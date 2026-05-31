@@ -28,6 +28,8 @@ pub struct PrivacyConfig {
 pub struct ReviewConfig {
     pub max_inline_comments: u32,
     pub severity_threshold: String,
+    pub max_diff_bytes: usize,
+    pub max_files: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -65,6 +67,8 @@ struct FilePrivacyConfig {
 struct FileReviewConfig {
     max_inline_comments: Option<u32>,
     severity_threshold: Option<String>,
+    max_diff_bytes: Option<usize>,
+    max_files: Option<usize>,
 }
 
 impl AppConfig {
@@ -114,6 +118,16 @@ impl AppConfig {
                 .ok()
                 .or_else(|| file_review.and_then(|review| review.severity_threshold.clone()))
                 .unwrap_or_else(|| "medium".to_string()),
+            max_diff_bytes: env::var("REVIEWGATE_MAX_DIFF_BYTES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .or_else(|| file_review.and_then(|review| review.max_diff_bytes))
+                .unwrap_or(200_000),
+            max_files: env::var("REVIEWGATE_MAX_FILES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .or_else(|| file_review.and_then(|review| review.max_files))
+                .unwrap_or(50),
         };
 
         Ok(Self {

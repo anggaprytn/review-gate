@@ -13,8 +13,26 @@ pub enum ReviewGateError {
     #[error("GitLab token is invalid or missing required scope")]
     InvalidGitLabToken,
 
+    #[error("GitLab token does not have permission to access this project or merge request")]
+    GitLabForbidden,
+
+    #[error("GitLab project or merge request was not found")]
+    GitLabNotFound,
+
+    #[error("GitLab rate limit exceeded. Retry later")]
+    GitLabRateLimited,
+
     #[error("cannot reach GitLab base URL. Check VPN connection or GitLab base URL")]
     GitLabUnreachable,
+
+    #[error("GitLab request timed out. Check VPN connection or GitLab responsiveness")]
+    GitLabTimeout,
+
+    #[error("GitLab response was malformed: {0}")]
+    MalformedGitLabResponse(String),
+
+    #[error("GitLab does not support the requested API parameter: {0}")]
+    UnsupportedGitLabParameter(String),
 
     #[error("GitLab API error: {0}")]
     GitLabApi(String),
