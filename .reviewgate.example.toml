@@ -1,0 +1,15 @@
+[providers.gitlab]
+base_url = "https://gitlab.company.local"
+
+[llm]
+provider = "ollama"
+model = "qwen2.5-coder:7b"
+ollama_base_url = "http://localhost:11434"
+
+[privacy]
+local_only = true
+redact_secrets = true
+
+[review]
+max_inline_comments = 8
+severity_threshold = "medium"
