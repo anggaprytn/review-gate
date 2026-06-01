@@ -220,28 +220,36 @@ pub fn resolve_inline_candidates_with_anchors(
 ) -> Vec<InlineCandidate> {
     let index = build_diff_position_index(diffs);
     let refs = complete_diff_refs(diff_refs);
-    let mut total_count = 0usize;
-    let mut high_count = 0usize;
-    let mut medium_count = 0usize;
+    let context = InlineResolveContext {
+        index: &index,
+        anchors,
+        diff_refs: refs.as_ref(),
+        config,
+    };
+    let mut counts = InlineResolveCounts::default();
 
     analysis
         .findings
         .iter()
         .enumerate()
         .map(|(index_in_review, finding)| {
-            resolve_candidate(
-                index_in_review,
-                finding,
-                &index,
-                anchors,
-                refs.as_ref(),
-                config,
-                &mut total_count,
-                &mut high_count,
-                &mut medium_count,
-            )
+            resolve_candidate(index_in_review, finding, &context, &mut counts)
         })
         .collect()
+}
+
+struct InlineResolveContext<'a> {
+    index: &'a DiffPositionIndex,
+    anchors: Option<&'a AnchoredDiffContext>,
+    diff_refs: Option<&'a CompleteDiffRefs>,
+    config: &'a InlineConfig,
+}
+
+#[derive(Default)]
+struct InlineResolveCounts {
+    total: usize,
+    high: usize,
+    medium: usize,
 }
 
 pub fn format_inline_dry_run_report(candidates: &[InlineCandidate]) -> String {
@@ -277,13 +285,8 @@ pub fn format_inline_dry_run_report_with_emoji(
 fn resolve_candidate(
     index_in_review: usize,
     finding: &ReviewFinding,
-    index: &DiffPositionIndex,
-    anchors: Option<&AnchoredDiffContext>,
-    diff_refs: Option<&CompleteDiffRefs>,
-    config: &InlineConfig,
-    total_count: &mut usize,
-    high_count: &mut usize,
-    medium_count: &mut usize,
+    context: &InlineResolveContext<'_>,
+    counts: &mut InlineResolveCounts,
 ) -> InlineCandidate {
     let base = InlineCandidate {
         finding_id: format!("finding-{}", index_in_review + 1),
@@ -313,9 +316,14 @@ fn resolve_candidate(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .is_some_and(|anchor_id| anchors.and_then(|anchors| anchors.get(anchor_id)).is_none());
+        .is_some_and(|anchor_id| {
+            context
+                .anchors
+                .and_then(|anchors| anchors.get(anchor_id))
+                .is_none()
+        });
 
-    let Some(diff_refs) = diff_refs else {
+    let Some(diff_refs) = context.diff_refs else {
         return ineligible(base, InlineEligibilityReason::MissingDiffRefs);
     };
 
@@ -324,18 +332,9 @@ fn resolve_candidate(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .and_then(|anchor_id| anchors.and_then(|anchors| anchors.get(anchor_id)))
+        .and_then(|anchor_id| context.anchors.and_then(|anchors| anchors.get(anchor_id)))
     {
-        return resolve_with_anchor(
-            base,
-            anchor,
-            index,
-            diff_refs,
-            config,
-            total_count,
-            high_count,
-            medium_count,
-        );
+        return resolve_with_anchor(base, anchor, context, diff_refs, counts);
     }
 
     let Some(file_path) = finding
@@ -364,7 +363,7 @@ fn resolve_candidate(
         );
     };
 
-    let Some(file_status) = index.file_status(file_path) else {
+    let Some(file_status) = context.index.file_status(file_path) else {
         return ineligible(base, InlineEligibilityReason::FileNotInDiff);
     };
     if file_status.generated {
@@ -377,7 +376,7 @@ fn resolve_candidate(
         return ineligible(base, InlineEligibilityReason::CollapsedFile);
     }
 
-    let Some(diff_position) = index.resolve(file_path, line) else {
+    let Some(diff_position) = context.index.resolve(file_path, line) else {
         return ineligible(
             base,
             if invalid_anchor {
@@ -388,28 +387,28 @@ fn resolve_candidate(
         );
     };
 
-    if *total_count >= config.max_inline_total {
+    if counts.total >= context.config.max_inline_total {
         return ineligible(base, InlineEligibilityReason::MaxInlineLimitReached);
     }
 
     match finding.severity {
         Severity::Critical => {}
         Severity::High => {
-            if *high_count >= config.max_high_inline {
+            if counts.high >= context.config.max_high_inline {
                 return ineligible(base, InlineEligibilityReason::MaxInlineLimitReached);
             }
-            *high_count += 1;
+            counts.high += 1;
         }
         Severity::Medium => {
-            if *medium_count >= config.max_medium_inline {
+            if counts.medium >= context.config.max_medium_inline {
                 return ineligible(base, InlineEligibilityReason::MaxInlineLimitReached);
             }
-            *medium_count += 1;
+            counts.medium += 1;
         }
         Severity::Low | Severity::Note => unreachable!("low and note severities returned earlier"),
     }
 
-    *total_count += 1;
+    counts.total += 1;
 
     InlineCandidate {
         eligible: true,
@@ -431,16 +430,14 @@ fn resolve_candidate(
 fn resolve_with_anchor(
     mut base: InlineCandidate,
     anchor: &ReviewLineAnchor,
-    index: &DiffPositionIndex,
+    context: &InlineResolveContext<'_>,
     diff_refs: &CompleteDiffRefs,
-    config: &InlineConfig,
-    total_count: &mut usize,
-    high_count: &mut usize,
-    medium_count: &mut usize,
+    counts: &mut InlineResolveCounts,
 ) -> InlineCandidate {
-    let Some(file_status) = index
+    let Some(file_status) = context
+        .index
         .file_status(&anchor.new_path)
-        .or_else(|| index.file_status(&anchor.old_path))
+        .or_else(|| context.index.file_status(&anchor.old_path))
     else {
         return ineligible(base, InlineEligibilityReason::FileNotInDiff);
     };
@@ -454,28 +451,28 @@ fn resolve_with_anchor(
         return ineligible(base, InlineEligibilityReason::CollapsedFile);
     }
 
-    if *total_count >= config.max_inline_total {
+    if counts.total >= context.config.max_inline_total {
         return ineligible(base, InlineEligibilityReason::MaxInlineLimitReached);
     }
 
     match base.severity {
         Severity::Critical => {}
         Severity::High => {
-            if *high_count >= config.max_high_inline {
+            if counts.high >= context.config.max_high_inline {
                 return ineligible(base, InlineEligibilityReason::MaxInlineLimitReached);
             }
-            *high_count += 1;
+            counts.high += 1;
         }
         Severity::Medium => {
-            if *medium_count >= config.max_medium_inline {
+            if counts.medium >= context.config.max_medium_inline {
                 return ineligible(base, InlineEligibilityReason::MaxInlineLimitReached);
             }
-            *medium_count += 1;
+            counts.medium += 1;
         }
         Severity::Low | Severity::Note => unreachable!("low and note severities returned earlier"),
     }
 
-    *total_count += 1;
+    counts.total += 1;
     base.file_path = Some(anchor.file_path.clone());
     base.requested_line = anchor.new_line.or(anchor.old_line);
 
@@ -688,9 +685,9 @@ impl InlineEligibilityReason {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_diff_position_index, format_inline_dry_run_report,
-        format_inline_dry_run_report_with_emoji, parse_diff_line_positions, parse_hunk_header,
-        resolve_inline_candidates, DiffLineKind, HunkHeader, InlineEligibilityReason,
+        build_diff_position_index, format_inline_dry_run_report_with_emoji,
+        parse_diff_line_positions, parse_hunk_header, resolve_inline_candidates, DiffLineKind,
+        HunkHeader, InlineEligibilityReason,
     };
     use crate::{
         config::InlineConfig,

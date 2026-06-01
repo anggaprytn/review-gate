@@ -249,7 +249,7 @@ pub fn format_verification_markdown(
     if let Some(warning) = outcome.parse_warning.as_deref() {
         output.push_str("\n## Warning\n\n");
         output.push_str(warning);
-        output.push_str("\n");
+        output.push('\n');
     }
 
     output.push_str("\n---\n\n");

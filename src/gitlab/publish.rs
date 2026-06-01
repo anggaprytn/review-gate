@@ -45,6 +45,7 @@ pub fn verification_marker(project_path: &str, mr_iid: u64) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_summary_note_body(
     markdown: &str,
     project_path: &str,

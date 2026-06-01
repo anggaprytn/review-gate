@@ -131,10 +131,12 @@ async fn run_review(args: ReviewArgs) -> Result<()> {
             &context,
             &diffs,
             &config,
-            args.force_new_note,
-            args.internal_note,
-            publish_inline,
-            inline_dry_run,
+            PublishOptions {
+                force_new_note: args.force_new_note,
+                internal_note_flag: args.internal_note,
+                publish_inline,
+                inline_dry_run,
+            },
             &mut storage,
         )
         .await?;
@@ -198,15 +200,20 @@ fn print_ci_guidance(config: &AppConfig, mode: &str) {
     println!("CI mode: {mode}.");
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PublishOptions {
+    force_new_note: bool,
+    internal_note_flag: bool,
+    publish_inline: bool,
+    inline_dry_run: bool,
+}
+
 async fn publish_review(
     gitlab: &GitLabClient,
     context: &MergeRequestContext,
     diffs: &[reviewgate::gitlab::types::MergeRequestDiff],
     config: &AppConfig,
-    force_new_note: bool,
-    internal_note_flag: bool,
-    publish_inline: bool,
-    inline_dry_run: bool,
+    options: PublishOptions,
     storage: &mut Option<Storage>,
 ) -> Result<()> {
     let preview = generate_preview(context, config, false).await?;
@@ -223,16 +230,21 @@ async fn publish_review(
         provider_local_only(&config.llm),
         external_model_call_label(&config.llm),
         head_sha(context),
-        inline_summary_label(publish_inline, inline_dry_run),
+        inline_summary_label(options.publish_inline, options.inline_dry_run),
         config.publish.max_note_chars,
     )?;
 
     println!("{body}");
 
-    let internal_note = internal_note_flag || config.publish.internal_note;
+    let internal_note = options.internal_note_flag || config.publish.internal_note;
     let result = publish_summary_with(body, |body| async move {
         gitlab
-            .publish_merge_request_summary(&context.mr_url, body, force_new_note, internal_note)
+            .publish_merge_request_summary(
+                &context.mr_url,
+                body,
+                options.force_new_note,
+                internal_note,
+            )
             .await
     })
     .await?;
@@ -240,10 +252,10 @@ async fn publish_review(
         update_summary_publish_best_effort(storage, &persisted.id, &result);
     }
 
-    print_publish_result(&result, publish_inline, inline_dry_run);
-    if inline_dry_run {
+    print_publish_result(&result, options.publish_inline, options.inline_dry_run);
+    if options.inline_dry_run {
         print_inline_dry_run_report(&preview, context, diffs, config);
-    } else if publish_inline {
+    } else if options.publish_inline {
         if !has_complete_diff_refs(context.metadata.diff_refs.as_ref()) {
             return Err(reviewgate::error::ReviewGateError::MissingGitLabDiffRefs);
         }
@@ -730,9 +742,7 @@ fn persist_review_run_best_effort(
     config: &AppConfig,
     preview: &ReviewPreview,
 ) -> Option<PersistedReviewRun> {
-    let Some(storage) = storage.as_mut() else {
-        return None;
-    };
+    let storage = storage.as_mut()?;
 
     match storage.persist_review_run(context, config, preview) {
         Ok(persisted) => Some(persisted),

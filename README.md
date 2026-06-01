@@ -1,3 +1,5 @@
+![Review Gate Cover](https://testing-1355450658.cos.ap-jakarta.myqcloud.com/review-gate.webp)
+
 # ReviewGate
 
 ReviewGate is a local-first AI merge request review tool for GitLab. It is built for teams that use GitLab self-managed, GitLab behind a VPN, or private network review workflows.

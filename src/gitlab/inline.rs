@@ -267,6 +267,7 @@ where
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn inline_fingerprint_v2(
     project_path: &str,
     mr_iid: u64,
@@ -302,6 +303,7 @@ pub fn inline_fingerprint_v2(
     hex_lower(&hasher.finalize())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn inline_fingerprint_v1(
     project_path: &str,
     mr_iid: u64,
@@ -869,9 +871,8 @@ mod tests {
     use super::{
         existing_inline_dedupe, existing_inline_fingerprints,
         extract_inline_fingerprints_from_note_body, extract_inline_markers_from_note_body,
-        format_inline_comment_body, format_inline_comment_body_with_emoji,
-        format_inline_publish_report, inline_fingerprint_v1, inline_fingerprint_v2, inline_marker,
-        publish_inline_comments_with, InlinePublishReport,
+        format_inline_comment_body_with_emoji, format_inline_publish_report, inline_fingerprint_v1,
+        inline_fingerprint_v2, inline_marker, publish_inline_comments_with, InlinePublishReport,
     };
     use crate::{
         config::InlineConfig,

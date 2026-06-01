@@ -48,9 +48,10 @@ pub enum Severity {
     Note,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Effort {
     Quick,
+    #[default]
     Moderate,
     Heavy,
 }
@@ -227,12 +228,6 @@ impl Effort {
             Effort::Moderate => "🛠️",
             Effort::Heavy => "🧱",
         }
-    }
-}
-
-impl Default for Effort {
-    fn default() -> Self {
-        Effort::Moderate
     }
 }
 

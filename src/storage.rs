@@ -207,8 +207,8 @@ impl Storage {
                 bool_int(crate::llm::provider_local_only(&config.llm)),
                 completed_at.as_str(),
                 completed_at.as_str(),
-                bool_int(config.storage.store_raw_diff && false),
-                bool_int(config.storage.store_raw_llm && false),
+                bool_int(false),
+                bool_int(false),
             ],
         )
         .map_err(storage_error)?;
@@ -271,15 +271,15 @@ impl Storage {
             .map_err(storage_error)?;
 
         let head_sha = head_sha_from_run(&self.conn, run_id)?.unwrap_or_default();
-        self.insert_published_comment(
+        self.insert_published_comment(PublishedComment {
             run_id,
-            "summary",
-            result.note_id,
-            None,
-            None,
-            "published",
-            &head_sha,
-        )
+            kind: "summary",
+            gitlab_note_id: result.note_id,
+            gitlab_discussion_id: None,
+            fingerprint: None,
+            status: "published",
+            head_sha: &head_sha,
+        })
     }
 
     pub fn update_inline_publish(
@@ -336,13 +336,15 @@ impl Storage {
                 .flatten();
             insert_published_comment_tx(
                 &tx,
-                run_id,
-                "inline",
-                result.note_id,
-                result.discussion_id.as_deref(),
-                fingerprint.as_deref(),
-                status,
-                &head_sha,
+                &PublishedComment {
+                    run_id,
+                    kind: "inline",
+                    gitlab_note_id: result.note_id,
+                    gitlab_discussion_id: result.discussion_id.as_deref(),
+                    fingerprint: fingerprint.as_deref(),
+                    status,
+                    head_sha: &head_sha,
+                },
             )?;
         }
 
@@ -514,26 +516,8 @@ impl Storage {
         Ok(())
     }
 
-    fn insert_published_comment(
-        &mut self,
-        run_id: &str,
-        kind: &str,
-        gitlab_note_id: Option<u64>,
-        gitlab_discussion_id: Option<&str>,
-        fingerprint: Option<&str>,
-        status: &str,
-        head_sha: &str,
-    ) -> Result<()> {
-        insert_published_comment_conn(
-            &self.conn,
-            run_id,
-            kind,
-            gitlab_note_id,
-            gitlab_discussion_id,
-            fingerprint,
-            status,
-            head_sha,
-        )
+    fn insert_published_comment(&mut self, comment: PublishedComment<'_>) -> Result<()> {
+        insert_published_comment_conn(&self.conn, &comment)
     }
 }
 
@@ -543,6 +527,17 @@ struct NormalizedFinding {
     old_line: Option<u32>,
     new_line: Option<u32>,
     fingerprint_v2: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PublishedComment<'a> {
+    run_id: &'a str,
+    kind: &'a str,
+    gitlab_note_id: Option<u64>,
+    gitlab_discussion_id: Option<&'a str>,
+    fingerprint: Option<&'a str>,
+    status: &'a str,
+    head_sha: &'a str,
 }
 
 fn normalize_finding(
@@ -580,23 +575,14 @@ fn normalize_finding(
     }
 }
 
-fn insert_published_comment_conn(
-    conn: &Connection,
-    run_id: &str,
-    kind: &str,
-    gitlab_note_id: Option<u64>,
-    gitlab_discussion_id: Option<&str>,
-    fingerprint: Option<&str>,
-    status: &str,
-    head_sha: &str,
-) -> Result<()> {
+fn insert_published_comment_conn(conn: &Connection, comment: &PublishedComment<'_>) -> Result<()> {
     let created_at = now_text();
     let id = published_comment_id(
-        run_id,
-        kind,
-        gitlab_note_id,
-        gitlab_discussion_id,
-        fingerprint,
+        comment.run_id,
+        comment.kind,
+        comment.gitlab_note_id,
+        comment.gitlab_discussion_id,
+        comment.fingerprint,
     );
     conn.execute(
         "INSERT INTO published_comments (
@@ -608,14 +594,14 @@ fn insert_published_comment_conn(
         WHERE id = ?9",
         params![
             id,
-            kind,
-            gitlab_note_id.map(|value| value as i64),
-            gitlab_discussion_id,
-            fingerprint,
-            head_sha,
-            status,
+            comment.kind,
+            comment.gitlab_note_id.map(|value| value as i64),
+            comment.gitlab_discussion_id,
+            comment.fingerprint,
+            comment.head_sha,
+            comment.status,
             created_at,
-            run_id,
+            comment.run_id,
         ],
     )
     .map_err(storage_error)?;
@@ -624,21 +610,15 @@ fn insert_published_comment_conn(
 
 fn insert_published_comment_tx(
     tx: &rusqlite::Transaction<'_>,
-    run_id: &str,
-    kind: &str,
-    gitlab_note_id: Option<u64>,
-    gitlab_discussion_id: Option<&str>,
-    fingerprint: Option<&str>,
-    status: &str,
-    head_sha: &str,
+    comment: &PublishedComment<'_>,
 ) -> Result<()> {
     let created_at = now_text();
     let id = published_comment_id(
-        run_id,
-        kind,
-        gitlab_note_id,
-        gitlab_discussion_id,
-        fingerprint,
+        comment.run_id,
+        comment.kind,
+        comment.gitlab_note_id,
+        comment.gitlab_discussion_id,
+        comment.fingerprint,
     );
     tx.execute(
         "INSERT INTO published_comments (
@@ -650,14 +630,14 @@ fn insert_published_comment_tx(
         WHERE id = ?9",
         params![
             id,
-            kind,
-            gitlab_note_id.map(|value| value as i64),
-            gitlab_discussion_id,
-            fingerprint,
-            head_sha,
-            status,
+            comment.kind,
+            comment.gitlab_note_id.map(|value| value as i64),
+            comment.gitlab_discussion_id,
+            comment.fingerprint,
+            comment.head_sha,
+            comment.status,
             created_at,
-            run_id,
+            comment.run_id,
         ],
     )
     .map_err(storage_error)?;
@@ -818,10 +798,7 @@ fn stable_id(prefix: &str, parts: &[&str]) -> String {
         hasher.update(part.trim().as_bytes());
         hasher.update(b"\0");
     }
-    format!(
-        "{prefix}_{}",
-        hex_lower(&hasher.finalize())[..24].to_string()
-    )
+    format!("{prefix}_{}", &hex_lower(&hasher.finalize())[..24])
 }
 
 fn now_text() -> String {
