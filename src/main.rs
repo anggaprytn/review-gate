@@ -1,11 +1,14 @@
 use clap::Parser;
-use reviewgate::cli::{Cli, Commands};
+use reviewgate::cli::{Cli, Commands, VerifyArgs};
 use reviewgate::config::AppConfig;
 use reviewgate::error::Result;
 use reviewgate::gitlab::client::GitLabClient;
 use reviewgate::gitlab::context::{build_merge_request_context, MergeRequestContext};
+use reviewgate::gitlab::inline::InlinePublishReport;
 use reviewgate::gitlab::inline::{format_inline_publish_report, publish_inline_comments_with};
-use reviewgate::gitlab::publish::{build_summary_note_body, publish_summary_with};
+use reviewgate::gitlab::publish::{
+    build_summary_note_body, build_verification_note_body, publish_summary_with,
+};
 use reviewgate::gitlab::types::{DiffRefs, PublishAction, PublishResult};
 use reviewgate::gitlab::url::GitLabMrUrl;
 use reviewgate::llm::types::LlmRunMetadata;
@@ -17,6 +20,10 @@ use reviewgate::review::engine::{
 };
 use reviewgate::review::inline::{
     format_inline_dry_run_report, resolve_inline_candidates_with_anchors,
+};
+use reviewgate::storage::{PersistedReviewRun, Storage};
+use reviewgate::verify::{
+    no_previous_run_message, verification_prompt_with_llm, VerificationPreview,
 };
 
 #[tokio::main]
@@ -45,6 +52,19 @@ async fn run() -> Result<()> {
             if args.calls_llm() {
                 config.validate_for_preview()?;
             }
+            let (mut storage, storage_open) = if args.calls_llm() {
+                Storage::open_best_effort(&config.storage)
+            } else {
+                (
+                    None,
+                    reviewgate::storage::StorageOpenOutcome {
+                        enabled: config.storage.enabled,
+                        db_path: config.storage.db_path.clone(),
+                        warning: None,
+                    },
+                )
+            };
+            print_storage_open_warning(&storage_open);
             let gitlab = GitLabClient::new(mr.base_url.clone(), config.gitlab_token.clone())?;
             let metadata = gitlab.fetch_merge_request(&mr).await?;
             let diffs = gitlab.fetch_merge_request_diffs(&mr).await?;
@@ -69,11 +89,24 @@ async fn run() -> Result<()> {
                     args.internal_note,
                     publish_inline,
                     inline_dry_run,
+                    &mut storage,
                 )
                 .await?;
             } else {
-                print_preview(&context, &diffs, &config, args.show_prompt, inline_dry_run).await?;
+                print_preview(
+                    &context,
+                    &diffs,
+                    &config,
+                    args.show_prompt,
+                    inline_dry_run,
+                    &mut storage,
+                )
+                .await?;
             }
+        }
+        Commands::Verify(args) => {
+            let publish = args.publishes();
+            verify_merge_request(args, publish).await?;
         }
     }
 
@@ -89,11 +122,13 @@ async fn publish_review(
     internal_note_flag: bool,
     publish_inline: bool,
     inline_dry_run: bool,
+    storage: &mut Option<Storage>,
 ) -> Result<()> {
     let preview = generate_preview(context, config, false).await?;
     if !preview.parsed {
         return Err(reviewgate::error::ReviewGateError::PublishRequiresParsedReview);
     }
+    let persisted = persist_review_run_best_effort(storage, context, config, &preview);
 
     let body = build_summary_note_body(
         &preview.markdown,
@@ -116,6 +151,9 @@ async fn publish_review(
             .await
     })
     .await?;
+    if let Some(persisted) = persisted.as_ref() {
+        update_summary_publish_best_effort(storage, &persisted.id, &result);
+    }
 
     print_publish_result(&result, publish_inline, inline_dry_run);
     if inline_dry_run {
@@ -124,8 +162,18 @@ async fn publish_review(
         if !has_complete_diff_refs(context.metadata.diff_refs.as_ref()) {
             return Err(reviewgate::error::ReviewGateError::MissingGitLabDiffRefs);
         }
-        publish_inline_review_comments(gitlab, &preview, context, diffs, config).await?;
+        let report =
+            publish_inline_review_comments(gitlab, &preview, context, diffs, config).await?;
+        if let Some(persisted) = persisted.as_ref() {
+            update_inline_publish_best_effort(
+                storage,
+                &persisted.id,
+                &persisted.finding_ids,
+                &report,
+            );
+        }
     }
+    print_persisted_review_run(storage, persisted.as_ref());
 
     Ok(())
 }
@@ -136,7 +184,7 @@ async fn publish_inline_review_comments(
     context: &MergeRequestContext,
     diffs: &[reviewgate::gitlab::types::MergeRequestDiff],
     config: &AppConfig,
-) -> Result<()> {
+) -> Result<InlinePublishReport> {
     let Some(analysis) = preview.analysis.as_ref() else {
         return Err(reviewgate::error::ReviewGateError::PublishRequiresParsedReview);
     };
@@ -168,7 +216,7 @@ async fn publish_inline_review_comments(
     }
     println!("{}", format_inline_publish_report(&report));
 
-    Ok(())
+    Ok(report)
 }
 
 fn print_dry_run_summary(context: &MergeRequestContext) {
@@ -192,6 +240,7 @@ async fn print_preview(
     config: &AppConfig,
     show_prompt: bool,
     inline_dry_run: bool,
+    storage: &mut Option<Storage>,
 ) -> Result<()> {
     let preview = generate_preview(context, config, show_prompt).await?;
 
@@ -205,6 +254,8 @@ async fn print_preview(
     if inline_dry_run {
         print_inline_dry_run_report(&preview, context, diffs, config);
     }
+    let persisted = persist_review_run_best_effort(storage, context, config, &preview);
+    print_persisted_review_run(storage, persisted.as_ref());
 
     Ok(())
 }
@@ -470,4 +521,207 @@ fn inline_summary_label(publish_inline: bool, inline_dry_run: bool) -> &'static 
     } else {
         "disabled"
     }
+}
+
+async fn verify_merge_request(args: VerifyArgs, publish: bool) -> Result<()> {
+    let mr = GitLabMrUrl::parse(&args.mr_url)?;
+    let config = AppConfig::load()?;
+    config.validate_for_preview()?;
+
+    let mut storage = match Storage::open(&config.storage)? {
+        Some(storage) => storage,
+        None => {
+            println!("{}", no_previous_run_message());
+            return Ok(());
+        }
+    };
+
+    let gitlab = GitLabClient::new(mr.base_url.clone(), config.gitlab_token.clone())?;
+    let metadata = gitlab.fetch_merge_request(&mr).await?;
+    let diffs = gitlab.fetch_merge_request_diffs(&mr).await?;
+    let context = build_merge_request_context(
+        mr,
+        metadata,
+        diffs,
+        &config.review,
+        config.privacy.redact_secrets,
+    );
+
+    let Some(previous_run) =
+        storage.latest_completed_review_run(&context.mr_url.project_path, context.metadata.iid)?
+    else {
+        println!("{}", no_previous_run_message());
+        return Ok(());
+    };
+
+    let previous_findings = storage.previous_findings_for_verification(
+        &previous_run.id,
+        config.storage.verify_max_previous_findings,
+    )?;
+    if previous_findings.is_empty() {
+        println!("No previous CRITICAL, HIGH, or MEDIUM ReviewGate findings found for this MR.");
+        return Ok(());
+    }
+
+    let llm_label = format!("{}/{}", config.llm.provider, config.llm.model);
+    let publish_mode = if publish {
+        "verification summary note"
+    } else {
+        "preview"
+    };
+    let llm_config = config.llm.clone();
+    let preview = verification_prompt_with_llm(
+        &context,
+        &previous_findings,
+        &llm_label,
+        publish_mode,
+        &previous_run.id,
+        move |prompt| async move { review_with_config(&llm_config, &prompt).await },
+    )
+    .await?;
+
+    println!("{}", preview.markdown);
+    print_verification_run_metadata(&config, &preview);
+
+    let persisted = storage.persist_verification_run(
+        &context,
+        &config,
+        Some(&previous_run.id),
+        &preview.outcome,
+    )?;
+    println!(
+        "Storage: verification run stored in {} (run ID: {})",
+        storage.db_path().display(),
+        persisted.id
+    );
+
+    if publish {
+        let body = build_verification_note_body(
+            &preview.markdown,
+            &context.mr_url.project_path,
+            context.metadata.iid,
+            config.publish.max_note_chars,
+        )?;
+        let result = publish_summary_with(body, |body| async move {
+            gitlab
+                .publish_merge_request_verification(
+                    &context.mr_url,
+                    body,
+                    args.force_new_note,
+                    config.publish.internal_note,
+                )
+                .await
+        })
+        .await?;
+        storage.update_verification_publish(&persisted.id, &result)?;
+        print_verification_publish_result(&result);
+    }
+
+    Ok(())
+}
+
+fn persist_review_run_best_effort(
+    storage: &mut Option<Storage>,
+    context: &MergeRequestContext,
+    config: &AppConfig,
+    preview: &ReviewPreview,
+) -> Option<PersistedReviewRun> {
+    let Some(storage) = storage.as_mut() else {
+        return None;
+    };
+
+    match storage.persist_review_run(context, config, preview) {
+        Ok(persisted) => Some(persisted),
+        Err(err) => {
+            eprintln!("warning: storage failed; review will continue: {err}");
+            None
+        }
+    }
+}
+
+fn update_summary_publish_best_effort(
+    storage: &mut Option<Storage>,
+    run_id: &str,
+    result: &PublishResult,
+) {
+    let Some(storage) = storage.as_mut() else {
+        return;
+    };
+    if let Err(err) = storage.update_summary_publish(run_id, result) {
+        eprintln!("warning: storage failed; review will continue: {err}");
+    }
+}
+
+fn update_inline_publish_best_effort(
+    storage: &mut Option<Storage>,
+    run_id: &str,
+    finding_ids: &[String],
+    report: &InlinePublishReport,
+) {
+    let Some(storage) = storage.as_mut() else {
+        return;
+    };
+    if let Err(err) = storage.update_inline_publish(run_id, finding_ids, report) {
+        eprintln!("warning: storage failed; review will continue: {err}");
+    }
+}
+
+fn print_persisted_review_run(storage: &Option<Storage>, persisted: Option<&PersistedReviewRun>) {
+    let (Some(storage), Some(persisted)) = (storage.as_ref(), persisted) else {
+        return;
+    };
+    println!(
+        "Storage: review run stored in {} (run ID: {})",
+        storage.db_path().display(),
+        persisted.id
+    );
+}
+
+fn print_storage_open_warning(outcome: &reviewgate::storage::StorageOpenOutcome) {
+    if let Some(warning) = outcome.warning.as_deref() {
+        eprintln!("warning: storage unavailable; review will continue without history: {warning}");
+    }
+}
+
+fn print_verification_run_metadata(config: &AppConfig, preview: &VerificationPreview) {
+    println!();
+    println!("ReviewGate verification metadata:");
+    println!("LLM: {}/{}", config.llm.provider, config.llm.model);
+    match preview.metadata.prompt_eval_count {
+        Some(tokens) => println!("Prompt tokens: {tokens}"),
+        None => println!("Prompt tokens: ~{}", preview.prompt_token_estimate),
+    }
+    match preview.metadata.eval_count {
+        Some(tokens) => println!("Completion tokens: {tokens}"),
+        None => println!("Completion tokens: unavailable"),
+    }
+    println!(
+        "Structured JSON: {}",
+        if preview.outcome.parsed {
+            "parsed"
+        } else {
+            "fallback"
+        }
+    );
+}
+
+fn print_verification_publish_result(result: &PublishResult) {
+    println!();
+    println!("Verification publish result:");
+    println!(
+        "Action: {}",
+        match result.action {
+            PublishAction::Created => "created",
+            PublishAction::Updated => "updated",
+        }
+    );
+    match result.note_id {
+        Some(note_id) => println!("GitLab verification note ID: {note_id}"),
+        None => println!("GitLab verification note ID: unavailable"),
+    }
+    println!(
+        "Duplicate ReviewGate verification notes found: {}",
+        result.duplicate_count
+    );
+    println!("Inline verification comments: skipped");
 }

@@ -9,6 +9,7 @@ clap = { version = "4.5.23", features = ["derive"] }
 dotenvy = "0.15.7"
 regex = "1.11.1"
 reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.134"
 sha2 = "0.10.8"

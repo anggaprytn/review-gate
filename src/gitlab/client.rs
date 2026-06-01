@@ -1,7 +1,7 @@
 use crate::{
     error::{Result, ReviewGateError},
     gitlab::{
-        publish::{select_publish_target, summary_marker},
+        publish::{select_publish_target, summary_marker, verification_marker},
         types::{
             CreateMergeRequestDiscussionRequest, CreateMergeRequestNoteRequest, GitLabDiscussion,
             GitLabNote, MergeRequestDiff, MergeRequestMetadata, PublishAction, PublishResult,
@@ -208,6 +208,59 @@ impl GitLabClient {
                 let note_id = target.note_id.ok_or_else(|| {
                     ReviewGateError::GitLabApi(
                         "selected ReviewGate note did not include a note ID".to_string(),
+                    )
+                })?;
+                let note = self
+                    .update_merge_request_note(mr, note_id, &UpdateMergeRequestNoteRequest { body })
+                    .await?;
+                Ok(PublishResult {
+                    action: PublishAction::Updated,
+                    note_id: Some(note.id),
+                    web_url: None,
+                    duplicate_count: target.duplicate_count,
+                })
+            }
+        }
+    }
+
+    pub async fn publish_merge_request_verification(
+        &self,
+        mr: &GitLabMrUrl,
+        body: String,
+        force_new_note: bool,
+        internal_note: bool,
+    ) -> Result<PublishResult> {
+        let marker = verification_marker(&mr.project_path, mr.mr_iid);
+        let notes = if force_new_note {
+            Vec::new()
+        } else {
+            self.list_merge_request_notes(mr).await?
+        };
+        let target = select_publish_target(&notes, &marker, force_new_note);
+
+        match target.action {
+            PublishAction::Created => {
+                let note = self
+                    .create_merge_request_note(
+                        mr,
+                        &CreateMergeRequestNoteRequest {
+                            body,
+                            internal: Some(internal_note),
+                        },
+                    )
+                    .await?;
+                Ok(PublishResult {
+                    action: PublishAction::Created,
+                    note_id: Some(note.id),
+                    web_url: None,
+                    duplicate_count: target.duplicate_count,
+                })
+            }
+            PublishAction::Updated => {
+                let note_id = target.note_id.ok_or_else(|| {
+                    ReviewGateError::GitLabApi(
+                        "selected ReviewGate verification note did not include a note ID"
+                            .to_string(),
                     )
                 })?;
                 let note = self

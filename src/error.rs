@@ -116,6 +116,9 @@ pub enum ReviewGateError {
     #[error("configuration error: {0}")]
     Config(String),
 
+    #[error("storage error: {0}")]
+    Storage(String),
+
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
 

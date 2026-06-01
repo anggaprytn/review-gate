@@ -13,6 +13,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Commands {
     Review(ReviewArgs),
+    Verify(VerifyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -44,6 +45,26 @@ pub struct ReviewArgs {
     pub publish_inline: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct VerifyArgs {
+    pub mr_url: String,
+
+    #[arg(long, conflicts_with = "publish")]
+    pub preview: bool,
+
+    #[arg(long, conflicts_with = "preview")]
+    pub publish: bool,
+
+    #[arg(long, requires = "publish")]
+    pub force_new_note: bool,
+}
+
+impl VerifyArgs {
+    pub fn publishes(&self) -> bool {
+        self.publish
+    }
+}
+
 impl ReviewArgs {
     pub fn validate(&self) -> Result<()> {
         if self.publish_inline && !self.publish {
@@ -71,7 +92,7 @@ impl ReviewArgs {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Commands};
+    use super::{Cli, Commands, ReviewArgs};
 
     #[test]
     fn dry_run_mode_does_not_call_llm() {
@@ -82,7 +103,7 @@ mod tests {
             "--dry-run",
         ]);
 
-        let Commands::Review(args) = cli.command;
+        let args = review_args(cli.command);
         assert!(!args.calls_llm());
         assert!(!args.publishes());
     }
@@ -96,7 +117,7 @@ mod tests {
             "--preview",
         ]);
 
-        let Commands::Review(args) = cli.command;
+        let args = review_args(cli.command);
         assert!(args.calls_llm());
         assert!(!args.publishes());
     }
@@ -110,7 +131,7 @@ mod tests {
             "--publish",
         ]);
 
-        let Commands::Review(args) = cli.command;
+        let args = review_args(cli.command);
         assert!(args.calls_llm());
         assert!(args.publishes());
     }
@@ -125,7 +146,7 @@ mod tests {
             "--inline-dry-run",
         ]);
 
-        let Commands::Review(args) = cli.command;
+        let args = review_args(cli.command);
         assert!(args.inline_dry_run);
         assert!(args.calls_llm());
         assert!(!args.publishes());
@@ -141,7 +162,7 @@ mod tests {
             "--inline-dry-run",
         ]);
 
-        let Commands::Review(args) = cli.command;
+        let args = review_args(cli.command);
         assert!(args.inline_dry_run);
         assert!(args.calls_llm());
         assert!(args.publishes());
@@ -169,7 +190,7 @@ mod tests {
             "--publish-inline",
         ]);
 
-        let Commands::Review(args) = cli.command;
+        let args = review_args(cli.command);
         let err = args.validate().unwrap_err();
 
         assert!(matches!(
@@ -190,8 +211,57 @@ mod tests {
             "--inline-dry-run",
         ]);
 
-        let Commands::Review(args) = cli.command;
+        let args = review_args(cli.command);
 
         assert!(!args.publishes_inline().unwrap());
+    }
+
+    #[test]
+    fn verify_defaults_to_preview_without_publish() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "verify",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+        ]);
+
+        let Commands::Verify(args) = cli.command else {
+            panic!("expected verify command");
+        };
+        assert!(!args.publishes());
+    }
+
+    #[test]
+    fn verify_publish_mode_publishes() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "verify",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--publish",
+        ]);
+
+        let Commands::Verify(args) = cli.command else {
+            panic!("expected verify command");
+        };
+        assert!(args.publishes());
+    }
+
+    #[test]
+    fn verify_force_new_note_requires_publish() {
+        let err = Cli::try_parse_from([
+            "reviewgate",
+            "verify",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--force-new-note",
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    fn review_args(command: Commands) -> ReviewArgs {
+        match command {
+            Commands::Review(args) => args,
+            Commands::Verify(_) => panic!("expected review command"),
+        }
     }
 }

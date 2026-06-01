@@ -2,7 +2,7 @@
 
 ReviewGate is a CLI-first AI merge request reviewer for private GitLab teams. v0.1 focuses on GitLab self-managed instances behind VPN and local-first review workflows.
 
-ReviewGate does not include a dashboard, SaaS backend, GitHub support, SQLite storage, Docker, GitLab Runner mode, Semgrep, LSP, remote LLM providers, or a full AST engine in this step.
+ReviewGate does not include a dashboard, SaaS backend, GitHub support, Docker, GitLab Runner mode, Semgrep, LSP, new model providers, or a full AST engine in this step.
 
 ## Real GitLab Dry Run
 
@@ -188,6 +188,56 @@ ReviewGate still reads old v1 inline markers where possible. It checks v2 finger
 
 GitLab can reject a position even when local diff parsing found a candidate, especially after force-pushes, collapsed diffs, or instance-specific validation differences. Those failures are isolated per candidate and reported as failed inline comments; the summary note remains published.
 
+## Local SQLite Storage
+
+ReviewGate stores local review history in SQLite by default:
+
+```env
+REVIEWGATE_STORAGE_ENABLED=true
+REVIEWGATE_DB_PATH=.reviewgate/reviewgate.sqlite
+REVIEWGATE_STORE_RAW_DIFF=false
+REVIEWGATE_STORE_RAW_LLM=false
+REVIEWGATE_VERIFY_MAX_PREVIOUS_FINDINGS=30
+```
+
+The `.reviewgate/` directory is created automatically and is ignored by git. ReviewGate stores review run metadata, normalized findings, summary note publish metadata, inline publish counts, inline discussion/note IDs, verification runs, and verification results.
+
+By default, ReviewGate does not store raw repository source, raw diffs, raw prompts, or raw model payloads. The stored finding text is the normalized ReviewGate finding returned by the model, plus file/line metadata and deterministic fingerprints for local history and dedupe.
+
+Review storage is best-effort. If SQLite cannot be opened or updated during `review`, ReviewGate prints a warning and continues the review. Verification requires readable local history because it compares against previous findings.
+
+## Change Verification
+
+After a review has been stored, verify whether previous CRITICAL, HIGH, and MEDIUM findings were fixed:
+
+```bash
+GITLAB_TOKEN=xxx cargo run -- verify "https://gitlab.company.local/group/repo/-/merge_requests/59"
+GITLAB_TOKEN=xxx cargo run -- verify "https://gitlab.company.local/group/repo/-/merge_requests/59" --preview
+```
+
+`verify` defaults to preview mode. It fetches the current MR metadata and diff, loads the latest completed local ReviewGate run for the same project and MR, sends only previous findings plus the current sanitized anchored diff to the configured LLM, then prints grouped verification markdown.
+
+Verification statuses are:
+
+- `fixed`: current diff clearly resolves the previous finding.
+- `still_open`: current diff still shows the same risk.
+- `skipped`: the finding is intentionally skipped or no longer relevant.
+- `needs_manual_confirmation`: evidence is insufficient or model output is unclear.
+
+Publish one top-level verification note:
+
+```bash
+GITLAB_TOKEN=xxx cargo run -- verify "$MR_URL" --publish
+```
+
+Verification publishing uses a hidden marker like:
+
+```md
+<!-- reviewgate:verification project="group/repo" mr="59" -->
+```
+
+On later `verify --publish` runs, ReviewGate lists existing MR notes, ignores system notes, and updates the existing verification note instead of creating duplicates. It does not post inline verification comments and does not resolve or delete existing discussions.
+
 ## Inline Dry Run
 
 Inline dry-run evaluates whether model findings can be mapped to valid GitLab inline diff positions. It does not post inline comments and does not call the GitLab Discussions API.
@@ -238,6 +288,11 @@ REVIEWGATE_MAX_CONTEXT_TOKENS=12000
 REVIEWGATE_TEMPERATURE=0.1
 REVIEWGATE_PUBLISH_MAX_NOTE_CHARS=60000
 REVIEWGATE_GITLAB_INTERNAL_NOTE=false
+REVIEWGATE_STORAGE_ENABLED=true
+REVIEWGATE_DB_PATH=.reviewgate/reviewgate.sqlite
+REVIEWGATE_STORE_RAW_DIFF=false
+REVIEWGATE_STORE_RAW_LLM=false
+REVIEWGATE_VERIFY_MAX_PREVIOUS_FINDINGS=30
 ```
 
 `GITLAB_TOKEN` needs permission to read merge request metadata and diffs. For publish mode it also needs permission to create and update merge request notes, which usually means `api` scope.
@@ -257,6 +312,13 @@ If dry-run fails with a GitLab reachability or timeout error:
 - Retry with a token that has `read_api` or `api` scope if you see 401 or 403.
 - If publish returns 403, the token likely lacks write permission for MR notes.
 - If ReviewGate says the GitLab base URL is unreachable, connect or reconnect the VPN and retry.
+
+## Storage And Verification Troubleshooting
+
+- No previous run: run `reviewgate review <mr-url> --publish` first so ReviewGate has local findings to verify.
+- DB permission issue: check `REVIEWGATE_DB_PATH`, parent directory permissions, and whether another process has locked the SQLite file.
+- Malformed verification JSON: ReviewGate falls back to `needs_manual_confirmation` for previous findings and prints a warning instead of panicking.
+- Storage disabled: set `REVIEWGATE_STORAGE_ENABLED=true`; verification cannot load prior findings while storage is disabled.
 
 ReviewGate never prints the token and does not include it in debug output.
 

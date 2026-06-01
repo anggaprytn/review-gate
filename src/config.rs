@@ -1,7 +1,10 @@
 use crate::error::{Result, ReviewGateError};
 use crate::llm::types::LlmProvider;
 use serde::Deserialize;
-use std::{env, fs, path::Path};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -12,6 +15,7 @@ pub struct AppConfig {
     pub review: ReviewConfig,
     pub inline: InlineConfig,
     pub publish: PublishConfig,
+    pub storage: StorageConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +62,15 @@ pub struct InlineConfig {
 pub struct PublishConfig {
     pub max_note_chars: usize,
     pub internal_note: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct StorageConfig {
+    pub enabled: bool,
+    pub db_path: PathBuf,
+    pub store_raw_diff: bool,
+    pub store_raw_llm: bool,
+    pub verify_max_previous_findings: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -230,6 +243,19 @@ impl AppConfig {
                 .unwrap_or(60_000),
             internal_note: env_bool("REVIEWGATE_GITLAB_INTERNAL_NOTE").unwrap_or(false),
         };
+        let storage = StorageConfig {
+            enabled: env_bool("REVIEWGATE_STORAGE_ENABLED").unwrap_or(true),
+            db_path: env::var("REVIEWGATE_DB_PATH")
+                .ok()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(".reviewgate/reviewgate.sqlite")),
+            store_raw_diff: env_bool("REVIEWGATE_STORE_RAW_DIFF").unwrap_or(false),
+            store_raw_llm: env_bool("REVIEWGATE_STORE_RAW_LLM").unwrap_or(false),
+            verify_max_previous_findings: env::var("REVIEWGATE_VERIFY_MAX_PREVIOUS_FINDINGS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(30),
+        };
 
         Ok(Self {
             gitlab_token: env::var("GITLAB_TOKEN")
@@ -254,6 +280,7 @@ impl AppConfig {
             review,
             inline,
             publish,
+            storage,
         })
     }
 
@@ -334,7 +361,10 @@ fn env_bool(name: &str) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, InlineConfig, LlmConfig, PrivacyConfig, PublishConfig, ReviewConfig};
+    use super::{
+        AppConfig, InlineConfig, LlmConfig, PrivacyConfig, PublishConfig, ReviewConfig,
+        StorageConfig,
+    };
     use crate::error::ReviewGateError;
 
     #[test]
@@ -419,6 +449,13 @@ mod tests {
             publish: PublishConfig {
                 max_note_chars: 60_000,
                 internal_note: false,
+            },
+            storage: StorageConfig {
+                enabled: true,
+                db_path: ".reviewgate/reviewgate.sqlite".into(),
+                store_raw_diff: false,
+                store_raw_llm: false,
+                verify_max_previous_findings: 30,
             },
         }
     }
