@@ -12,6 +12,7 @@ use reviewgate::llm::types::LlmRunMetadata;
 use reviewgate::review::engine::{
     build_sanitized_review_prompt, review_prompt_with_llm, ReviewPreview,
 };
+use reviewgate::review::inline::{format_inline_dry_run_report, resolve_inline_candidates};
 
 #[tokio::main]
 async fn main() {
@@ -43,10 +44,12 @@ async fn run() -> Result<()> {
             let context = build_merge_request_context(
                 mr,
                 metadata,
-                diffs,
+                diffs.clone(),
                 &config.review,
                 config.privacy.redact_secrets,
             );
+            let inline_dry_run =
+                args.inline_dry_run || (config.inline.enabled && config.inline.dry_run);
 
             if args.dry_run {
                 print_dry_run_summary(&context);
@@ -54,13 +57,15 @@ async fn run() -> Result<()> {
                 publish_review(
                     &gitlab,
                     &context,
+                    &diffs,
                     &config,
                     args.force_new_note,
                     args.internal_note,
+                    inline_dry_run,
                 )
                 .await?;
             } else {
-                print_preview(&context, &config, args.show_prompt).await?;
+                print_preview(&context, &diffs, &config, args.show_prompt, inline_dry_run).await?;
             }
         }
     }
@@ -71,9 +76,11 @@ async fn run() -> Result<()> {
 async fn publish_review(
     gitlab: &GitLabClient,
     context: &MergeRequestContext,
+    diffs: &[reviewgate::gitlab::types::MergeRequestDiff],
     config: &AppConfig,
     force_new_note: bool,
     internal_note_flag: bool,
+    inline_dry_run: bool,
 ) -> Result<()> {
     let preview = generate_preview(context, config, false).await?;
     if !preview.parsed {
@@ -101,6 +108,9 @@ async fn publish_review(
     .await?;
 
     print_publish_result(&result);
+    if inline_dry_run {
+        print_inline_dry_run_report(&preview, context, diffs, config);
+    }
 
     Ok(())
 }
@@ -122,8 +132,10 @@ fn print_dry_run_summary(context: &MergeRequestContext) {
 
 async fn print_preview(
     context: &MergeRequestContext,
+    diffs: &[reviewgate::gitlab::types::MergeRequestDiff],
     config: &AppConfig,
     show_prompt: bool,
+    inline_dry_run: bool,
 ) -> Result<()> {
     let preview = generate_preview(context, config, show_prompt).await?;
 
@@ -134,6 +146,9 @@ async fn print_preview(
         preview.prompt_token_estimate,
         preview.parsed,
     );
+    if inline_dry_run {
+        print_inline_dry_run_report(&preview, context, diffs, config);
+    }
 
     Ok(())
 }
@@ -334,6 +349,29 @@ fn print_publish_result(result: &PublishResult) {
         );
     }
     println!("Inline comments: skipped");
+}
+
+fn print_inline_dry_run_report(
+    preview: &ReviewPreview,
+    context: &MergeRequestContext,
+    diffs: &[reviewgate::gitlab::types::MergeRequestDiff],
+    config: &AppConfig,
+) {
+    let candidates = preview
+        .analysis
+        .as_ref()
+        .map(|analysis| {
+            resolve_inline_candidates(
+                analysis,
+                diffs,
+                context.metadata.diff_refs.as_ref(),
+                &config.inline,
+            )
+        })
+        .unwrap_or_default();
+
+    println!();
+    println!("{}", format_inline_dry_run_report(&candidates));
 }
 
 fn format_ollama_duration(nanoseconds: u64) -> String {

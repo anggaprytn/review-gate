@@ -34,6 +34,9 @@ pub struct ReviewArgs {
 
     #[arg(long, requires = "preview")]
     pub show_prompt: bool,
+
+    #[arg(long, conflicts_with = "dry_run")]
+    pub inline_dry_run: bool,
 }
 
 impl ReviewArgs {
@@ -90,6 +93,38 @@ mod tests {
         ]);
 
         let Commands::Review(args) = cli.command;
+        assert!(args.calls_llm());
+        assert!(args.publishes());
+    }
+
+    #[test]
+    fn inline_dry_run_can_run_with_preview() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--preview",
+            "--inline-dry-run",
+        ]);
+
+        let Commands::Review(args) = cli.command;
+        assert!(args.inline_dry_run);
+        assert!(args.calls_llm());
+        assert!(!args.publishes());
+    }
+
+    #[test]
+    fn inline_dry_run_can_run_with_publish() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--publish",
+            "--inline-dry-run",
+        ]);
+
+        let Commands::Review(args) = cli.command;
+        assert!(args.inline_dry_run);
         assert!(args.calls_llm());
         assert!(args.publishes());
     }

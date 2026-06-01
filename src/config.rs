@@ -9,6 +9,7 @@ pub struct AppConfig {
     pub llm: LlmConfig,
     pub privacy: PrivacyConfig,
     pub review: ReviewConfig,
+    pub inline: InlineConfig,
     pub publish: PublishConfig,
 }
 
@@ -34,6 +35,14 @@ pub struct ReviewConfig {
     pub severity_threshold: String,
     pub max_diff_bytes: usize,
     pub max_files: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct InlineConfig {
+    pub enabled: bool,
+    pub dry_run: bool,
+    pub max_high_inline: usize,
+    pub max_medium_inline: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +166,18 @@ impl AppConfig {
                 .or_else(|| file_review.and_then(|review| review.max_files))
                 .unwrap_or(50),
         };
+        let inline = InlineConfig {
+            enabled: env_bool("REVIEWGATE_INLINE_ENABLED").unwrap_or(false),
+            dry_run: env_bool("REVIEWGATE_INLINE_DRY_RUN").unwrap_or(true),
+            max_high_inline: env::var("REVIEWGATE_MAX_HIGH_INLINE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8),
+            max_medium_inline: env::var("REVIEWGATE_MAX_MEDIUM_INLINE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(5),
+        };
         let publish = PublishConfig {
             max_note_chars: env::var("REVIEWGATE_PUBLISH_MAX_NOTE_CHARS")
                 .ok()
@@ -180,6 +201,7 @@ impl AppConfig {
             },
             privacy,
             review,
+            inline,
             publish,
         })
     }
@@ -225,7 +247,7 @@ fn env_bool(name: &str) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, LlmConfig, PrivacyConfig, PublishConfig, ReviewConfig};
+    use super::{AppConfig, InlineConfig, LlmConfig, PrivacyConfig, PublishConfig, ReviewConfig};
     use crate::error::ReviewGateError;
 
     #[test]
@@ -271,6 +293,12 @@ mod tests {
                 severity_threshold: "medium".to_string(),
                 max_diff_bytes: 200_000,
                 max_files: 50,
+            },
+            inline: InlineConfig {
+                enabled: false,
+                dry_run: true,
+                max_high_inline: 8,
+                max_medium_inline: 5,
             },
             publish: PublishConfig {
                 max_note_chars: 60_000,

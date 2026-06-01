@@ -6,6 +6,7 @@ use crate::{
         formatter::{format_malformed_review_markdown, format_review_markdown},
         parser::parse_review_analysis,
         prompt::build_review_prompt,
+        types::ReviewAnalysis,
     },
 };
 use std::future::Future;
@@ -16,6 +17,7 @@ pub struct ReviewPreview {
     pub metadata: LlmRunMetadata,
     pub prompt_token_estimate: u64,
     pub parsed: bool,
+    pub analysis: Option<ReviewAnalysis>,
 }
 
 pub fn build_sanitized_review_prompt(context: &MergeRequestContext) -> String {
@@ -30,11 +32,12 @@ where
     let prompt_token_estimate = estimate_prompt_tokens(&prompt);
     let llm_response = call_llm(prompt).await?;
 
-    let (markdown, parsed) = match parse_review_analysis(&llm_response.text) {
-        Ok(analysis) => (format_review_markdown(&analysis), true),
+    let (markdown, parsed, analysis) = match parse_review_analysis(&llm_response.text) {
+        Ok(analysis) => (format_review_markdown(&analysis), true, Some(analysis)),
         Err(err) => (
             format_malformed_review_markdown(&llm_response.text, &err),
             false,
+            None,
         ),
     };
 
@@ -43,6 +46,7 @@ where
         metadata: llm_response.metadata,
         prompt_token_estimate,
         parsed,
+        analysis,
     })
 }
 

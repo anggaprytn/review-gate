@@ -107,6 +107,21 @@ cargo run -- review "$MR_URL" --publish --internal-note
 
 For publishing, `GITLAB_TOKEN` needs write permission for MR notes. On GitLab personal, project, or group access tokens, use `api` scope unless your instance has a narrower custom policy that permits note creation and updates.
 
+## Inline Dry Run
+
+Inline dry-run evaluates whether model findings can be mapped to valid GitLab inline diff positions. It does not post inline comments and does not call the GitLab Discussions API.
+
+```bash
+GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/merge_requests/59" --preview --inline-dry-run
+GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/merge_requests/59" --publish --inline-dry-run
+```
+
+With `--preview --inline-dry-run`, ReviewGate fetches GitLab data, calls local Ollama, prints ReviewGate markdown, and prints an inline candidate mapping report. It does not publish anything. With `--publish --inline-dry-run`, ReviewGate still only creates or updates the top-level summary note, then prints the inline candidate mapping report.
+
+Findings are eligible for inline placement only when severity is CRITICAL, HIGH, or MEDIUM; confidence is high or medium; the finding is actionable; file and line are present; the file exists in the MR diff; the requested line maps to a parsed diff position; the file is not generated, collapsed, or too large; GitLab `diff_refs` are available; and the severity limit has not been reached. Defaults are unlimited CRITICAL, up to 8 HIGH findings, up to 5 MEDIUM findings, and no LOW or NOTE inline candidates.
+
+Invalid or unsafe mappings fall back to the summary. Real inline publishing is planned for the next step.
+
 ## Environment
 
 Copy `.env.example` to `.env` or export variables in your shell:
@@ -115,6 +130,10 @@ Copy `.env.example` to `.env` or export variables in your shell:
 GITLAB_TOKEN=
 REVIEWGATE_MAX_DIFF_BYTES=200000
 REVIEWGATE_MAX_FILES=50
+REVIEWGATE_INLINE_ENABLED=false
+REVIEWGATE_INLINE_DRY_RUN=true
+REVIEWGATE_MAX_HIGH_INLINE=8
+REVIEWGATE_MAX_MEDIUM_INLINE=5
 REVIEWGATE_LLM_PROVIDER=ollama
 OLLAMA_BASE_URL=http://localhost:11434
 REVIEWGATE_MODEL=qwen2.5-coder:7b
@@ -170,7 +189,9 @@ If the repo has no remote, set one of `REVIEWGATE_TEST_REMOTE_URL`, `GITLAB_TEST
 ```bash
 cargo run -- review "$MR_URL" --dry-run
 cargo run -- review "$MR_URL" --preview
+cargo run -- review "$MR_URL" --preview --inline-dry-run
 cargo run -- review "$MR_URL" --publish
+cargo run -- review "$MR_URL" --publish --inline-dry-run
 cargo run -- review "$MR_URL" --publish
 ```
 
