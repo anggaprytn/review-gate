@@ -64,7 +64,7 @@ fn inline_output_keeps_attribution_and_hidden_marker() {
     assert!(body.contains(REVIEWGATE_ATTRIBUTION));
     assert!(body.contains("reviewgate:inline"));
     assert!(!body.contains("## Finding Summary"));
-    assert!(!body.contains("## Change Since Previous Review"));
+    assert!(!body.contains("## Change Since Previous Published Review"));
     assert!(!body.contains("| Severity | Count |"));
     assert!(!body.contains("| Status | Count |"));
 }
@@ -96,15 +96,16 @@ fn verification_output_keeps_attribution_and_hidden_marker() {
 }
 
 #[test]
-fn review_markdown_uses_pipe_tables_for_counters_and_comparison() {
+fn review_markdown_uses_pipe_table_for_counters_and_compact_comparison() {
     let markdown = format_review_markdown_with_emoji(&analysis(), true);
     let markdown = insert_comparison_section_with_emoji(&markdown, &comparison(), true);
 
     assert!(markdown.contains("## Finding Summary"));
     assert!(markdown.contains("| Severity | Count |\n|---|---:|"));
-    assert!(markdown.contains("## Change Since Previous Review"));
-    assert!(markdown.contains("Compared with previous published run: `previous-run`"));
-    assert!(markdown.contains("| Status | Count |\n|---|---:|"));
+    assert!(markdown.contains("## Change Since Previous Published Review"));
+    assert!(markdown.contains("Compared with: `previous-run`"));
+    assert!(markdown.contains("Current review:"));
+    assert!(!markdown.contains("| Status | Count |\n|---|---:|"));
     assert!(!markdown.contains('━'));
     assert!(!markdown.contains('─'));
 }

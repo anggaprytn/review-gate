@@ -7,7 +7,7 @@ use crate::{
     review::{
         anchors::{AnchorLineKind, AnchoredDiffContext, ReviewLineAnchor},
         engine::{estimate_prompt_tokens, ReviewPreview},
-        formatter::format_review_markdown,
+        formatter::{format_review_markdown_for_mode, MarkdownRenderMode},
         parser::parse_review_analysis,
         quality::normalize_review_analysis,
         types::{OverallRisk, ReviewAnalysis, ReviewFinding, Severity},
@@ -370,6 +370,7 @@ pub async fn review_large_chunks_with_llm<F, Fut>(
     metadata: &MergeRequestMetadata,
     chunks: &[ReviewChunk],
     selection: &LargeReviewSelection,
+    mode: MarkdownRenderMode,
     show_prompt: bool,
     mut progress: impl FnMut(&ReviewChunk, usize),
     mut call_llm: F,
@@ -432,7 +433,7 @@ where
         skipped_reasons: selection.skipped_reasons.clone(),
     };
     let analysis = normalize_review_analysis(merge_chunk_analyses(analyses, &report));
-    let markdown = format_large_review_markdown(&analysis, &report);
+    let markdown = format_large_review_markdown(&analysis, &report, mode);
 
     Ok(ReviewPreview {
         markdown,
@@ -473,12 +474,6 @@ pub fn merge_chunk_analyses(
     let findings = dedupe_findings(findings);
 
     let mut summary = compact_large_review_summary(&findings, report);
-    if report.failed_chunks > 0 {
-        summary.push_str(&format!(
-            "\n\n⚠️ {} of {} review chunks failed. Findings may be incomplete.",
-            report.failed_chunks, report.total_chunks
-        ));
-    }
     if findings.is_empty() && !summaries.is_empty() {
         let compacted = compact_sentences(&summaries.join(" "), 3);
         if !compacted.is_empty() {
@@ -526,12 +521,20 @@ pub fn dedupe_findings(findings: Vec<ReviewFinding>) -> Vec<ReviewFinding> {
 pub fn format_large_review_markdown(
     analysis: &ReviewAnalysis,
     report: &LargeReviewReport,
+    mode: MarkdownRenderMode,
 ) -> String {
-    let markdown = format_review_markdown(analysis);
-    let section = format!(
-        "## Large MR Review Plan\n\nReviewed chunks: {}\nReviewed files: {}\nSkipped files: {}\nReview mode: risk-prioritized partial review\n\nThis is not a full-file exhaustive review. ReviewGate prioritized high-risk changed files.\n\n",
-        report.reviewed_chunks, report.reviewed_files, report.skipped_files
+    let markdown = format_review_markdown_for_mode(analysis, mode);
+    let mut section = format!(
+        "## Large MR Review Plan\n\nPlanned chunks: {}\nReviewed chunks: {}\n",
+        report.total_chunks, report.reviewed_chunks
     );
+    if report.failed_chunks > 0 {
+        section.push_str(&format!("Failed chunks: {}\n", report.failed_chunks));
+    }
+    section.push_str(&format!(
+        "Reviewed files: {}\nSkipped files: {}\nReview mode: risk-prioritized partial review\n\nThis is not a full-file exhaustive review. ReviewGate prioritized high-risk changed files.\n\n",
+        report.reviewed_files, report.skipped_files
+    ));
 
     if let Some((title, rest)) = markdown.split_once("\n\n") {
         format!("{title}\n\n{section}{rest}")
@@ -844,7 +847,7 @@ fn compact_privacy_notes(notes: Vec<String>) -> Option<String> {
         .count();
     if no_secret_count > 1 || no_secret_count == sentences.len() {
         return Some(
-            "No obvious new secret or PII exposure detected in reviewed chunks.".to_string(),
+            "No obvious new PII or secret exposure detected in reviewed chunks.".to_string(),
         );
     }
     Some(sentences.join(" "))
@@ -1160,7 +1163,7 @@ mod tests {
 
         assert_eq!(
             merged.privacy_note.as_deref(),
-            Some("No obvious new secret or PII exposure detected in reviewed chunks.")
+            Some("No obvious new PII or secret exposure detected in reviewed chunks.")
         );
     }
 
@@ -1197,12 +1200,13 @@ mod tests {
     }
 
     #[test]
-    fn chunk_failure_partial_success_warning() {
+    fn chunk_failure_partial_success_summary_is_not_noisy() {
         let merged = merge_chunk_analyses(vec![analysis(vec![])], &report(4, 3));
 
+        assert!(!merged.summary.contains("review chunks failed"));
         assert!(merged
             .summary
-            .contains("⚠️ 3 of 4 review chunks failed. Findings may be incomplete."));
+            .contains("This is a partial risk-prioritized review, not a full exhaustive review."));
     }
 
     #[tokio::test]
@@ -1221,6 +1225,7 @@ mod tests {
             &metadata(),
             &chunks,
             &selection,
+            MarkdownRenderMode::Preview,
             false,
             |_, _| {},
             |_| async {
@@ -1241,29 +1246,51 @@ mod tests {
 
     #[test]
     fn large_summary_section_rendered() {
-        let markdown = format_large_review_markdown(&analysis(vec![]), &report(3, 0));
+        let markdown = format_large_review_markdown(
+            &analysis(vec![]),
+            &report(3, 0),
+            MarkdownRenderMode::Publish,
+        );
 
         assert!(markdown.contains("## Large MR Review Plan"));
         assert!(markdown.contains("## Finding Summary"));
+        assert!(markdown.contains("Planned chunks: 3"));
         assert!(markdown.contains("Reviewed chunks: 3"));
+        assert!(!markdown.contains("Failed chunks:"));
         assert!(markdown.contains("Review mode: risk-prioritized partial review"));
     }
 
     #[test]
-    fn large_review_markdown_caps_note_findings_by_default() {
+    fn large_summary_section_renders_failed_chunks_without_duplicate_warning() {
+        let markdown = format_large_review_markdown(
+            &analysis(vec![]),
+            &report(9, 1),
+            MarkdownRenderMode::Publish,
+        );
+
+        assert!(markdown.contains("Planned chunks: 9"));
+        assert!(markdown.contains("Reviewed chunks: 8"));
+        assert!(markdown.contains("Failed chunks: 1"));
+        assert_eq!(markdown.matches("review chunks failed").count(), 0);
+    }
+
+    #[test]
+    fn large_review_publish_markdown_collapses_note_findings_by_default() {
         let findings = (0..8)
             .map(|index| finding(&format!("note {index}"), Severity::Note, None))
             .collect::<Vec<_>>();
-        let markdown = format_large_review_markdown(&analysis(findings), &report(3, 0));
+        let markdown = format_large_review_markdown(
+            &analysis(findings),
+            &report(3, 0),
+            MarkdownRenderMode::Publish,
+        );
 
         let note_headings = markdown
             .lines()
             .filter(|line| line.starts_with("### ") && line.contains("NOTE"))
             .count();
-        assert!(note_headings <= 3);
-        assert!(
-            markdown.contains("Additional low/note findings omitted from the published summary: 5")
-        );
+        assert_eq!(note_headings, 0);
+        assert!(markdown.contains("0 low-priority findings and 8 notes were summarized only."));
     }
 
     fn options() -> LargeReviewOptions {

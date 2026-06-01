@@ -794,11 +794,11 @@ mod tests {
         let output = format_findings_summary(&summary);
 
         assert!(output.contains("Latest review:"));
-        assert!(output.contains("Open actionable findings: 3"));
+        assert!(output.contains("Open priority findings: 3"));
         assert!(output.contains("🔴 Critical: 1"));
         assert!(output.contains("🟠 High: 1"));
         assert!(output.contains("🟡 Medium: 1"));
-        assert!(output.contains("🟢 Low: 1"));
+        assert!(output.contains("🟢 Low-priority findings: 1"));
         assert!(output.contains("🔵 Notes: 1"));
         assert!(output.contains("Latest verification:"));
     }
@@ -821,9 +821,9 @@ mod tests {
         let summary = latest_findings_summary(&storage, &mr).unwrap();
         let output = format_findings_summary(&summary);
 
-        assert!(output.contains("Change since previous review:"));
-        assert!(output.contains("Previous published run: run-old"));
-        assert!(output.contains("⚠️ Still detected again: 1"));
+        assert!(output.contains("Change since previous published review:"));
+        assert!(output.contains("Compared with: run-old"));
+        assert!(output.contains("⚠️ Previously detected priority findings still present: 1"));
     }
 
     #[test]
@@ -843,9 +843,13 @@ mod tests {
 
         let generated = build_fix_prompt(&storage, &mr, default_options()).unwrap();
 
-        assert!(generated.prompt.contains("Change since previous review:"));
-        assert!(generated.prompt.contains("🆕 New findings: 0"));
-        assert!(generated.prompt.contains("⚠️ Still detected again: 1"));
+        assert!(generated
+            .prompt
+            .contains("Change since previous published review:"));
+        assert!(generated.prompt.contains("🆕 New priority findings: 0"));
+        assert!(generated
+            .prompt
+            .contains("⚠️ Previously detected priority findings still present: 1"));
         assert!(generated
             .prompt
             .contains("ReviewGate findings from latest SQLite run:"));

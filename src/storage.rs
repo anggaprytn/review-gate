@@ -612,7 +612,7 @@ impl Storage {
                  FROM review_findings
                  WHERE run_id = ?1
                    AND actionable = 1
-                   AND severity IN ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW')
+                   AND severity IN ('CRITICAL', 'HIGH', 'MEDIUM')
                  ORDER BY
                    CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END,
                    file_path,

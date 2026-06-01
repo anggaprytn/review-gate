@@ -35,8 +35,9 @@ use reviewgate::review::comparison::{
     insert_comparison_section, ReviewComparison,
 };
 use reviewgate::review::engine::{
-    build_sanitized_review_prompt, review_prompt_with_llm, ReviewPreview,
+    build_sanitized_review_prompt, review_prompt_with_llm_for_mode, ReviewPreview,
 };
+use reviewgate::review::formatter::MarkdownRenderMode;
 use reviewgate::review::inline::{
     format_inline_dry_run_report, resolve_inline_candidates_with_anchors,
 };
@@ -419,10 +420,16 @@ async fn run_large_review(
     }
 
     let llm_config = config.llm.clone();
+    let render_mode = if args.publish {
+        MarkdownRenderMode::Publish
+    } else {
+        MarkdownRenderMode::Preview
+    };
     let preview = review_large_chunks_with_llm(
         &context.metadata,
         &large_plan.chunks,
         &large_plan.selection,
+        render_mode,
         args.show_prompt,
         |chunk, total| {
             println!(
@@ -487,7 +494,7 @@ async fn publish_review(
     options: PublishOptions,
     storage: &mut Option<Storage>,
 ) -> Result<()> {
-    let preview = generate_preview(context, config, false).await?;
+    let preview = generate_preview(context, config, false, MarkdownRenderMode::Publish).await?;
     publish_review_preview(gitlab, context, diffs, config, options, storage, preview).await
 }
 
@@ -689,7 +696,8 @@ async fn print_preview(
     inline_dry_run: bool,
     storage: &mut Option<Storage>,
 ) -> Result<()> {
-    let mut preview = generate_preview(context, config, show_prompt).await?;
+    let mut preview =
+        generate_preview(context, config, show_prompt, MarkdownRenderMode::Preview).await?;
     let (persisted, comparison) =
         persist_review_run_and_apply_comparison(storage, context, config, &mut preview);
 
@@ -714,6 +722,7 @@ async fn generate_preview(
     context: &MergeRequestContext,
     config: &AppConfig,
     show_prompt: bool,
+    mode: MarkdownRenderMode,
 ) -> Result<ReviewPreview> {
     let prompt = build_sanitized_review_prompt(context);
     if show_prompt {
@@ -725,7 +734,7 @@ async fn generate_preview(
     }
 
     let llm_config = config.llm.clone();
-    let preview = review_prompt_with_llm(prompt, move |prompt| async move {
+    let preview = review_prompt_with_llm_for_mode(prompt, mode, move |prompt| async move {
         review_with_config(&llm_config, &prompt).await
     })
     .await?;

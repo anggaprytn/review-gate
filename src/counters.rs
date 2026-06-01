@@ -9,6 +9,7 @@ pub struct FindingCounters {
     pub total: usize,
     pub actionable: usize,
     pub open_actionable: usize,
+    pub open_priority: usize,
     pub critical: usize,
     pub high: usize,
     pub medium: usize,
@@ -38,6 +39,9 @@ pub fn count_review_findings(findings: &[ReviewFinding]) -> FindingCounters {
             if finding.severity != Severity::Note {
                 counters.open_actionable += 1;
             }
+            if is_priority_severity(finding.severity) {
+                counters.open_priority += 1;
+            }
         }
         increment_severity(&mut counters, finding.severity);
     }
@@ -56,6 +60,12 @@ pub fn count_stored_findings(findings: &[StoredReviewFinding]) -> FindingCounter
                 Some(Severity::Critical | Severity::High | Severity::Medium | Severity::Low)
             ) {
                 counters.open_actionable += 1;
+            }
+            if matches!(
+                severity,
+                Some(Severity::Critical | Severity::High | Severity::Medium)
+            ) {
+                counters.open_priority += 1;
             }
         }
         if let Some(severity) = severity {
@@ -91,15 +101,15 @@ pub fn count_verification_status_strings<'a>(
 
 pub fn format_finding_counters_terminal(counters: &FindingCounters, emoji: bool) -> String {
     format!(
-        "Finding counters:\nOpen actionable findings: {}\n{}: {}\n{}: {}\n{}: {}\n{}: {}\n{}: {}\n",
-        counters.open_actionable,
+        "Finding counters:\nOpen priority findings: {}\n{}: {}\n{}: {}\n{}: {}\n{}: {}\n{}: {}\n",
+        counters.open_priority,
         finding_label(Severity::Critical, emoji),
         counters.critical,
         finding_label(Severity::High, emoji),
         counters.high,
         finding_label(Severity::Medium, emoji),
         counters.medium,
-        finding_label(Severity::Low, emoji),
+        low_priority_label(emoji),
         counters.low,
         finding_label(Severity::Note, emoji),
         counters.note,
@@ -108,15 +118,15 @@ pub fn format_finding_counters_terminal(counters: &FindingCounters, emoji: bool)
 
 pub fn format_finding_counters_markdown(counters: &FindingCounters, emoji: bool) -> String {
     format!(
-        "## Finding Summary\n\nOpen actionable findings: {}\n\n| Severity | Count |\n|---|---:|\n| {} | {} |\n| {} | {} |\n| {} | {} |\n| {} | {} |\n| {} | {} |\n",
-        counters.open_actionable,
+        "## Finding Summary\n\nOpen priority findings: {}\n\n| Severity | Count |\n|---|---:|\n| {} | {} |\n| {} | {} |\n| {} | {} |\n\nAdditional:\n- {}: {}\n- {}: {}\n",
+        counters.open_priority,
         finding_label(Severity::Critical, emoji),
         counters.critical,
         finding_label(Severity::High, emoji),
         counters.high,
         finding_label(Severity::Medium, emoji),
         counters.medium,
-        finding_label(Severity::Low, emoji),
+        low_priority_label(emoji),
         counters.low,
         finding_label(Severity::Note, emoji),
         counters.note,
@@ -185,6 +195,13 @@ fn increment_severity(counters: &mut FindingCounters, severity: Severity) {
     }
 }
 
+fn is_priority_severity(severity: Severity) -> bool {
+    matches!(
+        severity,
+        Severity::Critical | Severity::High | Severity::Medium
+    )
+}
+
 fn increment_verification_status(counters: &mut VerificationCounters, status: VerificationStatus) {
     match status {
         VerificationStatus::Fixed => counters.fixed += 1,
@@ -217,6 +234,14 @@ fn finding_label(severity: Severity, emoji: bool) -> String {
         format!("{} {label}", severity.emoji())
     } else {
         label.to_string()
+    }
+}
+
+fn low_priority_label(emoji: bool) -> String {
+    if emoji {
+        "🟢 Low-priority findings".to_string()
+    } else {
+        "Low-priority findings".to_string()
     }
 }
 
@@ -258,7 +283,7 @@ mod tests {
                 finding(Severity::Critical, true),
                 finding(Severity::High, true),
                 finding(Severity::Medium, true),
-                finding(Severity::Low, false),
+                finding(Severity::Low, true),
                 finding(Severity::Note, true),
             ],
             test_coverage_note: None,
@@ -269,8 +294,9 @@ mod tests {
         let counters = count_findings_from_analysis(&analysis);
 
         assert_eq!(counters.total, 5);
-        assert_eq!(counters.actionable, 4);
-        assert_eq!(counters.open_actionable, 3);
+        assert_eq!(counters.actionable, 5);
+        assert_eq!(counters.open_actionable, 4);
+        assert_eq!(counters.open_priority, 3);
         assert_eq!(counters.critical, 1);
         assert_eq!(counters.note, 1);
     }
@@ -288,6 +314,7 @@ mod tests {
         assert_eq!(counters.total, 3);
         assert_eq!(counters.actionable, 2);
         assert_eq!(counters.open_actionable, 1);
+        assert_eq!(counters.open_priority, 1);
         assert_eq!(counters.high, 1);
         assert_eq!(counters.note, 1);
         assert_eq!(counters.low, 1);
@@ -297,22 +324,26 @@ mod tests {
     fn markdown_finding_summary_table_formats_expected_rows() {
         let markdown = format_finding_counters_markdown(
             &super::FindingCounters {
-                open_actionable: 7,
+                open_priority: 7,
                 critical: 3,
                 high: 2,
                 medium: 2,
+                low: 6,
+                note: 21,
                 ..super::FindingCounters::default()
             },
             true,
         );
 
         assert!(markdown.contains("## Finding Summary"));
-        assert!(markdown.contains("Open actionable findings: 7"));
+        assert!(markdown.contains("Open priority findings: 7"));
         assert!(markdown.contains("| 🔴 Critical | 3 |"));
         assert!(markdown.contains("| 🟠 High | 2 |"));
         assert!(markdown.contains("| 🟡 Medium | 2 |"));
-        assert!(markdown.contains("| 🟢 Low | 0 |"));
-        assert!(markdown.contains("| 🔵 Notes | 0 |"));
+        assert!(markdown.contains("Additional:"));
+        assert!(markdown.contains("- 🟢 Low-priority findings: 6"));
+        assert!(markdown.contains("- 🔵 Notes: 21"));
+        assert!(!markdown.contains("Open actionable findings"));
     }
 
     #[test]
@@ -336,19 +367,24 @@ mod tests {
     fn terminal_finding_counter_formatting() {
         let output = format_finding_counters_terminal(
             &super::FindingCounters {
-                open_actionable: 7,
+                open_priority: 7,
                 critical: 3,
                 high: 2,
                 medium: 2,
+                low: 6,
+                note: 21,
                 ..super::FindingCounters::default()
             },
             true,
         );
 
         assert!(output.contains("Finding counters:"));
-        assert!(output.contains("Open actionable findings: 7"));
+        assert!(output.contains("Open priority findings: 7"));
         assert!(output.contains("🔴 Critical: 3"));
         assert!(output.contains("🟠 High: 2"));
+        assert!(output.contains("🟢 Low-priority findings: 6"));
+        assert!(output.contains("🔵 Notes: 21"));
+        assert!(!output.contains("Open actionable findings"));
     }
 
     #[test]

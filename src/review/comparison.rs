@@ -78,6 +78,17 @@ pub fn compare_findings(
     current_findings: &[StoredPreviousFinding],
     verification_statuses: &[StoredVerificationStatus],
 ) -> ReviewComparison {
+    let previous_priority = previous_findings
+        .iter()
+        .filter(|finding| is_priority_finding(finding))
+        .cloned()
+        .collect::<Vec<_>>();
+    let current_priority = current_findings
+        .iter()
+        .filter(|finding| is_priority_finding(finding))
+        .cloned()
+        .collect::<Vec<_>>();
+
     if previous_run.is_none() {
         return ReviewComparison {
             previous_run_id: None,
@@ -88,12 +99,12 @@ pub fn compare_findings(
             verified_fixed: 0,
             needs_verification: 0,
             previous_total_actionable: 0,
-            current_total_actionable: current_findings.len(),
+            current_total_actionable: current_priority.len(),
         };
     }
 
-    let current_index = FindingKeyIndex::from_findings(current_findings);
-    let previous_index = FindingKeyIndex::from_findings(previous_findings);
+    let current_index = FindingKeyIndex::from_findings(&current_priority);
+    let previous_index = FindingKeyIndex::from_findings(&previous_priority);
     let latest_status_by_finding = latest_status_map(verification_statuses);
 
     let mut still_detected = 0;
@@ -101,7 +112,7 @@ pub fn compare_findings(
     let mut verified_fixed = 0;
     let mut needs_verification = 0;
 
-    for previous in previous_findings {
+    for previous in &previous_priority {
         if current_index.contains_finding(previous) {
             still_detected += 1;
             continue;
@@ -116,7 +127,7 @@ pub fn compare_findings(
         }
     }
 
-    let new_findings = current_findings
+    let new_findings = current_priority
         .iter()
         .filter(|finding| !previous_index.contains_finding(finding))
         .count();
@@ -129,52 +140,51 @@ pub fn compare_findings(
         not_detected,
         verified_fixed,
         needs_verification,
-        previous_total_actionable: previous_findings.len(),
-        current_total_actionable: current_findings.len(),
+        previous_total_actionable: previous_priority.len(),
+        current_total_actionable: current_priority.len(),
     }
 }
 
 pub fn format_comparison_markdown(comparison: &ReviewComparison, emoji: bool) -> String {
     let mut output = String::new();
-    output.push_str("## Change Since Previous Review\n\n");
+    output.push_str("## Change Since Previous Published Review\n\n");
     let Some(previous_run_id) = comparison.previous_run_id.as_deref() else {
         output.push_str("No previous published ReviewGate run found for this MR.\n");
         return output;
     };
 
+    output.push_str(&format!("Compared with: `{previous_run_id}`\n\n"));
+    output.push_str("Current review:\n");
     output.push_str(&format!(
-        "Compared with previous published run: `{previous_run_id}`\n\n"
-    ));
-    output.push_str("| Status | Count |\n|---|---:|\n");
-    output.push_str(&format!(
-        "| {} | {} |\n",
+        "- {}: {}\n",
         comparison_label(FindingDeltaStatus::New, emoji),
         comparison.new_findings
     ));
     output.push_str(&format!(
-        "| {} | {} |\n",
+        "- {}: {}\n\n",
         comparison_label(FindingDeltaStatus::StillDetected, emoji),
         comparison.still_detected
     ));
+    output.push_str("Previous review:\n");
     output.push_str(&format!(
-        "| {} | {} |\n",
+        "- {}: {}\n",
         comparison_label(FindingDeltaStatus::PossiblyResolvedNeedsVerification, emoji),
         comparison.possibly_resolved_needs_verification()
     ));
     output.push_str(&format!(
-        "| {} | {} |\n",
+        "- {}: {}\n",
         comparison_label(FindingDeltaStatus::VerifiedFixed, emoji),
         comparison.verified_fixed
     ));
     output.push_str(
-        "\nNote: \"Possibly resolved\" means the previous finding was not detected in this review. It is not counted as fixed until `reviewgate verify` confirms it.\n",
+        "\nNote: \"No longer detected\" is not counted as fixed until `reviewgate verify` confirms it.\n",
     );
     output
 }
 
 pub fn format_review_status_markdown(comparison: &ReviewComparison) -> String {
     format!(
-        "## Review Status\n\nCurrent open actionable findings: {}\nPrevious findings still detected: {}\nPossibly resolved, needs verification: {}\nVerified fixed: {}\n",
+        "## Review Status\n\nCurrent open priority findings: {}\nPreviously detected priority findings still present: {}\nNo longer detected, needs verification: {}\nVerified fixed: {}\n",
         comparison.current_total_actionable,
         comparison.still_detected,
         comparison.possibly_resolved_needs_verification(),
@@ -185,32 +195,38 @@ pub fn format_review_status_markdown(comparison: &ReviewComparison) -> String {
 pub fn format_comparison_terminal(comparison: &ReviewComparison, emoji: bool) -> String {
     let mut output = String::new();
     let Some(previous_run_id) = comparison.previous_run_id.as_deref() else {
-        output.push_str("Change since previous review: no previous published run found\n");
+        output
+            .push_str("Change since previous published review: no previous published run found\n");
         return output;
     };
 
-    output.push_str("Change since previous review:\n");
-    output.push_str(&format!("Previous published run: {previous_run_id}\n"));
+    output.push_str("Change since previous published review:\n");
+    output.push_str(&format!("Compared with: {previous_run_id}\n"));
+    output.push_str("Current review:\n");
     output.push_str(&format!(
-        "{}: {}\n",
+        "- {}: {}\n",
         comparison_label(FindingDeltaStatus::New, emoji),
         comparison.new_findings
     ));
     output.push_str(&format!(
-        "{}: {}\n",
+        "- {}: {}\n",
         comparison_label(FindingDeltaStatus::StillDetected, emoji),
         comparison.still_detected
     ));
+    output.push_str("Previous review:\n");
     output.push_str(&format!(
-        "{}: {}\n",
+        "- {}: {}\n",
         comparison_label(FindingDeltaStatus::PossiblyResolvedNeedsVerification, emoji),
         comparison.possibly_resolved_needs_verification()
     ));
     output.push_str(&format!(
-        "{}: {}\n",
+        "- {}: {}\n",
         comparison_label(FindingDeltaStatus::VerifiedFixed, emoji),
         comparison.verified_fixed
     ));
+    output.push_str(
+        "Note: \"No longer detected\" is not counted as fixed until reviewgate verify confirms it.\n",
+    );
     output
 }
 
@@ -227,12 +243,10 @@ pub fn insert_comparison_section_with_emoji(
     comparison: &ReviewComparison,
     emoji: bool,
 ) -> String {
-    let section = format!(
-        "{}\n{}",
-        format_review_status_markdown(comparison),
-        format_comparison_markdown(comparison, emoji)
-    );
-    if markdown.contains("## Change Since Previous Review") {
+    let section = format_comparison_markdown(comparison, emoji);
+    if markdown.contains("## Change Since Previous Review")
+        || markdown.contains("## Change Since Previous Published Review")
+    {
         return markdown.to_string();
     }
     if markdown.contains("## Review Status") {
@@ -254,13 +268,23 @@ fn latest_status_map(statuses: &[StoredVerificationStatus]) -> HashMap<&str, Ver
     latest
 }
 
+fn is_priority_finding(finding: &StoredPreviousFinding) -> bool {
+    finding.actionable
+        && matches!(
+            finding.severity.trim().to_ascii_uppercase().as_str(),
+            "CRITICAL" | "HIGH" | "MEDIUM"
+        )
+}
+
 fn comparison_label(status: FindingDeltaStatus, emoji: bool) -> String {
     let (icon, label) = match status {
-        FindingDeltaStatus::New => ("🆕", "New findings"),
-        FindingDeltaStatus::StillDetected => ("⚠️", "Still detected again"),
-        FindingDeltaStatus::NotDetected => ("🟣", "Not detected in this review"),
+        FindingDeltaStatus::New => ("🆕", "New priority findings"),
+        FindingDeltaStatus::StillDetected => {
+            ("⚠️", "Previously detected priority findings still present")
+        }
+        FindingDeltaStatus::NotDetected => ("🟣", "No longer detected"),
         FindingDeltaStatus::PossiblyResolvedNeedsVerification => {
-            ("🟣", "Possibly resolved, needs verification")
+            ("🟣", "No longer detected, needs verification")
         }
         FindingDeltaStatus::VerifiedFixed => ("✅", "Verified fixed"),
         FindingDeltaStatus::NeedsVerification => ("❓", "Needs verification"),
@@ -419,11 +443,11 @@ mod tests {
         assert_eq!(comparison.new_findings, 0);
         assert_eq!(
             format_comparison_terminal(&comparison, false),
-            "Change since previous review: no previous published run found\n"
+            "Change since previous published review: no previous published run found\n"
         );
         assert_eq!(
             format_comparison_markdown(&comparison, false),
-            "## Change Since Previous Review\n\nNo previous published ReviewGate run found for this MR.\n"
+            "## Change Since Previous Published Review\n\nNo previous published ReviewGate run found for this MR.\n"
         );
     }
 
@@ -483,6 +507,33 @@ mod tests {
     }
 
     #[test]
+    fn comparison_counts_priority_findings_only() {
+        let mut previous_low = finding("prev-low", Some("fp-low"), Some(40), "Low");
+        previous_low.severity = "LOW".to_string();
+        let mut current_low = finding("current-low", Some("fp-low-new"), Some(41), "Low new");
+        current_low.severity = "LOW".to_string();
+        let mut current_note = finding("current-note", Some("fp-note"), Some(42), "Note");
+        current_note.severity = "NOTE".to_string();
+
+        let previous = vec![
+            finding("prev-high", Some("fp-high"), Some(10), "High"),
+            previous_low,
+        ];
+        let current = vec![
+            finding("current-high", Some("fp-high-new"), Some(20), "New High"),
+            current_low,
+            current_note,
+        ];
+
+        let comparison = compare_findings("current-run", Some(&run()), &previous, &current, &[]);
+
+        assert_eq!(comparison.new_findings, 1);
+        assert_eq!(comparison.not_detected, 1);
+        assert_eq!(comparison.previous_total_actionable, 1);
+        assert_eq!(comparison.current_total_actionable, 1);
+    }
+
+    #[test]
     fn verified_fixed_is_counted_from_latest_verification_result() {
         let previous = vec![finding("prev-fixed", Some("fp-fixed"), Some(10), "Fixed")];
         let statuses = vec![status("prev-fixed", VerificationStatus::Fixed)];
@@ -521,17 +572,17 @@ mod tests {
     fn markdown_comparison_table_with_emoji() {
         let markdown = format_comparison_markdown(&comparison(), true);
 
-        assert!(markdown.contains("## Change Since Previous Review"));
-        assert!(markdown.contains("Compared with previous published run: `previous-run`"));
-        assert!(markdown.contains("| Status | Count |\n|---|---:|"));
-        assert!(markdown.contains("| 🆕 New findings | 4 |"));
-        assert!(markdown.contains("| ⚠️ Still detected again | 12 |"));
-        assert!(markdown.contains("| 🟣 Possibly resolved, needs verification | 3 |"));
-        assert!(markdown.contains("| ✅ Verified fixed | 2 |"));
+        assert!(markdown.contains("## Change Since Previous Published Review"));
+        assert!(markdown.contains("Compared with: `previous-run`"));
+        assert!(markdown.contains("Current review:"));
+        assert!(markdown.contains("- 🆕 New priority findings: 4"));
+        assert!(markdown.contains("- ⚠️ Previously detected priority findings still present: 12"));
+        assert!(markdown.contains("Previous review:"));
+        assert!(markdown.contains("- 🟣 No longer detected, needs verification: 3"));
+        assert!(markdown.contains("- ✅ Verified fixed: 2"));
+        assert!(!markdown.contains("| Status | Count |"));
         assert!(!markdown.contains("| ❓ Needs verification |"));
-        assert!(
-            markdown.contains("It is not counted as fixed until `reviewgate verify` confirms it.")
-        );
+        assert!(markdown.contains("not counted as fixed until `reviewgate verify` confirms it."));
         assert!(!markdown.contains('━'));
         assert!(!markdown.contains('─'));
     }
@@ -544,10 +595,10 @@ mod tests {
 
         let markdown = format_comparison_markdown(&comparison, true);
 
-        assert!(markdown.contains("| 🟣 Possibly resolved, needs verification | 15 |"));
+        assert!(markdown.contains("- 🟣 No longer detected, needs verification: 15"));
         assert!(!markdown.contains("| 🟣 Not detected in this review |"));
         assert!(!markdown.contains("| ❓ Needs verification |"));
-        assert!(!markdown.contains("| 🟣 Possibly resolved, needs verification | 30 |"));
+        assert!(!markdown.contains("No longer detected, needs verification: 30"));
     }
 
     #[test]
@@ -559,17 +610,17 @@ mod tests {
 
         let markdown = format_comparison_markdown(&comparison, true);
 
-        assert!(markdown.contains("| 🟣 Possibly resolved, needs verification | 15 |"));
-        assert!(markdown.contains("| ✅ Verified fixed | 4 |"));
+        assert!(markdown.contains("- 🟣 No longer detected, needs verification: 15"));
+        assert!(markdown.contains("- ✅ Verified fixed: 4"));
     }
 
     #[test]
     fn markdown_comparison_table_without_emoji() {
         let markdown = format_comparison_markdown(&comparison(), false);
 
-        assert!(markdown.contains("| New findings | 4 |"));
-        assert!(markdown.contains("| Still detected again | 12 |"));
-        assert!(markdown.contains("| Possibly resolved, needs verification | 3 |"));
+        assert!(markdown.contains("- New priority findings: 4"));
+        assert!(markdown.contains("- Previously detected priority findings still present: 12"));
+        assert!(markdown.contains("- No longer detected, needs verification: 3"));
         assert!(!markdown.contains("🆕"));
     }
 
@@ -577,10 +628,10 @@ mod tests {
     fn terminal_comparison_formatting() {
         let output = format_comparison_terminal(&comparison(), true);
 
-        assert!(output.contains("Change since previous review:"));
-        assert!(output.contains("Previous published run: previous-run"));
-        assert!(output.contains("⚠️ Still detected again: 12"));
-        assert!(output.contains("🟣 Possibly resolved, needs verification: 3"));
+        assert!(output.contains("Change since previous published review:"));
+        assert!(output.contains("Compared with: previous-run"));
+        assert!(output.contains("- ⚠️ Previously detected priority findings still present: 12"));
+        assert!(output.contains("- 🟣 No longer detected, needs verification: 3"));
         assert!(!output.contains("Needs verification:"));
     }
 
@@ -589,9 +640,9 @@ mod tests {
         let markdown = format_review_status_markdown(&comparison());
 
         assert!(markdown.contains("## Review Status"));
-        assert!(markdown.contains("Current open actionable findings: 16"));
-        assert!(markdown.contains("Previous findings still detected: 12"));
-        assert!(markdown.contains("Possibly resolved, needs verification: 3"));
+        assert!(markdown.contains("Current open priority findings: 16"));
+        assert!(markdown.contains("Previously detected priority findings still present: 12"));
+        assert!(markdown.contains("No longer detected, needs verification: 3"));
         assert!(markdown.contains("Verified fixed: 2"));
     }
 
@@ -602,9 +653,10 @@ mod tests {
 
         let output = insert_comparison_section_with_emoji(markdown, &comparison(), false);
 
-        assert!(output.contains("## Finding Summary\n\nx\n\n## Review Status"));
-        assert!(output.contains("## Change Since Previous Review"));
-        assert!(output.contains("## Review Status"));
+        assert!(
+            output.contains("## Finding Summary\n\nx\n\n## Change Since Previous Published Review")
+        );
+        assert!(!output.contains("## Review Status"));
         assert!(output.contains("\n## Summary\n\nbody"));
     }
 
@@ -615,8 +667,9 @@ mod tests {
         let output = insert_comparison_section_with_emoji(markdown, &comparison(), false);
 
         assert!(output.contains("## Large MR Review Plan"));
-        assert!(output.contains("## Finding Summary\n\nx\n\n## Review Status"));
-        assert!(output.contains("## Change Since Previous Review"));
+        assert!(
+            output.contains("## Finding Summary\n\nx\n\n## Change Since Previous Published Review")
+        );
     }
 
     fn comparison() -> ReviewComparison {

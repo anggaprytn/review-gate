@@ -3,7 +3,9 @@ use crate::{
     gitlab::context::MergeRequestContext,
     llm::types::{LlmReviewResponse, LlmRunMetadata},
     review::{
-        formatter::{format_malformed_review_markdown, format_review_markdown},
+        formatter::{
+            format_malformed_review_markdown, format_review_markdown_for_mode, MarkdownRenderMode,
+        },
         parser::parse_review_analysis,
         prompt::build_review_prompt,
         quality::normalize_review_analysis,
@@ -30,13 +32,29 @@ where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<LlmReviewResponse>>,
 {
+    review_prompt_with_llm_for_mode(prompt, MarkdownRenderMode::Preview, call_llm).await
+}
+
+pub async fn review_prompt_with_llm_for_mode<F, Fut>(
+    prompt: String,
+    mode: MarkdownRenderMode,
+    call_llm: F,
+) -> Result<ReviewPreview>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<LlmReviewResponse>>,
+{
     let prompt_token_estimate = estimate_prompt_tokens(&prompt);
     let llm_response = call_llm(prompt).await?;
 
     let (markdown, parsed, analysis) = match parse_review_analysis(&llm_response.text) {
         Ok(analysis) => {
             let analysis = normalize_review_analysis(analysis);
-            (format_review_markdown(&analysis), true, Some(analysis))
+            (
+                format_review_markdown_for_mode(&analysis, mode),
+                true,
+                Some(analysis),
+            )
         }
         Err(err) => (
             format_malformed_review_markdown(&llm_response.text, &err),

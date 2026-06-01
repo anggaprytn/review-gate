@@ -38,6 +38,28 @@ const CRITICAL_PHRASES: &[&str] = &[
     "session remains active after compromised device detection",
 ];
 
+const SPECULATIVE_PHRASES: &[&str] = &[
+    "not visible in this diff",
+    "not provided in this diff",
+    "defaults are not visible",
+    "unclear from this diff",
+    "cannot be confirmed",
+    "may be",
+    "could be",
+    "if the defaults are false",
+    "if misconfigured",
+    "if included in production",
+    "if this flag can be enabled",
+];
+
+const UNSEEN_IMPLEMENTATION_PHRASES: &[&str] = &[
+    "not visible in this diff",
+    "not provided in this diff",
+    "defaults are not visible",
+    "unclear from this diff",
+    "cannot be confirmed",
+];
+
 const MISLEADING_TITLE_PREFIXES: &[&str] = &[
     "critical:",
     "high:",
@@ -76,11 +98,91 @@ fn normalize_finding(mut finding: ReviewFinding) -> ReviewFinding {
         return finding;
     }
 
+    normalize_speculative_severity(&mut finding);
+
     if finding.severity == Severity::Critical && !critical_allowed(&finding) {
         finding.severity = Severity::High;
     }
 
     finding
+}
+
+fn normalize_speculative_severity(finding: &mut ReviewFinding) {
+    let text = normalize_text(&format!("{} {}", finding.title, finding.body));
+    if debug_only_nonproduction_signal(&text) {
+        if matches!(
+            finding.severity,
+            Severity::Critical | Severity::High | Severity::Medium
+        ) {
+            finding.severity = Severity::Low;
+        }
+        return;
+    }
+
+    if !speculative_signal(&text) {
+        return;
+    }
+
+    finding.severity = match finding.severity {
+        Severity::Critical => Severity::Medium,
+        Severity::High => Severity::Medium,
+        Severity::Medium if purely_speculative(finding, &text) => Severity::Low,
+        severity => severity,
+    };
+}
+
+fn speculative_signal(text: &str) -> bool {
+    SPECULATIVE_PHRASES
+        .iter()
+        .any(|phrase| text.contains(phrase))
+}
+
+fn purely_speculative(finding: &ReviewFinding, text: &str) -> bool {
+    let unseen_implementation = UNSEEN_IMPLEMENTATION_PHRASES
+        .iter()
+        .any(|phrase| text.contains(phrase));
+    let concrete_action = has_concrete_file_path_action(finding);
+    unseen_implementation || !(security_sensitive(finding) && concrete_action)
+}
+
+fn has_concrete_file_path_action(finding: &ReviewFinding) -> bool {
+    finding
+        .file_path
+        .as_deref()
+        .is_some_and(|path| !path.trim().is_empty())
+        && finding
+            .suggested_fix
+            .as_deref()
+            .is_some_and(|fix| !fix.trim().is_empty())
+}
+
+fn security_sensitive(finding: &ReviewFinding) -> bool {
+    matches!(
+        finding.category,
+        ReviewCategory::Security | ReviewCategory::Privacy | ReviewCategory::DataIntegrity
+    ) || matches!(
+        finding.risk_code,
+        Some(
+            RiskCode::AuthBypass
+                | RiskCode::MissingAuthorizationCheck
+                | RiskCode::SecretLeak
+                | RiskCode::PiiOrSecretLogging
+                | RiskCode::SqlInjection
+                | RiskCode::CommandInjection
+                | RiskCode::UnsafeDeserialization
+                | RiskCode::DataIntegrityRisk
+                | RiskCode::MigrationRisk
+        )
+    )
+}
+
+fn debug_only_nonproduction_signal(text: &str) -> bool {
+    text.contains("debug-only")
+        || (text.contains("debug")
+            && (text.contains("cleartext")
+                || text.contains("public wi-fi")
+                || text.contains("public wifi"))
+            && !text.contains("production"))
 }
 
 fn is_positive_note(finding: &ReviewFinding, original_title: &str) -> bool {
@@ -364,6 +466,70 @@ mod tests {
         )]));
 
         assert_eq!(normalized.findings[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn speculative_critical_is_downgraded() {
+        let mut item = finding(
+            Severity::Critical,
+            Some(RiskCode::MissingAuthorizationCheck),
+            "Implicit security hook configuration creates ambiguity",
+            "The defaults are not visible in this diff, so protection cannot be confirmed.",
+            Some("Pass the security hook options explicitly."),
+        );
+        item.category = ReviewCategory::Security;
+        item.file_path = Some("src/security/hooks.ts".to_string());
+
+        let normalized = normalize_review_analysis(analysis(vec![item]));
+
+        assert_eq!(normalized.findings[0].severity, Severity::Medium);
+    }
+
+    #[test]
+    fn speculative_high_is_downgraded_when_not_directly_proven() {
+        let mut item = finding(
+            Severity::High,
+            Some(RiskCode::SecretLeak),
+            "Hardcoded debug signature could be enabled in production",
+            "The signature could be included in production if misconfigured.",
+            Some("Gate the signature behind a non-release build flag."),
+        );
+        item.category = ReviewCategory::Security;
+        item.file_path = Some("android/app/build.gradle".to_string());
+
+        let normalized = normalize_review_analysis(analysis(vec![item]));
+
+        assert_eq!(normalized.findings[0].severity, Severity::Medium);
+    }
+
+    #[test]
+    fn debug_only_cleartext_finding_is_low_when_not_production_proven() {
+        let mut item = finding(
+            Severity::High,
+            Some(RiskCode::PiiOrSecretLogging),
+            "Cleartext debug config could leak on public Wi-Fi",
+            "The debug-only network config could leak traffic on public Wi-Fi.",
+            Some("Keep the config debug-only and exclude it from release builds."),
+        );
+        item.category = ReviewCategory::Security;
+        item.file_path = Some("android/app/src/debug/network_security_config.xml".to_string());
+
+        let normalized = normalize_review_analysis(analysis(vec![item]));
+
+        assert_eq!(normalized.findings[0].severity, Severity::Low);
+    }
+
+    #[test]
+    fn speculative_medium_without_concrete_action_is_low() {
+        let normalized = normalize_review_analysis(analysis(vec![finding(
+            Severity::Medium,
+            Some(RiskCode::MaintainabilityRisk),
+            "Defaults are unclear",
+            "The behavior cannot be confirmed from this diff.",
+            Some("Review the defaults."),
+        )]));
+
+        assert_eq!(normalized.findings[0].severity, Severity::Low);
     }
 
     #[test]
