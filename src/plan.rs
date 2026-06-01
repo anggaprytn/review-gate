@@ -20,7 +20,7 @@ pub enum FileRiskLevel {
 }
 
 impl FileRiskLevel {
-    fn priority(self) -> u8 {
+    pub(crate) fn priority(self) -> u8 {
         match self {
             Self::Critical => 0,
             Self::High => 1,
@@ -30,7 +30,7 @@ impl FileRiskLevel {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Critical => "Critical",
             Self::High => "High",
@@ -57,7 +57,7 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Generated => "generated file",
             Self::TooLarge => "too large",

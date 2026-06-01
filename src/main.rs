@@ -32,6 +32,10 @@ use reviewgate::review::engine::{
 use reviewgate::review::inline::{
     format_inline_dry_run_report, resolve_inline_candidates_with_anchors,
 };
+use reviewgate::review::large::{
+    build_large_review_plan, review_large_chunks_with_llm, selected_diffs_in_order,
+    validate_large_inline_mapping, LargeReviewOptions,
+};
 use reviewgate::storage::{PersistedReviewRun, Storage};
 use reviewgate::verify::{
     no_previous_run_message, verification_prompt_with_llm, VerificationPreview,
@@ -206,6 +210,11 @@ async fn run_review(args: ReviewArgs) -> Result<()> {
     )?;
     let metadata = gitlab.fetch_merge_request(&mr).await?;
     let diffs = gitlab.fetch_merge_request_diffs(&mr).await?;
+    if args.large {
+        run_large_review(args, mr, metadata, diffs, config, gitlab, &mut storage).await?;
+        return Ok(());
+    }
+
     let context = build_merge_request_context(
         mr,
         metadata,
@@ -228,6 +237,7 @@ async fn run_review(args: ReviewArgs) -> Result<()> {
                 internal_note_flag: args.internal_note,
                 publish_inline,
                 inline_dry_run,
+                large_review: false,
             },
             &mut storage,
         )
@@ -298,6 +308,113 @@ struct PublishOptions {
     internal_note_flag: bool,
     publish_inline: bool,
     inline_dry_run: bool,
+    large_review: bool,
+}
+
+async fn run_large_review(
+    args: ReviewArgs,
+    mr: GitLabMrUrl,
+    metadata: reviewgate::gitlab::types::MergeRequestMetadata,
+    diffs: Vec<reviewgate::gitlab::types::MergeRequestDiff>,
+    config: AppConfig,
+    gitlab: GitLabClient,
+    storage: &mut Option<Storage>,
+) -> Result<()> {
+    let publish_inline = args.publishes_inline()?;
+    let mut large_options = LargeReviewOptions::from_env();
+    large_options.include_low_risk = large_options.include_low_risk || args.include_low_risk;
+
+    let mut plan_options = PlanOptions::from_env();
+    plan_options.max_files = large_options.max_chunks * large_options.max_files_per_chunk;
+    plan_options.max_diff_bytes = large_options.max_chunks * large_options.max_diff_bytes_per_chunk;
+    plan_options.large_mr_diff_bytes = plan_options.max_diff_bytes;
+    plan_options.include_low_risk = large_options.include_low_risk;
+
+    let review_plan = build_review_plan(&mr, metadata.clone(), diffs.clone(), plan_options);
+    let anchor_review_config = review_config_for_large_anchors(&config, &diffs);
+    let context = build_merge_request_context(
+        mr,
+        metadata,
+        diffs.clone(),
+        &anchor_review_config,
+        config.privacy.redact_secrets,
+    );
+    let large_plan = build_large_review_plan(
+        &review_plan,
+        &diffs,
+        &context.anchored_diff,
+        large_options,
+        args.include_low_risk,
+    )?;
+    let selected_diffs = selected_diffs_in_order(&diffs, &large_plan.selection.files);
+
+    print_large_review_plan(
+        &large_plan,
+        &config,
+        review_mode_label(args.publish, publish_inline, args.dry_run),
+    );
+
+    if args.dry_run {
+        println!("LLM call: skipped in dry-run");
+        println!("Publish: skipped");
+        return Ok(());
+    }
+
+    let llm_config = config.llm.clone();
+    let preview = review_large_chunks_with_llm(
+        &context.metadata,
+        &large_plan.chunks,
+        &large_plan.selection,
+        args.show_prompt,
+        |chunk, total| {
+            println!(
+                "Reviewing chunk {}/{}: {} files, {}KB",
+                chunk.index,
+                total,
+                chunk.files.len(),
+                chunk.diff_bytes.div_ceil(1024)
+            );
+        },
+        move |prompt| {
+            let llm_config = llm_config.clone();
+            async move { review_with_config(&llm_config, &prompt).await }
+        },
+    )
+    .await?;
+
+    if args.publish {
+        publish_review_preview(
+            &gitlab,
+            &context,
+            &selected_diffs,
+            &config,
+            PublishOptions {
+                force_new_note: args.force_new_note,
+                internal_note_flag: args.internal_note,
+                publish_inline,
+                inline_dry_run: args.inline_dry_run,
+                large_review: true,
+            },
+            storage,
+            preview,
+        )
+        .await?;
+    } else {
+        println!("{}", preview.markdown);
+        print_run_metadata(
+            &config,
+            &preview.metadata,
+            preview.prompt_token_estimate,
+            preview.parsed,
+        );
+        if args.inline_dry_run {
+            print_inline_dry_run_report(&preview, &context, &selected_diffs, &config);
+        }
+        let persisted = persist_review_run_best_effort(storage, &context, &config, &preview);
+        print_persisted_review_run(storage, persisted.as_ref());
+    }
+
+    Ok(())
 }
 
 async fn publish_review(
@@ -309,6 +426,18 @@ async fn publish_review(
     storage: &mut Option<Storage>,
 ) -> Result<()> {
     let preview = generate_preview(context, config, false).await?;
+    publish_review_preview(gitlab, context, diffs, config, options, storage, preview).await
+}
+
+async fn publish_review_preview(
+    gitlab: &GitLabClient,
+    context: &MergeRequestContext,
+    diffs: &[reviewgate::gitlab::types::MergeRequestDiff],
+    config: &AppConfig,
+    options: PublishOptions,
+    storage: &mut Option<Storage>,
+    preview: ReviewPreview,
+) -> Result<()> {
     if !preview.parsed {
         return Err(reviewgate::error::ReviewGateError::PublishRequiresParsedReview);
     }
@@ -350,6 +479,12 @@ async fn publish_review(
     } else if options.publish_inline {
         if !has_complete_diff_refs(context.metadata.diff_refs.as_ref()) {
             return Err(reviewgate::error::ReviewGateError::MissingGitLabDiffRefs);
+        }
+        if options.large_review {
+            let Some(analysis) = preview.analysis.as_ref() else {
+                return Err(reviewgate::error::ReviewGateError::PublishRequiresParsedReview);
+            };
+            validate_large_inline_mapping(analysis, &context.anchored_diff)?;
         }
         let report =
             publish_inline_review_comments(gitlab, &preview, context, diffs, config).await?;
@@ -421,6 +556,47 @@ fn print_dry_run_summary(context: &MergeRequestContext) {
     println!("Diff fetched: yes");
     println!("LLM call: skipped in dry-run");
     println!("Publish: skipped");
+}
+
+fn print_large_review_plan(
+    plan: &reviewgate::review::large::LargeReviewPlan,
+    config: &AppConfig,
+    mode: &str,
+) {
+    println!("Large MR review");
+    println!();
+    println!("Reviewable files: {}", plan.selection.files.len());
+    println!("Chunks: {}", plan.chunks.len());
+    println!("Skipped files: {}", plan.selection.skipped_files);
+    println!("Provider: {}/{}", config.llm.provider, config.llm.model);
+    println!("Mode: {mode}");
+    println!();
+}
+
+fn review_mode_label(publish: bool, publish_inline: bool, dry_run: bool) -> &'static str {
+    if dry_run {
+        "dry-run"
+    } else if publish && publish_inline {
+        "publish+inline"
+    } else if publish {
+        "publish"
+    } else {
+        "preview"
+    }
+}
+
+fn review_config_for_large_anchors(
+    config: &AppConfig,
+    diffs: &[reviewgate::gitlab::types::MergeRequestDiff],
+) -> reviewgate::config::ReviewConfig {
+    let mut review_config = config.review.clone();
+    review_config.max_files = diffs.len().max(1);
+    review_config.max_diff_bytes = diffs
+        .iter()
+        .map(|diff| diff.to_unified_diff().len())
+        .sum::<usize>()
+        .saturating_add(1);
+    review_config
 }
 
 async fn print_preview(

@@ -60,6 +60,21 @@ pub enum ReviewGateError {
     #[error("--publish-inline requires --publish")]
     PublishInlineRequiresPublish,
 
+    #[error("large MR review mode is disabled. Set REVIEWGATE_LARGE_REVIEW_ENABLED=true or omit --large")]
+    LargeReviewDisabled,
+
+    #[error("large MR review found no reviewable files after planning")]
+    LargeReviewNoReviewableFiles,
+
+    #[error("all large MR review chunks failed: {0}")]
+    LargeReviewAllChunksFailed(String),
+
+    #[error("large MR review would exceed REVIEWGATE_LARGE_REVIEW_MAX_CHUNKS; high-risk files could not fit without truncation")]
+    LargeReviewTooManyChunks,
+
+    #[error("large MR inline mapping is unavailable for the merged findings")]
+    LargeReviewInlineMappingUnavailable,
+
     #[error("No previous ReviewGate run found for this MR. Verification in CI requires review history in the job workspace, cache, or artifact. Run review first or persist REVIEWGATE_DB_PATH.")]
     NoPreviousVerificationHistory,
 

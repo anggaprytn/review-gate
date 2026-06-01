@@ -84,6 +84,12 @@ pub struct ReviewArgs {
     pub publish_inline: bool,
 
     #[arg(long)]
+    pub large: bool,
+
+    #[arg(long)]
+    pub include_low_risk: bool,
+
+    #[arg(long)]
     pub soft_fail: bool,
 }
 
@@ -345,6 +351,49 @@ mod tests {
             err,
             crate::error::ReviewGateError::PublishInlineRequiresPublish
         ));
+    }
+
+    #[test]
+    fn large_publish_remains_summary_only_without_publish_inline() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--large",
+            "--publish",
+        ]);
+
+        let args = review_args(cli.command);
+        assert!(args.large);
+        assert!(args.publishes());
+        assert!(!args.publish_inline);
+        assert!(!args.publishes_inline().unwrap());
+    }
+
+    #[test]
+    fn large_publish_inline_requires_explicit_flag() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--large",
+            "--publish",
+            "--publish-inline",
+        ]);
+
+        let args = review_args(cli.command);
+        assert!(args.large);
+        assert!(args.publishes_inline().unwrap());
+    }
+
+    #[test]
+    fn large_ci_publish_is_supported() {
+        let cli = Cli::parse_from(["reviewgate", "review", "--ci", "--large", "--publish"]);
+
+        let args = review_args(cli.command);
+        assert!(args.ci);
+        assert!(args.large);
+        assert!(args.publishes());
     }
 
     #[test]
