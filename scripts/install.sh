@@ -6,9 +6,17 @@ fi
 
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 BIN_NAME="reviewgate"
+DEFAULT_REPO="Anggaprytn/review-gate"
+DRY_RUN="${REVIEWGATE_INSTALL_DRY_RUN:-false}"
 
 error() {
   printf '%s\n' "error: $*" >&2
+  exit 1
+}
+
+no_prebuilt() {
+  printf '%s\n' "error: No prebuilt ReviewGate binary is available for $1/$2." >&2
+  printf '%s\n' "Build from source with: cargo install --path ." >&2
   exit 1
 }
 
@@ -25,21 +33,8 @@ normalize_repo() {
   printf '%s\n' "$value"
 }
 
-infer_repo() {
-  if [ -n "${REVIEWGATE_REPO:-}" ]; then
-    normalize_repo "$REVIEWGATE_REPO"
-    return
-  fi
-
-  if command -v git >/dev/null 2>&1; then
-    remote="$(git config --get remote.origin.url 2>/dev/null || true)"
-    if [ -n "$remote" ]; then
-      normalize_repo "$remote"
-      return
-    fi
-  fi
-
-  printf '%s\n' "Anggaprytn/review-gate"
+resolve_repo() {
+  normalize_repo "${REVIEWGATE_REPO:-$DEFAULT_REPO}"
 }
 
 detect_target() {
@@ -53,10 +48,48 @@ detect_target() {
     Darwin:arm64|Darwin:aarch64)
       printf '%s\n' "aarch64-apple-darwin"
       ;;
+    Darwin:x86_64|Darwin:amd64)
+      printf '%s\n' "x86_64-apple-darwin"
+      ;;
+    Linux:arm64|Linux:aarch64)
+      printf '%s\n' "aarch64-unknown-linux-gnu"
+      ;;
     *)
-      error "unsupported platform: $os $arch"
+      no_prebuilt "$os" "$arch"
       ;;
   esac
+}
+
+resolve_version() {
+  if [ -n "${REVIEWGATE_VERSION:-}" ]; then
+    printf '%s\n' "$REVIEWGATE_VERSION"
+    return
+  fi
+
+  latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${repo}/releases/latest")"
+  case "$latest_url" in
+    */releases/tag/*) ;;
+    *) error "could not resolve latest release for ${repo}" ;;
+  esac
+  version="${latest_url##*/}"
+  [ -n "$version" ] && [ "$version" != "latest" ] || error "could not resolve latest release for ${repo}"
+  printf '%s\n' "$version"
+}
+
+verify_checksum() {
+  archive="$1"
+
+  grep "  ${archive}\$" checksums.txt > "${archive}.sha256" || error "checksums.txt does not include ${archive}"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 -c "${archive}.sha256"
+    return
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c "${archive}.sha256"
+    return
+  fi
+
+  error "shasum or sha256sum is required"
 }
 
 install_binary() {
@@ -80,24 +113,55 @@ install_binary() {
   error "install directory is not writable: $INSTALL_DIR"
 }
 
+repo="$(resolve_repo)"
+os="$(uname -s)"
+arch="$(uname -m)"
+target="$(detect_target)"
+
+if [ "$DRY_RUN" = "true" ] && [ -z "${REVIEWGATE_VERSION:-}" ]; then
+  version="latest"
+else
+  if [ -z "${REVIEWGATE_VERSION:-}" ]; then
+    need curl
+  fi
+  version="$(resolve_version)"
+fi
+
+if [ "$version" = "latest" ]; then
+  archive="reviewgate-<version>-${target}.tar.gz"
+  asset_url="https://github.com/${repo}/releases/latest/download/${archive}"
+else
+  archive="reviewgate-${version}-${target}.tar.gz"
+  asset_url="https://github.com/${repo}/releases/download/${version}/${archive}"
+fi
+checksum_url="https://github.com/${repo}/releases/download/${version}/checksums.txt"
+
+if [ "$DRY_RUN" = "true" ]; then
+  printf '%s\n' "ReviewGate install dry run"
+  printf '%s\n' "detected OS: ${os}"
+  printf '%s\n' "detected arch: ${arch}"
+  printf '%s\n' "target triple: ${target}"
+  printf '%s\n' "repo: ${repo}"
+  printf '%s\n' "release version/latest: ${version}"
+  printf '%s\n' "asset URL: ${asset_url}"
+  printf '%s\n' "install dir: ${INSTALL_DIR}"
+  exit 0
+fi
+
 need curl
 need tar
-need shasum
 
-repo="$(infer_repo)"
-target="$(detect_target)"
-archive="reviewgate-${target}.tar.gz"
-base_url="https://github.com/${repo}/releases/latest/download"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT INT TERM
 
-printf '%s\n' "Downloading ReviewGate from ${repo} (${target})"
-curl -fsSL "${base_url}/${archive}" -o "${tmp_dir}/${archive}"
-curl -fsSL "${base_url}/${archive}.sha256" -o "${tmp_dir}/${archive}.sha256"
+printf '%s\n' "Downloading ReviewGate ${version} from ${repo} (${target})"
+curl -fsIL "$asset_url" >/dev/null 2>&1 || no_prebuilt "$os" "$arch"
+curl -fsSL "$asset_url" -o "${tmp_dir}/${archive}"
+curl -fsSL "$checksum_url" -o "${tmp_dir}/checksums.txt"
 
 (
   cd "$tmp_dir"
-  shasum -a 256 -c "${archive}.sha256"
+  verify_checksum "$archive"
   tar -xzf "$archive"
 )
 

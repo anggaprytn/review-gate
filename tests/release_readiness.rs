@@ -141,6 +141,80 @@ fn install_script_exists_and_is_executable() {
     }
 }
 
+#[test]
+fn install_script_supports_release_overrides_and_dry_run() {
+    let script = fs::read_to_string("scripts/install.sh").unwrap();
+
+    assert!(script.contains("REVIEWGATE_REPO"));
+    assert!(script.contains("REVIEWGATE_VERSION"));
+    assert!(script.contains("REVIEWGATE_INSTALL_DRY_RUN"));
+    assert!(script.contains("Anggaprytn/review-gate"));
+    assert!(script.contains("reviewgate-${version}-${target}.tar.gz"));
+    assert!(script.contains("No prebuilt ReviewGate binary is available"));
+}
+
+#[test]
+fn release_workflow_artifact_names_match_install_script_expectations() {
+    let workflow = fs::read_to_string(".github/workflows/release.yml").unwrap();
+    let script = fs::read_to_string("scripts/install.sh").unwrap();
+
+    assert!(workflow.contains("tags:"));
+    assert!(workflow.contains("- \"v*\""));
+    assert!(workflow.contains("reviewgate-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"));
+    assert!(workflow.contains("checksums.txt"));
+    assert!(workflow.contains("softprops/action-gh-release"));
+    assert!(script.contains("reviewgate-${version}-${target}.tar.gz"));
+    assert!(script.contains("/releases/download/${version}/${archive}"));
+    assert!(script.contains("/releases/download/${version}/checksums.txt"));
+}
+
+#[test]
+fn release_smoke_docs_and_templates_exist() {
+    for path in [
+        "docs/release-smoke-test.md",
+        "docs/release-checklist.md",
+        ".github/ISSUE_TEMPLATE/bug_report.yml",
+        ".github/ISSUE_TEMPLATE/feature_request.yml",
+        ".github/ISSUE_TEMPLATE/provider_issue.yml",
+        ".github/ISSUE_TEMPLATE/config.yml",
+        ".github/pull_request_template.md",
+    ] {
+        assert!(Path::new(path).is_file(), "{path} should exist");
+    }
+
+    let smoke = fs::read_to_string("docs/release-smoke-test.md").unwrap();
+    assert!(smoke.contains("reviewgate --version"));
+    assert!(smoke.contains("reviewgate doctor"));
+    assert!(smoke.contains("reviewgate review \"$MR_URL\" --dry-run"));
+    assert!(smoke.contains("reviewgate review \"$MR_URL\" --preview"));
+    assert!(smoke.contains("reviewgate review \"$MR_URL\" --publish"));
+    assert!(smoke.contains("reviewgate verify \"$MR_URL\" --preview"));
+    assert!(smoke.contains("--publish-inline"));
+
+    let checklist = fs::read_to_string("docs/release-checklist.md").unwrap();
+    assert!(checklist.contains("cargo fmt --all -- --check"));
+    assert!(checklist.contains("cargo clippy --all-targets --all-features -- -D warnings"));
+    assert!(checklist.contains("git ls-files docs/PRD.md"));
+
+    let pr_template = fs::read_to_string(".github/pull_request_template.md").unwrap();
+    assert!(pr_template.contains("Plain `review --publish` remains summary-only"));
+    assert!(pr_template.contains("Inline publishing remains explicit"));
+}
+
+#[test]
+fn issue_templates_warn_not_to_paste_secrets() {
+    for path in [
+        ".github/ISSUE_TEMPLATE/bug_report.yml",
+        ".github/ISSUE_TEMPLATE/feature_request.yml",
+        ".github/ISSUE_TEMPLATE/provider_issue.yml",
+    ] {
+        let template = fs::read_to_string(path).unwrap();
+        assert!(template.contains("Do not paste tokens"), "{path}");
+        assert!(template.contains("private merge request URLs"), "{path}");
+        assert!(template.contains("raw diffs"), "{path}");
+    }
+}
+
 fn collect_matching_files(path: &Path, forbidden: &[String], offenders: &mut Vec<String>) {
     if should_skip(path) {
         return;

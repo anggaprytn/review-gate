@@ -1,0 +1,62 @@
+name: Provider issue
+description: Report a problem with an LLM provider integration.
+title: "Provider: "
+labels:
+  - provider
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste tokens, `.env` contents, private merge request URLs, raw diffs, or confidential model input/output.
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options:
+        - gemini_cli
+        - codex_cli
+        - ollama
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      placeholder: gemini-2.5-pro, gpt-5, qwen2.5-coder:7b
+    validations:
+      required: true
+  - type: input
+    id: cli_version
+    attributes:
+      label: CLI version
+      description: Required for gemini_cli or codex_cli issues.
+      placeholder: gemini --version, codex --version
+  - type: dropdown
+    id: auth
+    attributes:
+      label: Does provider authentication work outside ReviewGate?
+      options:
+        - "Yes"
+        - "No"
+        - "Not sure"
+        - "Not applicable"
+    validations:
+      required: true
+  - type: dropdown
+    id: malformed_output
+    attributes:
+      label: Was the provider output malformed?
+      options:
+        - "Yes"
+        - "No"
+        - "Not sure"
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Sanitized command output
+      description: Remove tokens, private URLs, raw diffs, and confidential code before posting.
+      render: text
+    validations:
+      required: true

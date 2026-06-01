@@ -5,6 +5,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build ${{ matrix.name }}
@@ -36,16 +39,39 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          archive="reviewgate-${{ matrix.target }}.tar.gz"
+          archive="reviewgate-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/reviewgate" dist/reviewgate
           tar -C dist -czf "$archive" reviewgate
-          shasum -a 256 "$archive" > "$archive.sha256"
 
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
           name: reviewgate-${{ matrix.target }}
-          path: |
-            reviewgate-${{ matrix.target }}.tar.gz
-            reviewgate-${{ matrix.target }}.tar.gz.sha256
+          path: reviewgate-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          shasum -a 256 reviewgate-${GITHUB_REF_NAME}-*.tar.gz > checksums.txt
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/reviewgate-${{ github.ref_name }}-*.tar.gz
+            dist/checksums.txt

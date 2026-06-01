@@ -1,0 +1,70 @@
+name: Bug report
+description: Report a reproducible ReviewGate problem.
+title: "Bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste tokens, `.env` contents, private merge request URLs, or raw diffs.
+  - type: input
+    id: version
+    attributes:
+      label: ReviewGate version
+      placeholder: reviewgate 0.1.0-alpha
+    validations:
+      required: true
+  - type: input
+    id: os_arch
+    attributes:
+      label: OS and architecture
+      placeholder: macOS arm64, Linux x86_64
+    validations:
+      required: true
+  - type: dropdown
+    id: gitlab_type
+    attributes:
+      label: GitLab type
+      options:
+        - GitLab.com
+        - Self-managed
+        - Behind VPN
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options:
+        - gemini_cli
+        - codex_cli
+        - ollama
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command run
+      description: Redact private project paths, private merge request URLs, and secrets.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: error_output
+    attributes:
+      label: Sanitized error output
+      description: Remove tokens, private URLs, raw diffs, and confidential code before posting.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: doctor
+    attributes:
+      label: Does reviewgate doctor pass?
+      options:
+        - "Yes"
+        - "No"
+        - "Not run"
+    validations:
+      required: true

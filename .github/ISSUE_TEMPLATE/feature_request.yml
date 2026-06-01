@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest a focused improvement to ReviewGate.
+title: "Feature: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste tokens, `.env` contents, private merge request URLs, or raw diffs.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful behavior change.
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Related provider
+      options:
+        - Not provider-specific
+        - gemini_cli
+        - codex_cli
+        - ollama
+    validations:
+      required: true
