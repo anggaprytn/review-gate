@@ -15,12 +15,17 @@ pub struct ReviewAnalysis {
 pub struct ReviewFinding {
     pub severity: Severity,
     pub category: ReviewCategory,
+    #[serde(default)]
+    pub risk_code: Option<RiskCode>,
+    #[serde(default)]
+    pub anchor_id: Option<String>,
     pub file_path: Option<String>,
     pub line: Option<u32>,
     pub title: String,
     pub body: String,
     pub suggested_fix: Option<String>,
-    pub confidence: Confidence,
+    #[serde(default)]
+    pub effort: Effort,
     #[serde(default)]
     pub actionable: bool,
 }
@@ -44,10 +49,10 @@ pub enum Severity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Confidence {
-    High,
-    Medium,
-    Low,
+pub enum Effort {
+    Quick,
+    Moderate,
+    Heavy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -62,6 +67,31 @@ pub enum ReviewCategory {
     Observability,
     TestCoverage,
     Other(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RiskCode {
+    AuthBypass,
+    MissingAuthorizationCheck,
+    SecretLeak,
+    PiiOrSecretLogging,
+    SqlInjection,
+    CommandInjection,
+    UnsafeDeserialization,
+    MissingTimeout,
+    UnboundedRetry,
+    UnclosedResource,
+    NilOrNullRisk,
+    ApiContractBreak,
+    DataIntegrityRisk,
+    MigrationRisk,
+    MissingTestCoverage,
+    WeakErrorHandling,
+    ObservabilityGap,
+    PerformanceRegression,
+    MaintainabilityRisk,
+    PositiveNote,
+    Other,
 }
 
 impl Severity {
@@ -103,6 +133,33 @@ impl Severity {
             Severity::Note => "note",
         }
     }
+
+    pub fn display_label(self, emoji: bool) -> String {
+        if emoji {
+            format!("{} {}", self.emoji(), self.display_upper())
+        } else {
+            self.display_upper().to_string()
+        }
+    }
+
+    pub fn section_label_with_emoji(self, emoji: bool) -> String {
+        let label = self.section_label();
+        if emoji {
+            format!("{} {}", self.emoji(), label)
+        } else {
+            label.to_string()
+        }
+    }
+
+    pub fn emoji(self) -> &'static str {
+        match self {
+            Severity::Critical => "🔴",
+            Severity::High => "🟠",
+            Severity::Medium => "🟡",
+            Severity::Low => "🟢",
+            Severity::Note => "🔵",
+        }
+    }
 }
 
 impl OverallRisk {
@@ -115,15 +172,67 @@ impl OverallRisk {
             OverallRisk::Note => "NOTE",
         }
     }
+
+    pub fn display_label(self, emoji: bool) -> String {
+        let label = match self {
+            OverallRisk::Critical => "Critical",
+            OverallRisk::High => "High",
+            OverallRisk::Medium => "Medium",
+            OverallRisk::Low => "Low",
+            OverallRisk::Note => "Note",
+        };
+        if emoji {
+            format!("{} {}", self.emoji(), label)
+        } else {
+            label.to_string()
+        }
+    }
+
+    fn emoji(self) -> &'static str {
+        match self {
+            OverallRisk::Critical => "🔴",
+            OverallRisk::High => "🟠",
+            OverallRisk::Medium => "🟡",
+            OverallRisk::Low => "🟢",
+            OverallRisk::Note => "🔵",
+        }
+    }
 }
 
-impl Confidence {
+impl Effort {
     pub fn display_lower(self) -> &'static str {
         match self {
-            Confidence::High => "high",
-            Confidence::Medium => "medium",
-            Confidence::Low => "low",
+            Effort::Quick => "quick",
+            Effort::Moderate => "moderate",
+            Effort::Heavy => "heavy",
         }
+    }
+
+    pub fn display_label(self, emoji: bool) -> String {
+        let label = match self {
+            Effort::Quick => "Quick fix",
+            Effort::Moderate => "Moderate fix",
+            Effort::Heavy => "Heavy fix",
+        };
+        if emoji {
+            format!("{} {}", self.emoji(), label)
+        } else {
+            label.to_string()
+        }
+    }
+
+    fn emoji(self) -> &'static str {
+        match self {
+            Effort::Quick => "⚡",
+            Effort::Moderate => "🛠️",
+            Effort::Heavy => "🧱",
+        }
+    }
+}
+
+impl Default for Effort {
+    fn default() -> Self {
+        Effort::Moderate
     }
 }
 
@@ -140,6 +249,34 @@ impl ReviewCategory {
             ReviewCategory::Observability => "observability",
             ReviewCategory::TestCoverage => "test_coverage",
             ReviewCategory::Other(value) => value.as_str(),
+        }
+    }
+}
+
+impl RiskCode {
+    pub fn display_lower(self) -> &'static str {
+        match self {
+            RiskCode::AuthBypass => "auth_bypass",
+            RiskCode::MissingAuthorizationCheck => "missing_authorization_check",
+            RiskCode::SecretLeak => "secret_leak",
+            RiskCode::PiiOrSecretLogging => "pii_or_secret_logging",
+            RiskCode::SqlInjection => "sql_injection",
+            RiskCode::CommandInjection => "command_injection",
+            RiskCode::UnsafeDeserialization => "unsafe_deserialization",
+            RiskCode::MissingTimeout => "missing_timeout",
+            RiskCode::UnboundedRetry => "unbounded_retry",
+            RiskCode::UnclosedResource => "unclosed_resource",
+            RiskCode::NilOrNullRisk => "nil_or_null_risk",
+            RiskCode::ApiContractBreak => "api_contract_break",
+            RiskCode::DataIntegrityRisk => "data_integrity_risk",
+            RiskCode::MigrationRisk => "migration_risk",
+            RiskCode::MissingTestCoverage => "missing_test_coverage",
+            RiskCode::WeakErrorHandling => "weak_error_handling",
+            RiskCode::ObservabilityGap => "observability_gap",
+            RiskCode::PerformanceRegression => "performance_regression",
+            RiskCode::MaintainabilityRisk => "maintainability_risk",
+            RiskCode::PositiveNote => "positive_note",
+            RiskCode::Other => "other",
         }
     }
 }
@@ -178,17 +315,17 @@ impl<'de> Deserialize<'de> for OverallRisk {
     }
 }
 
-impl<'de> Deserialize<'de> for Confidence {
+impl<'de> Deserialize<'de> for Effort {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
         match normalize_enum_value(&value).as_str() {
-            "high" => Ok(Confidence::High),
-            "medium" => Ok(Confidence::Medium),
-            "low" => Ok(Confidence::Low),
-            _ => Err(de::Error::custom(format!("unknown confidence '{value}'"))),
+            "quick" | "low" | "small" | "easy" => Ok(Effort::Quick),
+            "moderate" | "medium" | "normal" => Ok(Effort::Moderate),
+            "heavy" | "high" | "large" | "hard" => Ok(Effort::Heavy),
+            _ => Err(de::Error::custom(format!("unknown effort '{value}'"))),
         }
     }
 }
@@ -215,7 +352,47 @@ impl<'de> Deserialize<'de> for ReviewCategory {
     }
 }
 
+impl<'de> Deserialize<'de> for RiskCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        let normalized = normalize_enum_value(&value);
+        Ok(match normalized.as_str() {
+            "auth_bypass" => RiskCode::AuthBypass,
+            "missing_authorization_check" => RiskCode::MissingAuthorizationCheck,
+            "secret_leak" => RiskCode::SecretLeak,
+            "pii_or_secret_logging" => RiskCode::PiiOrSecretLogging,
+            "sql_injection" => RiskCode::SqlInjection,
+            "command_injection" => RiskCode::CommandInjection,
+            "unsafe_deserialization" => RiskCode::UnsafeDeserialization,
+            "missing_timeout" => RiskCode::MissingTimeout,
+            "unbounded_retry" => RiskCode::UnboundedRetry,
+            "unclosed_resource" => RiskCode::UnclosedResource,
+            "nil_or_null_risk" | "null_risk" | "nil_risk" => RiskCode::NilOrNullRisk,
+            "api_contract_break" | "api_contract_risk" => RiskCode::ApiContractBreak,
+            "data_integrity_risk" => RiskCode::DataIntegrityRisk,
+            "migration_risk" => RiskCode::MigrationRisk,
+            "missing_test_coverage" => RiskCode::MissingTestCoverage,
+            "weak_error_handling" => RiskCode::WeakErrorHandling,
+            "observability_gap" => RiskCode::ObservabilityGap,
+            "performance_regression" => RiskCode::PerformanceRegression,
+            "maintainability_risk" => RiskCode::MaintainabilityRisk,
+            "positive_note" => RiskCode::PositiveNote,
+            "other" => RiskCode::Other,
+            _ => RiskCode::Other,
+        })
+    }
+}
+
 impl fmt::Display for ReviewCategory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.display_lower())
+    }
+}
+
+impl fmt::Display for RiskCode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.display_lower())
     }
@@ -227,7 +404,7 @@ fn normalize_enum_value(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Confidence, OverallRisk, ReviewAnalysis, ReviewCategory, Severity};
+    use super::{Effort, OverallRisk, ReviewAnalysis, ReviewCategory, RiskCode, Severity};
 
     #[test]
     fn parses_review_json_into_typed_structs_with_flexible_enums() {
@@ -239,12 +416,15 @@ mod tests {
                 {
                   "severity": "HIGH",
                   "category": "api-contract",
+                  "risk_code": "missing-timeout",
+                  "anchor_id": "A0001",
                   "file_path": "src/payment/client.ts",
                   "line": 42,
                   "title": "HTTP request has no timeout",
                   "body": "The callback call can hang indefinitely.",
                   "suggested_fix": "Use a request-scoped timeout.",
                   "confidence": "high",
+                  "effort": "quick",
                   "actionable": true
                 }
               ],
@@ -257,6 +437,73 @@ mod tests {
         assert_eq!(review.overall_risk, OverallRisk::Medium);
         assert_eq!(review.findings[0].severity, Severity::High);
         assert_eq!(review.findings[0].category, ReviewCategory::ApiContract);
-        assert_eq!(review.findings[0].confidence, Confidence::High);
+        assert_eq!(review.findings[0].risk_code, Some(RiskCode::MissingTimeout));
+        assert_eq!(review.findings[0].anchor_id.as_deref(), Some("A0001"));
+        assert_eq!(review.findings[0].effort, Effort::Quick);
+    }
+
+    #[test]
+    fn missing_effort_defaults_to_moderate_and_legacy_confidence_is_ignored() {
+        let review: ReviewAnalysis = serde_json::from_str(
+            r#"{
+              "summary": "Short MR-level review summary.",
+              "overall_risk": "medium",
+              "findings": [
+                {
+                  "severity": "HIGH",
+                  "category": "reliability",
+                  "file_path": "src/payment/client.ts",
+                  "line": 42,
+                  "title": "HTTP request has no timeout",
+                  "body": "The callback call can hang indefinitely.",
+                  "suggested_fix": null,
+                  "confidence": "low",
+                  "actionable": true
+                }
+              ],
+              "test_coverage_note": null,
+              "privacy_note": null
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(review.findings[0].effort, Effort::Moderate);
+    }
+
+    #[test]
+    fn parses_effort_variants_flexibly() {
+        for value in ["quick", "low", "small", "easy"] {
+            let parsed: Effort = serde_json::from_str(&format!(r#""{value}""#)).unwrap();
+            assert_eq!(parsed, Effort::Quick);
+        }
+        for value in ["moderate", "medium", "normal"] {
+            let parsed: Effort = serde_json::from_str(&format!(r#""{value}""#)).unwrap();
+            assert_eq!(parsed, Effort::Moderate);
+        }
+        for value in ["heavy", "high", "large", "hard"] {
+            let parsed: Effort = serde_json::from_str(&format!(r#""{value}""#)).unwrap();
+            assert_eq!(parsed, Effort::Heavy);
+        }
+    }
+
+    #[test]
+    fn parses_risk_code_variants_flexibly() {
+        for value in [
+            "missing_timeout",
+            "MISSING_TIMEOUT",
+            "missing-timeout",
+            "missing timeout",
+        ] {
+            let json = format!(r#""{value}""#);
+            let parsed: RiskCode = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, RiskCode::MissingTimeout);
+        }
+    }
+
+    #[test]
+    fn unknown_risk_code_does_not_crash() {
+        let parsed: RiskCode = serde_json::from_str(r#""surprising_new_risk""#).unwrap();
+
+        assert_eq!(parsed, RiskCode::Other);
     }
 }

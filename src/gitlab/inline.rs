@@ -9,7 +9,7 @@ use crate::{
         inline::{
             InlineCandidate, InlineEligibilityReason, InlinePublishResult, InlinePublishStatus,
         },
-        types::{ReviewFinding, Severity},
+        types::{ReviewCategory, ReviewFinding, RiskCode, Severity},
     },
 };
 use regex::Regex;
@@ -17,6 +17,23 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashMap, future::Future};
 
 const INLINE_MARKER_PREFIX: &str = "<!-- reviewgate:inline";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExistingInlineDedupe {
+    pub fingerprints: HashMap<String, usize>,
+    pub position_signatures: HashMap<String, usize>,
+    pub location_risk_signatures: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineMarker {
+    pub version: Option<u8>,
+    pub project: Option<String>,
+    pub mr: Option<u64>,
+    pub fingerprint: String,
+    pub head_sha: Option<String>,
+    pub risk_code: Option<RiskCode>,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InlinePublishReport {
@@ -85,10 +102,10 @@ where
         return Ok(report);
     }
 
-    let mut existing_fingerprints = if config.dedupe {
-        existing_inline_fingerprints(&list_discussions().await?)
+    let mut existing_dedupe = if config.dedupe {
+        existing_inline_dedupe(&list_discussions().await?)
     } else {
-        HashMap::new()
+        ExistingInlineDedupe::default()
     };
 
     for (index, candidate) in candidates.iter().enumerate() {
@@ -115,24 +132,89 @@ where
             continue;
         };
 
-        let fingerprint = inline_fingerprint(
+        let file_path = resolved_position_file_path(&position);
+        let fingerprint = inline_fingerprint_v2(
             &mr.project_path,
             mr.mr_iid,
             &position.head_sha,
-            candidate
-                .file_path
-                .as_deref()
-                .unwrap_or(position.new_path.as_str()),
+            file_path,
+            position.old_line,
+            position.new_line,
+            candidate.severity,
+            &finding.category,
+            finding.risk_code,
+        );
+        let v1_fingerprint = inline_fingerprint_v1(
+            &mr.project_path,
+            mr.mr_iid,
+            &position.head_sha,
+            file_path,
             position.old_line,
             position.new_line,
             candidate.severity,
             &candidate.title,
         );
+        let position_signature = inline_position_signature(
+            &position.head_sha,
+            &position.old_path,
+            &position.new_path,
+            position.old_line,
+            position.new_line,
+            candidate.severity,
+            finding.risk_code.unwrap_or(RiskCode::Other),
+        );
+        let v1_position_signature = inline_position_signature(
+            &position.head_sha,
+            &position.old_path,
+            &position.new_path,
+            position.old_line,
+            position.new_line,
+            candidate.severity,
+            RiskCode::Other,
+        );
+        let location_risk_signature = inline_location_risk_signature(
+            &position.head_sha,
+            &position.old_path,
+            &position.new_path,
+            position.old_line,
+            position.new_line,
+            finding.risk_code.unwrap_or(RiskCode::Other),
+        );
+        let v1_location_risk_signature = inline_location_risk_signature(
+            &position.head_sha,
+            &position.old_path,
+            &position.new_path,
+            position.old_line,
+            position.new_line,
+            RiskCode::Other,
+        );
 
-        if let Some(count) = existing_fingerprints.get(&fingerprint).copied() {
+        let duplicate_count = existing_dedupe
+            .fingerprints
+            .get(&fingerprint)
+            .or_else(|| existing_dedupe.fingerprints.get(&v1_fingerprint))
+            .or_else(|| existing_dedupe.position_signatures.get(&position_signature))
+            .or_else(|| {
+                existing_dedupe
+                    .position_signatures
+                    .get(&v1_position_signature)
+            })
+            .or_else(|| {
+                existing_dedupe
+                    .location_risk_signatures
+                    .get(&location_risk_signature)
+            })
+            .or_else(|| {
+                existing_dedupe
+                    .location_risk_signatures
+                    .get(&v1_location_risk_signature)
+            })
+            .copied();
+
+        if let Some(count) = duplicate_count {
             if count > 1 {
                 report.duplicate_warnings.push(format!(
-                    "multiple existing ReviewGate inline notes share fingerprint {fingerprint}"
+                    "multiple existing ReviewGate inline notes match dedupe key {fingerprint}"
                 ));
             }
             report.results.push(skipped_duplicate_result(candidate));
@@ -146,7 +228,16 @@ where
             Ok(discussion) => match created_note_id(&discussion) {
                 Some(note_id) => {
                     if config.dedupe {
-                        existing_fingerprints.insert(fingerprint, 1);
+                        existing_dedupe.fingerprints.insert(fingerprint, 1);
+                        existing_dedupe
+                            .position_signatures
+                            .insert(position_signature, 1);
+                        existing_dedupe
+                            .location_risk_signatures
+                            .insert(location_risk_signature, 1);
+                        existing_dedupe
+                            .location_risk_signatures
+                            .insert(v1_location_risk_signature, 1);
                     }
                     report.results.push(InlinePublishResult {
                         finding_id: candidate.finding_id.clone(),
@@ -175,7 +266,42 @@ where
     Ok(report)
 }
 
-pub fn inline_fingerprint(
+pub fn inline_fingerprint_v2(
+    project_path: &str,
+    mr_iid: u64,
+    head_sha: &str,
+    file_path: &str,
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+    severity: Severity,
+    category: &ReviewCategory,
+    risk_code: Option<RiskCode>,
+) -> String {
+    let mut hasher = Sha256::new();
+    let parts = vec![
+        project_path.trim().to_string(),
+        mr_iid.to_string(),
+        head_sha.trim().to_string(),
+        file_path.trim().to_string(),
+        old_line.map(|line| line.to_string()).unwrap_or_default(),
+        new_line.map(|line| line.to_string()).unwrap_or_default(),
+        severity.display_upper().to_string(),
+        category.display_lower().to_string(),
+        risk_code
+            .unwrap_or(RiskCode::Other)
+            .display_lower()
+            .to_string(),
+    ];
+
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+
+    hex_lower(&hasher.finalize())
+}
+
+pub fn inline_fingerprint_v1(
     project_path: &str,
     mr_iid: u64,
     head_sha: &str,
@@ -205,41 +331,238 @@ pub fn inline_fingerprint(
     hex_lower(&hasher.finalize())
 }
 
-pub fn inline_marker(project_path: &str, mr_iid: u64, fingerprint: &str, head_sha: &str) -> String {
+pub fn inline_marker(
+    project_path: &str,
+    mr_iid: u64,
+    fingerprint: &str,
+    head_sha: &str,
+    risk_code: Option<RiskCode>,
+) -> String {
     format!(
-        "<!-- reviewgate:inline project=\"{}\" mr=\"{}\" fingerprint=\"{}\" head_sha=\"{}\" -->",
+        "<!-- reviewgate:inline version=\"2\" project=\"{}\" mr=\"{}\" fingerprint=\"{}\" head_sha=\"{}\" risk_code=\"{}\" -->",
         escape_marker_attr(project_path),
         mr_iid,
         escape_marker_attr(fingerprint),
-        escape_marker_attr(head_sha)
+        escape_marker_attr(head_sha),
+        risk_code.unwrap_or(RiskCode::Other).display_lower()
     )
 }
 
 pub fn extract_inline_fingerprints_from_note_body(body: &str) -> Vec<String> {
-    let marker_regex =
-        Regex::new(r#"<!--\s*reviewgate:inline\b[^>]*\bfingerprint="([^"]+)"[^>]*-->"#)
-            .expect("inline marker regex compiles");
-    marker_regex
-        .captures_iter(body)
-        .filter_map(|captures| captures.get(1).map(|value| value.as_str().to_string()))
+    extract_inline_markers_from_note_body(body)
+        .into_iter()
+        .map(|marker| marker.fingerprint)
         .collect()
 }
 
 pub fn existing_inline_fingerprints(discussions: &[GitLabDiscussion]) -> HashMap<String, usize> {
-    let mut counts = HashMap::new();
+    existing_inline_dedupe(discussions).fingerprints
+}
+
+pub fn extract_inline_markers_from_note_body(body: &str) -> Vec<InlineMarker> {
+    let marker_regex = Regex::new(r#"<!--\s*reviewgate:inline\b(?P<attrs>[^>]*)-->"#)
+        .expect("inline marker regex compiles");
+    marker_regex
+        .captures_iter(body)
+        .filter_map(|captures| {
+            let attrs = captures.name("attrs")?.as_str();
+            let fingerprint = marker_attr(attrs, "fingerprint")?;
+            Some(InlineMarker {
+                version: marker_attr(attrs, "version").and_then(|value| value.parse().ok()),
+                project: marker_attr(attrs, "project"),
+                mr: marker_attr(attrs, "mr").and_then(|value| value.parse().ok()),
+                fingerprint,
+                head_sha: marker_attr(attrs, "head_sha"),
+                risk_code: marker_attr(attrs, "risk_code")
+                    .and_then(|value| serde_json::from_str(&format!("{value:?}")).ok()),
+            })
+        })
+        .collect()
+}
+
+pub fn existing_inline_dedupe(discussions: &[GitLabDiscussion]) -> ExistingInlineDedupe {
+    let mut dedupe = ExistingInlineDedupe::default();
 
     for discussion in discussions {
         for note in &discussion.notes {
             if note.system || !note.body.contains(INLINE_MARKER_PREFIX) {
                 continue;
             }
-            for fingerprint in extract_inline_fingerprints_from_note_body(&note.body) {
-                *counts.entry(fingerprint).or_insert(0) += 1;
+            let markers = extract_inline_markers_from_note_body(&note.body);
+            for marker in &markers {
+                *dedupe
+                    .fingerprints
+                    .entry(marker.fingerprint.clone())
+                    .or_insert(0) += 1;
+            }
+            let Some(position) = note.position.as_ref() else {
+                continue;
+            };
+            if let Some(signature) =
+                existing_note_position_signature(&note.body, position, &markers)
+            {
+                *dedupe.position_signatures.entry(signature).or_insert(0) += 1;
+            }
+            if let Some(signature) = existing_note_location_risk_signature(position, &markers) {
+                *dedupe
+                    .location_risk_signatures
+                    .entry(signature)
+                    .or_insert(0) += 1;
+            }
+            if let Some(signature) =
+                existing_note_location_signature_with_risk(position, RiskCode::Other)
+            {
+                *dedupe
+                    .location_risk_signatures
+                    .entry(signature)
+                    .or_insert(0) += 1;
             }
         }
     }
 
-    counts
+    dedupe
+}
+
+pub fn inline_position_signature(
+    head_sha: &str,
+    old_path: &str,
+    new_path: &str,
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+    severity: Severity,
+    risk_code: RiskCode,
+) -> String {
+    let mut hasher = Sha256::new();
+    let parts = vec![
+        head_sha.trim().to_string(),
+        old_path.trim().to_string(),
+        new_path.trim().to_string(),
+        old_line.map(|line| line.to_string()).unwrap_or_default(),
+        new_line.map(|line| line.to_string()).unwrap_or_default(),
+        severity.display_upper().to_string(),
+        risk_code.display_lower().to_string(),
+    ];
+
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+
+    hex_lower(&hasher.finalize())
+}
+
+pub fn inline_location_risk_signature(
+    head_sha: &str,
+    old_path: &str,
+    new_path: &str,
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+    risk_code: RiskCode,
+) -> String {
+    let mut hasher = Sha256::new();
+    let parts = vec![
+        head_sha.trim().to_string(),
+        old_path.trim().to_string(),
+        new_path.trim().to_string(),
+        old_line.map(|line| line.to_string()).unwrap_or_default(),
+        new_line.map(|line| line.to_string()).unwrap_or_default(),
+        risk_code.display_lower().to_string(),
+    ];
+
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\0");
+    }
+
+    hex_lower(&hasher.finalize())
+}
+
+fn existing_note_position_signature(
+    body: &str,
+    position: &crate::gitlab::types::GitLabNotePosition,
+    markers: &[InlineMarker],
+) -> Option<String> {
+    let head_sha = position.head_sha.as_deref()?.trim();
+    let old_path = position.old_path.as_deref().unwrap_or_default();
+    let new_path = position.new_path.as_deref().unwrap_or_default();
+    let severity = parse_reviewgate_severity(body)?;
+    let risk_code = markers
+        .iter()
+        .find_map(|marker| marker.risk_code)
+        .unwrap_or(RiskCode::Other);
+
+    Some(inline_position_signature(
+        head_sha,
+        old_path,
+        new_path,
+        position.old_line,
+        position.new_line,
+        severity,
+        risk_code,
+    ))
+}
+
+fn existing_note_location_risk_signature(
+    position: &crate::gitlab::types::GitLabNotePosition,
+    markers: &[InlineMarker],
+) -> Option<String> {
+    let risk_code = markers
+        .iter()
+        .find_map(|marker| marker.risk_code)
+        .unwrap_or(RiskCode::Other);
+
+    existing_note_location_signature_with_risk(position, risk_code)
+}
+
+fn existing_note_location_signature_with_risk(
+    position: &crate::gitlab::types::GitLabNotePosition,
+    risk_code: RiskCode,
+) -> Option<String> {
+    let head_sha = position.head_sha.as_deref()?.trim();
+    let old_path = position.old_path.as_deref().unwrap_or_default();
+    let new_path = position.new_path.as_deref().unwrap_or_default();
+
+    Some(inline_location_risk_signature(
+        head_sha,
+        old_path,
+        new_path,
+        position.old_line,
+        position.new_line,
+        risk_code,
+    ))
+}
+
+fn parse_reviewgate_severity(body: &str) -> Option<Severity> {
+    let severity_regex =
+        Regex::new(r"(?i)\*\*(?:[^\w*]+\s*)?ReviewGate:\s*(CRITICAL|HIGH|MEDIUM|LOW|NOTE)\b")
+            .expect("severity regex compiles");
+    let value = severity_regex.captures(body)?.get(1)?.as_str();
+    serde_json::from_str(&format!("{value:?}")).ok()
+}
+
+fn marker_attr(attrs: &str, name: &str) -> Option<String> {
+    let attr_regex = Regex::new(&format!(r#"\b{}\s*=\s*"([^"]*)""#, regex::escape(name)))
+        .expect("marker attr regex compiles");
+    attr_regex
+        .captures(attrs)
+        .and_then(|captures| captures.get(1))
+        .map(|value| unescape_marker_attr(value.as_str()))
+}
+
+fn unescape_marker_attr(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn resolved_position_file_path(position: &crate::review::inline::GitLabInlinePosition) -> &str {
+    if position.new_line.is_some() {
+        &position.new_path
+    } else {
+        &position.old_path
+    }
 }
 
 pub fn format_inline_comment_body(
@@ -248,13 +571,31 @@ pub fn format_inline_comment_body(
     fingerprint: &str,
     head_sha: &str,
 ) -> Result<String> {
+    format_inline_comment_body_with_emoji(mr, finding, fingerprint, head_sha, emoji_enabled())
+}
+
+pub fn format_inline_comment_body_with_emoji(
+    mr: &GitLabMrUrl,
+    finding: &ReviewFinding,
+    fingerprint: &str,
+    head_sha: &str,
+    emoji: bool,
+) -> Result<String> {
     let title = blank_fallback(&finding.title, "Untitled finding");
     let body = blank_fallback(&finding.body, "No details returned.");
     let mut output = String::new();
 
-    output.push_str("**ReviewGate: ");
+    output.push_str("**");
+    if emoji {
+        output.push_str(finding.severity.emoji());
+        output.push(' ');
+    }
+    output.push_str("ReviewGate: ");
     output.push_str(finding.severity.display_upper());
-    output.push_str(" - ");
+    output.push_str(" · ");
+    output.push_str(&finding.effort.display_label(emoji));
+    output.push_str("**\n\n");
+    output.push_str("**");
     output.push_str(title);
     output.push_str("**\n\n");
     output.push_str(&clean_inline_text(body));
@@ -271,17 +612,19 @@ pub fn format_inline_comment_body(
         output.push_str("\n\n");
     }
 
-    output.push_str("Confidence: ");
-    output.push_str(finding.confidence.display_lower());
-    output.push('\n');
     output.push_str("Category: ");
     output.push_str(finding.category.display_lower());
+    if let Some(risk_code) = finding.risk_code {
+        output.push_str("\nRisk code: ");
+        output.push_str(risk_code.display_lower());
+    }
     output.push_str("\n\n");
     output.push_str(&inline_marker(
         &mr.project_path,
         mr.mr_iid,
         fingerprint,
         head_sha,
+        finding.risk_code,
     ));
 
     if output.trim().is_empty() {
@@ -289,6 +632,13 @@ pub fn format_inline_comment_body(
     }
 
     Ok(output)
+}
+
+fn emoji_enabled() -> bool {
+    std::env::var("REVIEWGATE_EMOJI")
+        .ok()
+        .map(|value| !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+        .unwrap_or(true)
 }
 
 pub fn format_inline_publish_report(report: &InlinePublishReport) -> String {
@@ -514,13 +864,15 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        existing_inline_fingerprints, extract_inline_fingerprints_from_note_body,
-        format_inline_comment_body, format_inline_publish_report, inline_fingerprint,
-        inline_marker, publish_inline_comments_with, InlinePublishReport,
+        existing_inline_dedupe, existing_inline_fingerprints,
+        extract_inline_fingerprints_from_note_body, extract_inline_markers_from_note_body,
+        format_inline_comment_body, format_inline_comment_body_with_emoji,
+        format_inline_publish_report, inline_fingerprint_v1, inline_fingerprint_v2, inline_marker,
+        publish_inline_comments_with, InlinePublishReport,
     };
     use crate::{
         config::InlineConfig,
-        error::{Result, ReviewGateError},
+        error::ReviewGateError,
         gitlab::{
             types::{GitLabDiscussion, GitLabDiscussionNote, GitLabNotePosition},
             url::GitLabMrUrl,
@@ -530,7 +882,7 @@ mod tests {
                 GitLabInlinePosition, InlineCandidate, InlineEligibilityReason,
                 InlinePublishResult, InlinePublishStatus,
             },
-            types::{Confidence, ReviewCategory, ReviewFinding, Severity},
+            types::{Effort, ReviewCategory, ReviewFinding, RiskCode, Severity},
         },
     };
     use std::sync::{
@@ -539,8 +891,8 @@ mod tests {
     };
 
     #[test]
-    fn inline_fingerprint_generation_is_deterministic() {
-        let first = inline_fingerprint(
+    fn v2_fingerprint_ignores_title_changes() {
+        let first = inline_fingerprint_v2(
             "group/repo",
             59,
             "head",
@@ -548,9 +900,10 @@ mod tests {
             None,
             Some(42),
             Severity::High,
-            "  HTTP   request has no timeout ",
+            &ReviewCategory::Reliability,
+            Some(RiskCode::MissingTimeout),
         );
-        let second = inline_fingerprint(
+        let second = inline_fingerprint_v2(
             "group/repo",
             59,
             "head",
@@ -558,15 +911,16 @@ mod tests {
             None,
             Some(42),
             Severity::High,
-            "http request has no timeout",
+            &ReviewCategory::Reliability,
+            Some(RiskCode::MissingTimeout),
         );
 
         assert_eq!(first, second);
     }
 
     #[test]
-    fn inline_fingerprint_changes_when_head_sha_changes() {
-        let first = inline_fingerprint(
+    fn v2_fingerprint_changes_when_position_head_or_risk_changes() {
+        let first = inline_fingerprint_v2(
             "group/repo",
             59,
             "head-1",
@@ -574,9 +928,21 @@ mod tests {
             None,
             Some(42),
             Severity::High,
-            "finding",
+            &ReviewCategory::Reliability,
+            Some(RiskCode::MissingTimeout),
         );
-        let second = inline_fingerprint(
+        let moved = inline_fingerprint_v2(
+            "group/repo",
+            59,
+            "head-1",
+            "src/a.rs",
+            None,
+            Some(43),
+            Severity::High,
+            &ReviewCategory::Reliability,
+            Some(RiskCode::MissingTimeout),
+        );
+        let new_head = inline_fingerprint_v2(
             "group/repo",
             59,
             "head-2",
@@ -584,17 +950,37 @@ mod tests {
             None,
             Some(42),
             Severity::High,
-            "finding",
+            &ReviewCategory::Reliability,
+            Some(RiskCode::MissingTimeout),
+        );
+        let different_risk = inline_fingerprint_v2(
+            "group/repo",
+            59,
+            "head-1",
+            "src/a.rs",
+            None,
+            Some(42),
+            Severity::High,
+            &ReviewCategory::Reliability,
+            Some(RiskCode::UnboundedRetry),
         );
 
-        assert_ne!(first, second);
+        assert_ne!(first, moved);
+        assert_ne!(first, new_head);
+        assert_ne!(first, different_risk);
     }
 
     #[test]
     fn marker_generation_uses_hidden_reviewgate_marker() {
         assert_eq!(
-            inline_marker("group/repo", 59, "abc123", "head"),
-            r#"<!-- reviewgate:inline project="group/repo" mr="59" fingerprint="abc123" head_sha="head" -->"#
+            inline_marker(
+                "group/repo",
+                59,
+                "abc123",
+                "head",
+                Some(RiskCode::MissingTimeout)
+            ),
+            r#"<!-- reviewgate:inline version="2" project="group/repo" mr="59" fingerprint="abc123" head_sha="head" risk_code="missing_timeout" -->"#
         );
     }
 
@@ -606,6 +992,21 @@ mod tests {
         );
 
         assert_eq!(fingerprints, vec!["abc123".to_string()]);
+    }
+
+    #[test]
+    fn marker_extraction_reads_v2_risk_code_and_v1_marker() {
+        let markers = extract_inline_markers_from_note_body(
+            r#"body
+<!-- reviewgate:inline version="2" project="group/repo" mr="59" fingerprint="v2" head_sha="head" risk_code="missing-timeout" -->
+<!-- reviewgate:inline project="group/repo" mr="59" fingerprint="v1" head_sha="head" -->"#,
+        );
+
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[0].version, Some(2));
+        assert_eq!(markers[0].risk_code, Some(RiskCode::MissingTimeout));
+        assert_eq!(markers[1].version, None);
+        assert_eq!(markers[1].fingerprint, "v1");
     }
 
     #[test]
@@ -632,17 +1033,113 @@ mod tests {
     }
 
     #[test]
+    fn existing_v1_comment_can_be_deduped_by_position_signature() {
+        let discussions = vec![discussion(
+            "d1",
+            vec![note(
+                1,
+                r#"**ReviewGate: HIGH - HTTP request has no timeout**
+
+body
+
+<!-- reviewgate:inline project="group/repo" mr="59" fingerprint="old" head_sha="head" -->"#,
+                false,
+            )],
+        )];
+
+        let dedupe = existing_inline_dedupe(&discussions);
+        let signature = super::inline_position_signature(
+            "head",
+            "src/a.rs",
+            "src/a.rs",
+            None,
+            Some(1),
+            Severity::High,
+            RiskCode::Other,
+        );
+
+        assert_eq!(dedupe.position_signatures.get(&signature), Some(&1));
+    }
+
+    #[test]
+    fn existing_comment_can_be_deduped_when_severity_changes() {
+        let discussions = vec![discussion(
+            "d1",
+            vec![note(
+                1,
+                r#"**ReviewGate: MEDIUM - HTTP request has no timeout**
+
+body
+
+<!-- reviewgate:inline version="2" project="group/repo" mr="59" fingerprint="old" head_sha="head" risk_code="missing_timeout" -->"#,
+                false,
+            )],
+        )];
+
+        let dedupe = existing_inline_dedupe(&discussions);
+        let signature = super::inline_location_risk_signature(
+            "head",
+            "src/a.rs",
+            "src/a.rs",
+            None,
+            Some(1),
+            RiskCode::MissingTimeout,
+        );
+
+        assert_eq!(dedupe.location_risk_signatures.get(&signature), Some(&1));
+    }
+
+    #[test]
     fn inline_body_formatting_uses_safe_reviewgate_shape() {
         let mr = mr();
-        let body = format_inline_comment_body(&mr, &finding(), "fp", "head").unwrap();
+        let body =
+            format_inline_comment_body_with_emoji(&mr, &finding(), "fp", "head", true).unwrap();
 
-        assert!(body.contains("**ReviewGate: HIGH - HTTP request has no timeout**"));
+        assert!(body.contains("**🟠 ReviewGate: HIGH · ⚡ Quick fix**"));
+        assert!(body.contains("**HTTP request has no timeout**"));
         assert!(body.contains("The call can hang indefinitely."));
         assert!(body.contains("Suggested fix:\nUse a timeout."));
-        assert!(body.contains("Confidence: high"));
         assert!(body.contains("Category: reliability"));
-        assert!(body.contains(r#"<!-- reviewgate:inline project="group/repo" mr="59" fingerprint="fp" head_sha="head" -->"#));
+        assert!(body.contains("Risk code: missing_timeout"));
+        assert!(!body.contains("Confidence:"));
+        assert!(body.contains(r#"<!-- reviewgate:inline version="2" project="group/repo" mr="59" fingerprint="fp" head_sha="head" risk_code="missing_timeout" -->"#));
         assert!(!body.contains("raw prompt"));
+    }
+
+    #[test]
+    fn inline_body_can_disable_emoji() {
+        let body =
+            format_inline_comment_body_with_emoji(&mr(), &finding(), "fp", "head", false).unwrap();
+
+        assert!(body.contains("**ReviewGate: HIGH · Quick fix**"));
+        assert!(!body.contains("🟠"));
+        assert!(!body.contains("⚡"));
+    }
+
+    #[test]
+    fn v1_fingerprint_still_matches_old_title_based_marker() {
+        let first = inline_fingerprint_v1(
+            "group/repo",
+            59,
+            "head",
+            "src/a.rs",
+            None,
+            Some(42),
+            Severity::High,
+            "  HTTP   request has no timeout ",
+        );
+        let second = inline_fingerprint_v1(
+            "group/repo",
+            59,
+            "head",
+            "src/a.rs",
+            None,
+            Some(42),
+            Severity::High,
+            "http request has no timeout",
+        );
+
+        assert_eq!(first, second);
     }
 
     #[tokio::test]
@@ -787,12 +1284,14 @@ mod tests {
         ReviewFinding {
             severity: Severity::High,
             category: ReviewCategory::Reliability,
+            risk_code: Some(RiskCode::MissingTimeout),
+            anchor_id: None,
             file_path: Some("src/a.rs".to_string()),
             line: Some(42),
             title: "HTTP request has no timeout".to_string(),
             body: "The call can hang indefinitely.".to_string(),
             suggested_fix: Some("Use a timeout.".to_string()),
-            confidence: Confidence::High,
+            effort: Effort::Quick,
             actionable: true,
         }
     }
@@ -801,9 +1300,10 @@ mod tests {
         InlineCandidate {
             finding_id: finding_id.to_string(),
             severity: Severity::High,
-            confidence: Confidence::High,
+            effort: Effort::Quick,
             file_path: Some("src/a.rs".to_string()),
             requested_line: Some(line),
+            anchor_id: None,
             title: "HTTP request has no timeout".to_string(),
             eligible: true,
             reason: InlineEligibilityReason::Eligible,

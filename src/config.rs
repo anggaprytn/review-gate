@@ -1,4 +1,5 @@
 use crate::error::{Result, ReviewGateError};
+use crate::llm::types::LlmProvider;
 use serde::Deserialize;
 use std::{env, fs, path::Path};
 
@@ -21,6 +22,12 @@ pub struct LlmConfig {
     pub timeout_seconds: u64,
     pub max_context_tokens: u32,
     pub temperature: f64,
+    pub codex_timeout_seconds: u64,
+    pub codex_bin: String,
+    pub codex_full_auto: bool,
+    pub gemini_timeout_seconds: u64,
+    pub gemini_bin: String,
+    pub gemini_output_format: String,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +86,12 @@ struct FileLlmConfig {
     timeout_seconds: Option<u64>,
     max_context_tokens: Option<u32>,
     temperature: Option<f64>,
+    codex_timeout_seconds: Option<u64>,
+    codex_bin: Option<String>,
+    codex_full_auto: Option<bool>,
+    gemini_timeout_seconds: Option<u64>,
+    gemini_bin: Option<String>,
+    gemini_output_format: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -111,7 +124,7 @@ impl AppConfig {
         let provider = env::var("REVIEWGATE_LLM_PROVIDER")
             .ok()
             .or_else(|| file_llm.and_then(|llm| llm.provider.clone()))
-            .unwrap_or_else(|| "ollama".to_string());
+            .unwrap_or_else(|| "gemini_cli".to_string());
         let ollama_base_url = env::var("OLLAMA_BASE_URL")
             .ok()
             .or_else(|| file_llm.and_then(|llm| llm.ollama_base_url.clone()))
@@ -119,7 +132,7 @@ impl AppConfig {
         let model = env::var("REVIEWGATE_MODEL")
             .ok()
             .or_else(|| file_llm.and_then(|llm| llm.model.clone()))
-            .unwrap_or_else(|| "qwen2.5-coder:7b".to_string());
+            .unwrap_or_else(|| default_model_for_provider(&provider).to_string());
         let timeout_seconds = env::var("REVIEWGATE_LLM_TIMEOUT_SECONDS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -135,12 +148,37 @@ impl AppConfig {
             .and_then(|value| value.parse().ok())
             .or_else(|| file_llm.and_then(|llm| llm.temperature))
             .unwrap_or(0.1);
+        let codex_timeout_seconds = env::var("REVIEWGATE_CODEX_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .or_else(|| file_llm.and_then(|llm| llm.codex_timeout_seconds))
+            .unwrap_or(240);
+        let codex_bin = env::var("REVIEWGATE_CODEX_BIN")
+            .ok()
+            .or_else(|| file_llm.and_then(|llm| llm.codex_bin.clone()))
+            .unwrap_or_else(|| "codex".to_string());
+        let codex_full_auto = env_bool("REVIEWGATE_CODEX_FULL_AUTO")
+            .or_else(|| file_llm.and_then(|llm| llm.codex_full_auto))
+            .unwrap_or(false);
+        let gemini_timeout_seconds = env::var("REVIEWGATE_GEMINI_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .or_else(|| file_llm.and_then(|llm| llm.gemini_timeout_seconds))
+            .unwrap_or(240);
+        let gemini_bin = env::var("REVIEWGATE_GEMINI_BIN")
+            .ok()
+            .or_else(|| file_llm.and_then(|llm| llm.gemini_bin.clone()))
+            .unwrap_or_else(|| "gemini".to_string());
+        let gemini_output_format = env::var("REVIEWGATE_GEMINI_OUTPUT_FORMAT")
+            .ok()
+            .or_else(|| file_llm.and_then(|llm| llm.gemini_output_format.clone()))
+            .unwrap_or_else(|| "json".to_string());
 
         let file_privacy = file_config.privacy.as_ref();
         let privacy = PrivacyConfig {
             local_only: env_bool("REVIEWGATE_LOCAL_ONLY")
                 .or_else(|| file_privacy.and_then(|privacy| privacy.local_only))
-                .unwrap_or(true),
+                .unwrap_or_else(|| default_local_only_for_provider(&provider)),
             redact_secrets: env_bool("REVIEWGATE_REDACT_SECRETS")
                 .or_else(|| file_privacy.and_then(|privacy| privacy.redact_secrets))
                 .unwrap_or(true),
@@ -205,6 +243,12 @@ impl AppConfig {
                 timeout_seconds,
                 max_context_tokens,
                 temperature,
+                codex_timeout_seconds,
+                codex_bin,
+                codex_full_auto,
+                gemini_timeout_seconds,
+                gemini_bin,
+                gemini_output_format,
             },
             privacy,
             review,
@@ -214,15 +258,39 @@ impl AppConfig {
     }
 
     pub fn validate_for_preview(&self) -> Result<()> {
-        if !self.llm.provider.eq_ignore_ascii_case("ollama") {
-            return Err(ReviewGateError::UnsupportedLlmProvider(
-                self.llm.provider.clone(),
-            ));
-        }
-        if self.llm.ollama_base_url.trim().is_empty() {
-            return Err(ReviewGateError::Config(
-                "OLLAMA_BASE_URL must not be empty".to_string(),
-            ));
+        match LlmProvider::parse(&self.llm.provider)? {
+            LlmProvider::Ollama => {
+                if self.llm.ollama_base_url.trim().is_empty() {
+                    return Err(ReviewGateError::Config(
+                        "OLLAMA_BASE_URL must not be empty".to_string(),
+                    ));
+                }
+            }
+            LlmProvider::CodexCli => {
+                if self.llm.codex_bin.trim().is_empty() {
+                    return Err(ReviewGateError::Config(
+                        "REVIEWGATE_CODEX_BIN must not be empty".to_string(),
+                    ));
+                }
+                if self.llm.codex_full_auto {
+                    return Err(ReviewGateError::Config(
+                        "REVIEWGATE_CODEX_FULL_AUTO=true is not supported for ReviewGate codex_cli because this provider must stay read-only".to_string(),
+                    ));
+                }
+            }
+            LlmProvider::GeminiCli => {
+                if self.llm.gemini_bin.trim().is_empty() {
+                    return Err(ReviewGateError::Config(
+                        "REVIEWGATE_GEMINI_BIN must not be empty".to_string(),
+                    ));
+                }
+                let output_format = self.llm.gemini_output_format.trim();
+                if output_format.is_empty() {
+                    return Err(ReviewGateError::Config(
+                        "REVIEWGATE_GEMINI_OUTPUT_FORMAT must not be empty".to_string(),
+                    ));
+                }
+            }
         }
         if self.llm.model.trim().is_empty() {
             return Err(ReviewGateError::Config(
@@ -231,6 +299,18 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+fn default_model_for_provider(provider: &str) -> &'static str {
+    match LlmProvider::parse(provider) {
+        Ok(LlmProvider::Ollama) => "qwen2.5-coder:7b",
+        Ok(LlmProvider::CodexCli) => "gpt-5.2-codex",
+        Ok(LlmProvider::GeminiCli) | Err(_) => "gemini-2.5-pro",
+    }
+}
+
+fn default_local_only_for_provider(provider: &str) -> bool {
+    matches!(LlmProvider::parse(provider), Ok(LlmProvider::Ollama))
 }
 
 fn load_file_config(path: &str) -> Result<FileConfig> {
@@ -264,10 +344,21 @@ mod tests {
         let err = config.validate_for_preview().unwrap_err();
 
         assert!(matches!(err, ReviewGateError::UnsupportedLlmProvider(_)));
-        assert_eq!(
-            err.to_string(),
-            "Only Ollama provider is implemented in this version."
-        );
+        assert!(err.to_string().contains("unsupported LLM provider"));
+    }
+
+    #[test]
+    fn codex_cli_provider_is_supported_by_config_validation() {
+        let config = config_with_provider("codex_cli");
+
+        config.validate_for_preview().unwrap();
+    }
+
+    #[test]
+    fn gemini_cli_provider_is_supported_by_config_validation() {
+        let config = config_with_provider("gemini_cli");
+
+        config.validate_for_preview().unwrap();
     }
 
     #[test]
@@ -277,6 +368,16 @@ mod tests {
         let err = config.validate_for_preview().unwrap_err();
 
         assert!(matches!(err, ReviewGateError::UnsupportedLlmProvider(_)));
+    }
+
+    #[test]
+    fn codex_full_auto_fails_closed() {
+        let mut config = config_with_provider("codex_cli");
+        config.llm.codex_full_auto = true;
+
+        let err = config.validate_for_preview().unwrap_err();
+
+        assert!(err.to_string().contains("read-only"));
     }
 
     fn config_with_provider(provider: &str) -> AppConfig {
@@ -290,6 +391,12 @@ mod tests {
                 timeout_seconds: 180,
                 max_context_tokens: 12000,
                 temperature: 0.1,
+                codex_timeout_seconds: 240,
+                codex_bin: "codex".to_string(),
+                codex_full_auto: false,
+                gemini_timeout_seconds: 240,
+                gemini_bin: "gemini".to_string(),
+                gemini_output_format: "json".to_string(),
             },
             privacy: PrivacyConfig {
                 local_only: true,

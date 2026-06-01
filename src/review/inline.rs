@@ -1,7 +1,10 @@
 use crate::{
     config::InlineConfig,
     gitlab::types::{DiffRefs, MergeRequestDiff},
-    review::types::{Confidence, ReviewAnalysis, ReviewFinding, Severity},
+    review::{
+        anchors::{AnchoredDiffContext, ReviewLineAnchor},
+        types::{Effort, ReviewAnalysis, ReviewFinding, Severity},
+    },
 };
 use std::collections::HashMap;
 
@@ -38,10 +41,10 @@ pub struct GitLabInlinePosition {
 pub enum InlineEligibilityReason {
     Eligible,
     SeverityTooLow,
-    ConfidenceTooLow,
     NotActionable,
     MissingFilePath,
     MissingLine,
+    InvalidAnchorId,
     FileNotInDiff,
     LineNotInDiff,
     GeneratedFile,
@@ -76,9 +79,10 @@ pub struct InlinePublishResult {
 pub struct InlineCandidate {
     pub finding_id: String,
     pub severity: Severity,
-    pub confidence: Confidence,
+    pub effort: Effort,
     pub file_path: Option<String>,
     pub requested_line: Option<u32>,
+    pub anchor_id: Option<String>,
     pub title: String,
     pub eligible: bool,
     pub reason: InlineEligibilityReason,
@@ -204,6 +208,16 @@ pub fn resolve_inline_candidates(
     diff_refs: Option<&DiffRefs>,
     config: &InlineConfig,
 ) -> Vec<InlineCandidate> {
+    resolve_inline_candidates_with_anchors(analysis, diffs, None, diff_refs, config)
+}
+
+pub fn resolve_inline_candidates_with_anchors(
+    analysis: &ReviewAnalysis,
+    diffs: &[MergeRequestDiff],
+    anchors: Option<&AnchoredDiffContext>,
+    diff_refs: Option<&DiffRefs>,
+    config: &InlineConfig,
+) -> Vec<InlineCandidate> {
     let index = build_diff_position_index(diffs);
     let refs = complete_diff_refs(diff_refs);
     let mut total_count = 0usize;
@@ -219,6 +233,7 @@ pub fn resolve_inline_candidates(
                 index_in_review,
                 finding,
                 &index,
+                anchors,
                 refs.as_ref(),
                 config,
                 &mut total_count,
@@ -230,6 +245,13 @@ pub fn resolve_inline_candidates(
 }
 
 pub fn format_inline_dry_run_report(candidates: &[InlineCandidate]) -> String {
+    format_inline_dry_run_report_with_emoji(candidates, emoji_enabled())
+}
+
+pub fn format_inline_dry_run_report_with_emoji(
+    candidates: &[InlineCandidate],
+    emoji: bool,
+) -> String {
     let eligible: Vec<&InlineCandidate> = candidates
         .iter()
         .filter(|candidate| candidate.eligible)
@@ -245,9 +267,9 @@ pub fn format_inline_dry_run_report(candidates: &[InlineCandidate]) -> String {
     output.push_str(&format!("Fallback to summary: {}\n\n", fallback.len()));
 
     output.push_str("Eligible:\n");
-    push_candidate_section(&mut output, &eligible, true);
+    push_candidate_section(&mut output, &eligible, true, emoji);
     output.push_str("\nFallback:\n");
-    push_candidate_section(&mut output, &fallback, false);
+    push_candidate_section(&mut output, &fallback, false, emoji);
 
     output
 }
@@ -256,6 +278,7 @@ fn resolve_candidate(
     index_in_review: usize,
     finding: &ReviewFinding,
     index: &DiffPositionIndex,
+    anchors: Option<&AnchoredDiffContext>,
     diff_refs: Option<&CompleteDiffRefs>,
     config: &InlineConfig,
     total_count: &mut usize,
@@ -265,9 +288,10 @@ fn resolve_candidate(
     let base = InlineCandidate {
         finding_id: format!("finding-{}", index_in_review + 1),
         severity: finding.severity,
-        confidence: finding.confidence,
+        effort: finding.effort,
         file_path: finding.file_path.clone(),
         requested_line: finding.line,
+        anchor_id: finding.anchor_id.clone(),
         title: finding.title.clone(),
         eligible: false,
         reason: InlineEligibilityReason::Eligible,
@@ -280,11 +304,38 @@ fn resolve_candidate(
     ) {
         return ineligible(base, InlineEligibilityReason::SeverityTooLow);
     }
-    if finding.confidence == Confidence::Low {
-        return ineligible(base, InlineEligibilityReason::ConfidenceTooLow);
-    }
     if !finding.actionable {
         return ineligible(base, InlineEligibilityReason::NotActionable);
+    }
+
+    let invalid_anchor = finding
+        .anchor_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|anchor_id| anchors.and_then(|anchors| anchors.get(anchor_id)).is_none());
+
+    let Some(diff_refs) = diff_refs else {
+        return ineligible(base, InlineEligibilityReason::MissingDiffRefs);
+    };
+
+    if let Some(anchor) = finding
+        .anchor_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|anchor_id| anchors.and_then(|anchors| anchors.get(anchor_id)))
+    {
+        return resolve_with_anchor(
+            base,
+            anchor,
+            index,
+            diff_refs,
+            config,
+            total_count,
+            high_count,
+            medium_count,
+        );
     }
 
     let Some(file_path) = finding
@@ -293,10 +344,24 @@ fn resolve_candidate(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return ineligible(base, InlineEligibilityReason::MissingFilePath);
+        return ineligible(
+            base,
+            if invalid_anchor {
+                InlineEligibilityReason::InvalidAnchorId
+            } else {
+                InlineEligibilityReason::MissingFilePath
+            },
+        );
     };
     let Some(line) = finding.line else {
-        return ineligible(base, InlineEligibilityReason::MissingLine);
+        return ineligible(
+            base,
+            if invalid_anchor {
+                InlineEligibilityReason::InvalidAnchorId
+            } else {
+                InlineEligibilityReason::MissingLine
+            },
+        );
     };
 
     let Some(file_status) = index.file_status(file_path) else {
@@ -312,11 +377,15 @@ fn resolve_candidate(
         return ineligible(base, InlineEligibilityReason::CollapsedFile);
     }
 
-    let Some(diff_refs) = diff_refs else {
-        return ineligible(base, InlineEligibilityReason::MissingDiffRefs);
-    };
     let Some(diff_position) = index.resolve(file_path, line) else {
-        return ineligible(base, InlineEligibilityReason::LineNotInDiff);
+        return ineligible(
+            base,
+            if invalid_anchor {
+                InlineEligibilityReason::InvalidAnchorId
+            } else {
+                InlineEligibilityReason::LineNotInDiff
+            },
+        );
     };
 
     if *total_count >= config.max_inline_total {
@@ -354,6 +423,74 @@ fn resolve_candidate(
             new_path: diff_position.new_path,
             old_line: diff_position.old_line,
             new_line: diff_position.new_line,
+        }),
+        ..base
+    }
+}
+
+fn resolve_with_anchor(
+    mut base: InlineCandidate,
+    anchor: &ReviewLineAnchor,
+    index: &DiffPositionIndex,
+    diff_refs: &CompleteDiffRefs,
+    config: &InlineConfig,
+    total_count: &mut usize,
+    high_count: &mut usize,
+    medium_count: &mut usize,
+) -> InlineCandidate {
+    let Some(file_status) = index
+        .file_status(&anchor.new_path)
+        .or_else(|| index.file_status(&anchor.old_path))
+    else {
+        return ineligible(base, InlineEligibilityReason::FileNotInDiff);
+    };
+    if file_status.generated {
+        return ineligible(base, InlineEligibilityReason::GeneratedFile);
+    }
+    if file_status.too_large {
+        return ineligible(base, InlineEligibilityReason::TooLargeFile);
+    }
+    if file_status.collapsed {
+        return ineligible(base, InlineEligibilityReason::CollapsedFile);
+    }
+
+    if *total_count >= config.max_inline_total {
+        return ineligible(base, InlineEligibilityReason::MaxInlineLimitReached);
+    }
+
+    match base.severity {
+        Severity::Critical => {}
+        Severity::High => {
+            if *high_count >= config.max_high_inline {
+                return ineligible(base, InlineEligibilityReason::MaxInlineLimitReached);
+            }
+            *high_count += 1;
+        }
+        Severity::Medium => {
+            if *medium_count >= config.max_medium_inline {
+                return ineligible(base, InlineEligibilityReason::MaxInlineLimitReached);
+            }
+            *medium_count += 1;
+        }
+        Severity::Low | Severity::Note => unreachable!("low and note severities returned earlier"),
+    }
+
+    *total_count += 1;
+    base.file_path = Some(anchor.file_path.clone());
+    base.requested_line = anchor.new_line.or(anchor.old_line);
+
+    InlineCandidate {
+        eligible: true,
+        reason: InlineEligibilityReason::Eligible,
+        position: Some(GitLabInlinePosition {
+            position_type: "text".to_string(),
+            base_sha: diff_refs.base_sha.clone(),
+            start_sha: diff_refs.start_sha.clone(),
+            head_sha: diff_refs.head_sha.clone(),
+            old_path: anchor.old_path.clone(),
+            new_path: anchor.new_path.clone(),
+            old_line: anchor.old_line,
+            new_line: anchor.new_line,
         }),
         ..base
     }
@@ -438,7 +575,12 @@ fn preview_content(content: &str) -> String {
     content.chars().take(MAX_PREVIEW_CHARS).collect()
 }
 
-fn push_candidate_section(output: &mut String, candidates: &[&InlineCandidate], eligible: bool) {
+fn push_candidate_section(
+    output: &mut String,
+    candidates: &[&InlineCandidate],
+    eligible: bool,
+    emoji: bool,
+) {
     if candidates.is_empty() {
         output.push_str("- none\n");
         return;
@@ -449,9 +591,15 @@ fn push_candidate_section(output: &mut String, candidates: &[&InlineCandidate], 
             output.push('\n');
         }
         output.push_str("- ");
-        output.push_str(candidate.severity.display_upper());
-        output.push(' ');
+        output.push_str(&candidate.severity.display_label(emoji));
+        output.push_str(" · ");
+        output.push_str(&candidate.effort.display_label(emoji));
+        output.push_str(" · ");
         output.push_str(&candidate_location(candidate));
+        if let Some(anchor_id) = candidate.anchor_id.as_deref() {
+            output.push_str(" anchor=");
+            output.push_str(anchor_id);
+        }
         output.push('\n');
         if eligible {
             output.push_str("  Title: ");
@@ -471,6 +619,13 @@ fn push_candidate_section(output: &mut String, candidates: &[&InlineCandidate], 
             output.push('\n');
         }
     }
+}
+
+fn emoji_enabled() -> bool {
+    std::env::var("REVIEWGATE_EMOJI")
+        .ok()
+        .map(|value| !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+        .unwrap_or(true)
 }
 
 fn candidate_location(candidate: &InlineCandidate) -> String {
@@ -515,10 +670,10 @@ impl InlineEligibilityReason {
         match self {
             InlineEligibilityReason::Eligible => "eligible",
             InlineEligibilityReason::SeverityTooLow => "severity too low",
-            InlineEligibilityReason::ConfidenceTooLow => "confidence too low",
             InlineEligibilityReason::NotActionable => "not actionable",
             InlineEligibilityReason::MissingFilePath => "missing file path",
             InlineEligibilityReason::MissingLine => "missing line",
+            InlineEligibilityReason::InvalidAnchorId => "invalid anchor id",
             InlineEligibilityReason::FileNotInDiff => "file not in diff",
             InlineEligibilityReason::LineNotInDiff => "line not in diff",
             InlineEligibilityReason::GeneratedFile => "generated file",
@@ -533,15 +688,16 @@ impl InlineEligibilityReason {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_diff_position_index, format_inline_dry_run_report, parse_diff_line_positions,
-        parse_hunk_header, resolve_inline_candidates, DiffLineKind, HunkHeader,
-        InlineEligibilityReason,
+        build_diff_position_index, format_inline_dry_run_report,
+        format_inline_dry_run_report_with_emoji, parse_diff_line_positions, parse_hunk_header,
+        resolve_inline_candidates, DiffLineKind, HunkHeader, InlineEligibilityReason,
     };
     use crate::{
         config::InlineConfig,
         gitlab::types::{DiffRefs, MergeRequestDiff},
-        review::types::{
-            Confidence, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, Severity,
+        review::{
+            anchors::AnchorBuilder,
+            types::{Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, Severity},
         },
     };
 
@@ -666,7 +822,7 @@ mod tests {
     fn model_finding_line_maps_to_new_line() {
         let analysis = analysis(vec![finding(
             Severity::High,
-            Confidence::High,
+            Effort::Quick,
             true,
             Some("src/a.rs"),
             Some(2),
@@ -687,7 +843,7 @@ mod tests {
     fn model_finding_line_maps_to_old_line_when_relevant() {
         let analysis = analysis(vec![finding(
             Severity::High,
-            Confidence::High,
+            Effort::Quick,
             true,
             Some("src/a.rs"),
             Some(4),
@@ -702,6 +858,81 @@ mod tests {
         assert!(candidates[0].eligible);
         assert_eq!(candidates[0].position.as_ref().unwrap().old_line, Some(4));
         assert_eq!(candidates[0].position.as_ref().unwrap().new_line, None);
+    }
+
+    #[test]
+    fn valid_anchor_id_is_preferred_over_wrong_file_path_and_line() {
+        let diff = diff("src/a.rs", "@@ -1 +1,2 @@\n old\n+new");
+        let anchors = anchored_context(&diff);
+        let mut anchored_finding = finding(
+            Severity::High,
+            Effort::Quick,
+            true,
+            Some("src/wrong.rs"),
+            Some(999),
+        );
+        anchored_finding.anchor_id = Some("A0002".to_string());
+        let candidates = super::resolve_inline_candidates_with_anchors(
+            &analysis(vec![anchored_finding]),
+            &[diff],
+            Some(&anchors),
+            Some(&diff_refs()),
+            &inline_config(8, 5),
+        );
+
+        assert!(candidates[0].eligible);
+        assert_eq!(candidates[0].file_path.as_deref(), Some("src/a.rs"));
+        assert_eq!(candidates[0].requested_line, Some(2));
+        assert_eq!(candidates[0].position.as_ref().unwrap().new_line, Some(2));
+    }
+
+    #[test]
+    fn invalid_anchor_id_falls_back_to_summary_when_line_is_not_valid() {
+        let diff = diff("src/a.rs", "@@ -1 +1,2 @@\n old\n+new");
+        let anchors = anchored_context(&diff);
+        let mut anchored_finding = finding(
+            Severity::High,
+            Effort::Quick,
+            true,
+            Some("src/a.rs"),
+            Some(999),
+        );
+        anchored_finding.anchor_id = Some("A9999".to_string());
+        let candidates = super::resolve_inline_candidates_with_anchors(
+            &analysis(vec![anchored_finding]),
+            &[diff],
+            Some(&anchors),
+            Some(&diff_refs()),
+            &inline_config(8, 5),
+        );
+
+        assert!(!candidates[0].eligible);
+        assert_eq!(
+            candidates[0].reason,
+            InlineEligibilityReason::InvalidAnchorId
+        );
+    }
+
+    #[test]
+    fn missing_anchor_id_falls_back_to_file_path_and_line() {
+        let diff = diff("src/a.rs", "@@ -1 +1,2 @@\n old\n+new");
+        let anchors = anchored_context(&diff);
+        let candidates = super::resolve_inline_candidates_with_anchors(
+            &analysis(vec![finding(
+                Severity::High,
+                Effort::Quick,
+                true,
+                Some("src/a.rs"),
+                Some(2),
+            )]),
+            &[diff],
+            Some(&anchors),
+            Some(&diff_refs()),
+            &inline_config(8, 5),
+        );
+
+        assert!(candidates[0].eligible);
+        assert_eq!(candidates[0].position.as_ref().unwrap().new_line, Some(2));
     }
 
     #[test]
@@ -744,7 +975,7 @@ mod tests {
     fn missing_diff_refs_rejected() {
         let analysis = analysis(vec![finding(
             Severity::High,
-            Confidence::High,
+            Effort::Quick,
             true,
             Some("src/a.rs"),
             Some(1),
@@ -764,28 +995,28 @@ mod tests {
 
     #[test]
     fn severity_low_rejected() {
-        let candidate = single_candidate(Severity::Low, Confidence::High, true);
+        let candidate = single_candidate(Severity::Low, Effort::Quick, true);
 
         assert_eq!(candidate.reason, InlineEligibilityReason::SeverityTooLow);
     }
 
     #[test]
     fn note_rejected() {
-        let candidate = single_candidate(Severity::Note, Confidence::High, true);
+        let candidate = single_candidate(Severity::Note, Effort::Quick, true);
 
         assert_eq!(candidate.reason, InlineEligibilityReason::SeverityTooLow);
     }
 
     #[test]
-    fn low_confidence_rejected() {
-        let candidate = single_candidate(Severity::High, Confidence::Low, true);
+    fn heavy_effort_does_not_block_inline_eligibility() {
+        let candidate = single_candidate(Severity::High, Effort::Heavy, true);
 
-        assert_eq!(candidate.reason, InlineEligibilityReason::ConfidenceTooLow);
+        assert!(candidate.eligible);
     }
 
     #[test]
     fn not_actionable_rejected() {
-        let candidate = single_candidate(Severity::High, Confidence::High, false);
+        let candidate = single_candidate(Severity::High, Effort::Quick, false);
 
         assert_eq!(candidate.reason, InlineEligibilityReason::NotActionable);
     }
@@ -795,14 +1026,14 @@ mod tests {
         let analysis = analysis(vec![
             finding(
                 Severity::High,
-                Confidence::High,
+                Effort::Quick,
                 true,
                 Some("src/a.rs"),
                 Some(1),
             ),
             finding(
                 Severity::High,
-                Confidence::High,
+                Effort::Quick,
                 true,
                 Some("src/a.rs"),
                 Some(2),
@@ -827,14 +1058,14 @@ mod tests {
         let analysis = analysis(vec![
             finding(
                 Severity::Medium,
-                Confidence::Medium,
+                Effort::Moderate,
                 true,
                 Some("src/a.rs"),
                 Some(1),
             ),
             finding(
                 Severity::Medium,
-                Confidence::Medium,
+                Effort::Moderate,
                 true,
                 Some("src/a.rs"),
                 Some(2),
@@ -859,14 +1090,14 @@ mod tests {
         let analysis = analysis(vec![
             finding(
                 Severity::High,
-                Confidence::High,
+                Effort::Quick,
                 true,
                 Some("src/a.rs"),
                 Some(2),
             ),
             finding(
                 Severity::Low,
-                Confidence::High,
+                Effort::Quick,
                 true,
                 Some("src/a.rs"),
                 Some(1),
@@ -879,22 +1110,68 @@ mod tests {
             &inline_config(8, 5),
         );
 
-        let report = format_inline_dry_run_report(&candidates);
+        let report = format_inline_dry_run_report_with_emoji(&candidates, true);
 
         assert!(report.contains("Inline dry-run report:"));
         assert!(report.contains("Eligible inline candidates: 1"));
         assert!(report.contains("Fallback to summary: 1"));
-        assert!(report.contains("- HIGH src/a.rs:2"));
+        assert!(report.contains("- 🟠 HIGH · ⚡ Quick fix · src/a.rs:2"));
         assert!(report.contains("Title: finding"));
         assert!(report.contains("Position: new_path=src/a.rs new_line=2 old_line=none"));
-        assert!(report.contains("- LOW src/a.rs:1"));
+        assert!(report.contains("- 🟢 LOW · ⚡ Quick fix · src/a.rs:1"));
         assert!(report.contains("Reason: severity too low"));
+    }
+
+    #[test]
+    fn inline_report_can_disable_emoji() {
+        let candidates = resolve_inline_candidates(
+            &analysis(vec![finding(
+                Severity::High,
+                Effort::Quick,
+                true,
+                Some("src/a.rs"),
+                Some(1),
+            )]),
+            &[diff("src/a.rs", "@@ -0,0 +1 @@\n+new")],
+            Some(&diff_refs()),
+            &inline_config(8, 5),
+        );
+
+        let report = format_inline_dry_run_report_with_emoji(&candidates, false);
+
+        assert!(report.contains("- HIGH · Quick fix · src/a.rs:1"));
+        assert!(!report.contains("🟠"));
+    }
+
+    #[test]
+    fn inline_report_includes_anchor_id() {
+        let diff = diff("src/a.rs", "@@ -0,0 +1 @@\n+new");
+        let anchors = anchored_context(&diff);
+        let mut anchored_finding = finding(
+            Severity::High,
+            Effort::Quick,
+            true,
+            Some("src/a.rs"),
+            Some(1),
+        );
+        anchored_finding.anchor_id = Some("A0001".to_string());
+        let candidates = super::resolve_inline_candidates_with_anchors(
+            &analysis(vec![anchored_finding]),
+            &[diff],
+            Some(&anchors),
+            Some(&diff_refs()),
+            &inline_config(8, 5),
+        );
+
+        let report = format_inline_dry_run_report_with_emoji(&candidates, true);
+
+        assert!(report.contains("- 🟠 HIGH · ⚡ Quick fix · src/a.rs:1 anchor=A0001"));
     }
 
     fn assert_reason(diff: MergeRequestDiff, path: &str, reason: InlineEligibilityReason) {
         let analysis = analysis(vec![finding(
             Severity::High,
-            Confidence::High,
+            Effort::Quick,
             true,
             Some(path),
             Some(1),
@@ -907,12 +1184,12 @@ mod tests {
 
     fn single_candidate(
         severity: Severity,
-        confidence: Confidence,
+        effort: Effort,
         actionable: bool,
     ) -> super::InlineCandidate {
         let analysis = analysis(vec![finding(
             severity,
-            confidence,
+            effort,
             actionable,
             Some("src/a.rs"),
             Some(1),
@@ -938,7 +1215,7 @@ mod tests {
 
     fn finding(
         severity: Severity,
-        confidence: Confidence,
+        effort: Effort,
         actionable: bool,
         file_path: Option<&str>,
         line: Option<u32>,
@@ -946,12 +1223,14 @@ mod tests {
         ReviewFinding {
             severity,
             category: ReviewCategory::Correctness,
+            risk_code: None,
+            anchor_id: None,
             file_path: file_path.map(str::to_string),
             line,
             title: "finding".to_string(),
             body: "body".to_string(),
             suggested_fix: None,
-            confidence,
+            effort,
             actionable,
         }
     }
@@ -968,6 +1247,12 @@ mod tests {
             collapsed: None,
             too_large: None,
         }
+    }
+
+    fn anchored_context(diff: &MergeRequestDiff) -> crate::review::anchors::AnchoredDiffContext {
+        let mut builder = AnchorBuilder::new();
+        builder.add_diff(diff);
+        builder.finish(false)
     }
 
     fn diff_refs() -> DiffRefs {

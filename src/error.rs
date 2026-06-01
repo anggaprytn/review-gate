@@ -78,7 +78,39 @@ pub enum ReviewGateError {
     #[error("Ollama API error: {0}")]
     OllamaApi(String),
 
-    #[error("Only Ollama provider is implemented in this version.")]
+    #[error("Codex CLI binary was not found. Install Codex CLI or set REVIEWGATE_CODEX_BIN")]
+    CodexBinaryNotFound,
+
+    #[error("Codex CLI is not authenticated. Run `codex login` first, then retry.")]
+    CodexNotAuthenticated,
+
+    #[error("Codex CLI command failed: {0}")]
+    CodexCommandFailed(String),
+
+    #[error("Codex CLI request timed out after {seconds} seconds. Check model load time or increase REVIEWGATE_CODEX_TIMEOUT_SECONDS")]
+    CodexTimeout { seconds: u64 },
+
+    #[error("Codex CLI returned an empty model response")]
+    CodexEmptyResponse,
+
+    #[error("Gemini CLI binary was not found. Install Gemini CLI or set REVIEWGATE_GEMINI_BIN")]
+    GeminiBinaryNotFound,
+
+    #[error("Gemini CLI is not authenticated. Run `gemini` once and choose Login with Google, or configure Gemini CLI auth, then retry.")]
+    GeminiNotAuthenticated,
+
+    #[error("Gemini CLI command failed: {0}")]
+    GeminiCommandFailed(String),
+
+    #[error("Gemini CLI request timed out after {seconds} seconds. Check model load time or increase REVIEWGATE_GEMINI_TIMEOUT_SECONDS")]
+    GeminiTimeout { seconds: u64 },
+
+    #[error("Gemini CLI returned an empty model response")]
+    GeminiEmptyResponse,
+
+    #[error(
+        "unsupported LLM provider. Use REVIEWGATE_LLM_PROVIDER=gemini_cli, codex_cli, or ollama"
+    )]
     UnsupportedLlmProvider(String),
 
     #[error("configuration error: {0}")]

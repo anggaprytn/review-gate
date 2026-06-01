@@ -5,6 +5,7 @@ use crate::{
         url::GitLabMrUrl,
     },
     redaction::redact_secrets,
+    review::anchors::{AnchorBuilder, AnchoredDiffContext},
 };
 
 #[derive(Debug, Clone)]
@@ -14,6 +15,7 @@ pub struct MergeRequestContext {
     pub files: Vec<NormalizedDiffFile>,
     pub stats: DiffStats,
     pub sanitized_diff: String,
+    pub anchored_diff: AnchoredDiffContext,
     pub warnings: Vec<String>,
     pub partial: bool,
 }
@@ -53,6 +55,7 @@ pub fn build_merge_request_context(
     };
     let mut files = Vec::new();
     let mut diff_parts = Vec::new();
+    let mut anchor_builder = AnchorBuilder::new();
     let mut warnings = Vec::new();
     let mut partial = false;
     let mut warned_file_limit = false;
@@ -116,6 +119,9 @@ pub fn build_merge_request_context(
         stats.total_diff_bytes += sanitized_bytes;
         stats.approximate_added_lines += line_stats.added;
         stats.approximate_removed_lines += line_stats.removed;
+        if !diff.is_collapsed() {
+            anchor_builder.add_diff(&diff);
+        }
 
         files.push(NormalizedDiffFile {
             old_path: diff.old_path,
@@ -135,6 +141,7 @@ pub fn build_merge_request_context(
         files,
         stats,
         sanitized_diff: diff_parts.join("\n"),
+        anchored_diff: anchor_builder.finish(partial),
         warnings,
         partial,
     }

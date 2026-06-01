@@ -39,15 +39,13 @@ fn json_candidate(output: &str) -> Option<&str> {
 
     let without_fence = strip_json_code_fence(trimmed);
     if without_fence.trim_start().starts_with('{') {
-        return Some(without_fence.trim());
+        let candidate = without_fence.trim();
+        if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+            return Some(candidate);
+        }
     }
 
-    let start = without_fence.find('{')?;
-    let end = without_fence.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    Some(without_fence[start..=end].trim())
+    first_valid_json_object(without_fence)
 }
 
 fn strip_json_code_fence(input: &str) -> &str {
@@ -64,6 +62,47 @@ fn strip_json_code_fence(input: &str) -> &str {
         .strip_suffix("```")
         .map(str::trim_end)
         .unwrap_or(after_open)
+}
+
+fn first_valid_json_object(input: &str) -> Option<&str> {
+    for (start, char_value) in input.char_indices() {
+        if char_value != '{' {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (relative_index, current) in input[start..].char_indices() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if current == '\\' {
+                    escaped = true;
+                } else if current == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+
+            match current {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        let end = start + relative_index + current.len_utf8();
+                        let candidate = input[start..end].trim();
+                        if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                            return Some(candidate);
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -106,5 +145,23 @@ mod tests {
         let err = parse_review_analysis("not json").unwrap_err();
 
         assert!(err.to_string().contains("JSON review object"));
+    }
+
+    #[test]
+    fn parses_first_valid_json_object_with_extra_text() {
+        let parsed = parse_review_analysis(
+            r#"logs {not json}
+            {
+              "summary": "Looks good.",
+              "overall_risk": "LOW",
+              "findings": [],
+              "test_coverage_note": null,
+              "privacy_note": null
+            }
+            more logs"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.summary, "Looks good.");
     }
 }

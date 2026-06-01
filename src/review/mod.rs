@@ -1,3 +1,4 @@
+pub mod anchors;
 pub mod engine;
 pub mod formatter;
 pub mod inline;

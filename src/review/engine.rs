@@ -21,7 +21,7 @@ pub struct ReviewPreview {
 }
 
 pub fn build_sanitized_review_prompt(context: &MergeRequestContext) -> String {
-    build_review_prompt(&context.metadata, &context.sanitized_diff)
+    build_review_prompt(&context.metadata, &context.anchored_diff)
 }
 
 pub async fn review_prompt_with_llm<F, Fut>(prompt: String, call_llm: F) -> Result<ReviewPreview>

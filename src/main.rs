@@ -8,12 +8,16 @@ use reviewgate::gitlab::inline::{format_inline_publish_report, publish_inline_co
 use reviewgate::gitlab::publish::{build_summary_note_body, publish_summary_with};
 use reviewgate::gitlab::types::{DiffRefs, PublishAction, PublishResult};
 use reviewgate::gitlab::url::GitLabMrUrl;
-use reviewgate::llm::ollama::OllamaClient;
 use reviewgate::llm::types::LlmRunMetadata;
+use reviewgate::llm::{
+    auth_label, external_model_call_label, payload_label, provider_local_only, review_with_config,
+};
 use reviewgate::review::engine::{
     build_sanitized_review_prompt, review_prompt_with_llm, ReviewPreview,
 };
-use reviewgate::review::inline::{format_inline_dry_run_report, resolve_inline_candidates};
+use reviewgate::review::inline::{
+    format_inline_dry_run_report, resolve_inline_candidates_with_anchors,
+};
 
 #[tokio::main]
 async fn main() {
@@ -96,7 +100,8 @@ async fn publish_review(
         &context.mr_url.project_path,
         context.metadata.iid,
         &format!("{}/{}", config.llm.provider, config.llm.model),
-        config.privacy.local_only,
+        provider_local_only(&config.llm),
+        external_model_call_label(&config.llm),
         head_sha(context),
         inline_summary_label(publish_inline, inline_dry_run),
         config.publish.max_note_chars,
@@ -135,9 +140,10 @@ async fn publish_inline_review_comments(
     let Some(analysis) = preview.analysis.as_ref() else {
         return Err(reviewgate::error::ReviewGateError::PublishRequiresParsedReview);
     };
-    let candidates = resolve_inline_candidates(
+    let candidates = resolve_inline_candidates_with_anchors(
         analysis,
         diffs,
+        Some(&context.anchored_diff),
         context.metadata.diff_refs.as_ref(),
         &config.inline,
     );
@@ -217,13 +223,11 @@ async fn generate_preview(
         println!();
     }
 
-    let ollama = OllamaClient::from_config(&config.llm)?;
-    let preview =
-        review_prompt_with_llm(
-            prompt,
-            move |prompt| async move { ollama.review(&prompt).await },
-        )
-        .await?;
+    let llm_config = config.llm.clone();
+    let preview = review_prompt_with_llm(prompt, move |prompt| async move {
+        review_with_config(&llm_config, &prompt).await
+    })
+    .await?;
 
     Ok(preview)
 }
@@ -350,7 +354,15 @@ fn print_run_metadata(
     println!("ReviewGate run metadata:");
     println!("Provider: GitLab");
     println!("LLM: {}/{}", config.llm.provider, config.llm.model);
-    println!("Local-only: {}", config.privacy.local_only);
+    if let Some(auth) = auth_label(&config.llm) {
+        println!("Auth: {auth}");
+    }
+    println!("Local-only: {}", provider_local_only(&config.llm));
+    println!(
+        "External model call: {}",
+        external_model_call_label(&config.llm)
+    );
+    println!("Payload: {}", payload_label(&config.llm));
     match metadata.prompt_eval_count {
         Some(tokens) => println!("Prompt tokens: {tokens}"),
         None => println!("Prompt tokens: ~{prompt_token_estimate}"),
@@ -418,9 +430,10 @@ fn print_inline_dry_run_report(
         .analysis
         .as_ref()
         .map(|analysis| {
-            resolve_inline_candidates(
+            resolve_inline_candidates_with_anchors(
                 analysis,
                 diffs,
+                Some(&context.anchored_diff),
                 context.metadata.diff_refs.as_ref(),
                 &config.inline,
             )
