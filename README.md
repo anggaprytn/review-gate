@@ -51,15 +51,39 @@ LLM call: skipped in dry-run
 Publish: skipped
 ```
 
-## Preview
+## Ollama Preview
 
-Preview fetches real GitLab metadata and diffs, builds the sanitized review prompt, and prints a truncated prompt preview:
+Preview fetches real GitLab metadata and diffs, builds a sanitized review prompt, sends it to local Ollama, parses the model JSON, and prints ReviewGate markdown. It does not publish comments.
+
+Install Ollama from https://ollama.com, start it, then pull a local coding model:
+
+```bash
+ollama pull qwen2.5-coder:7b
+```
+
+Example environment:
+
+```env
+GITLAB_TOKEN=xxx
+REVIEWGATE_LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://localhost:11434
+REVIEWGATE_MODEL=qwen2.5-coder:7b
+REVIEWGATE_LLM_TIMEOUT_SECONDS=180
+REVIEWGATE_MAX_CONTEXT_TOKENS=12000
+REVIEWGATE_TEMPERATURE=0.1
+```
+
+Run a preview:
 
 ```bash
 GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/merge_requests/59" --preview
 ```
 
-Preview does not publish comments. LLM review is not implemented in this step, so preview stops after prompt construction.
+To inspect model input while debugging, print the sanitized prompt before the Ollama call:
+
+```bash
+GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/merge_requests/59" --preview --show-prompt
+```
 
 ## Environment
 
@@ -72,6 +96,9 @@ REVIEWGATE_MAX_FILES=50
 REVIEWGATE_LLM_PROVIDER=ollama
 OLLAMA_BASE_URL=http://localhost:11434
 REVIEWGATE_MODEL=qwen2.5-coder:7b
+REVIEWGATE_LLM_TIMEOUT_SECONDS=180
+REVIEWGATE_MAX_CONTEXT_TOKENS=12000
+REVIEWGATE_TEMPERATURE=0.1
 ```
 
 `GITLAB_TOKEN` needs permission to read merge request metadata and diffs. For GitLab personal, project, or group access tokens, use `read_api` when available; some self-managed instances may require `api` depending on policy.
@@ -92,6 +119,16 @@ If dry-run fails with a GitLab reachability or timeout error:
 
 ReviewGate never prints the token and does not include it in debug output.
 
+## Common Errors
+
+- `cannot reach Ollama`: start Ollama and confirm `OLLAMA_BASE_URL` is reachable from this machine.
+- `Ollama model ... was not found`: run `ollama pull qwen2.5-coder:7b` or set `REVIEWGATE_MODEL` to a model you have locally.
+- `cannot reach GitLab base URL`: connect to VPN and confirm the MR URL opens from the same machine.
+- `GITLAB_TOKEN is required`: export a token with permission to read merge request metadata and diffs.
+- `Only Ollama provider is implemented in this version`: set `REVIEWGATE_LLM_PROVIDER=ollama`.
+
 ## Privacy
 
-Before diff text is printed in preview or passed to downstream review code, ReviewGate redacts common secret patterns such as authorization headers, bearer tokens, passwords, API keys, cookies, database URLs, `.env`-style credentials, and multiline private keys.
+Before diff text is printed with `--show-prompt` or sent to the configured model endpoint, ReviewGate redacts common secret patterns such as authorization headers, bearer tokens, passwords, API keys, cookies, database URLs, `.env`-style credentials, and multiline private keys.
+
+Local Ollama mode keeps the model call local to the configured `OLLAMA_BASE_URL`. The sanitized diff is sent only to that endpoint. ReviewGate does not publish GitLab comments in preview mode.

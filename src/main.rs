@@ -5,9 +5,9 @@ use reviewgate::error::Result;
 use reviewgate::gitlab::client::GitLabClient;
 use reviewgate::gitlab::context::{build_merge_request_context, MergeRequestContext};
 use reviewgate::gitlab::url::GitLabMrUrl;
-use reviewgate::review::prompt::build_review_prompt;
-
-const PROMPT_PREVIEW_LIMIT: usize = 8_000;
+use reviewgate::llm::ollama::OllamaClient;
+use reviewgate::llm::types::LlmRunMetadata;
+use reviewgate::review::engine::{build_sanitized_review_prompt, review_prompt_with_llm};
 
 #[tokio::main]
 async fn main() {
@@ -30,6 +30,9 @@ async fn run() -> Result<()> {
         Commands::Review(args) => {
             let mr = GitLabMrUrl::parse(&args.mr_url)?;
             let config = AppConfig::load()?;
+            if args.calls_llm() {
+                config.validate_for_preview()?;
+            }
             let gitlab = GitLabClient::new(mr.base_url.clone(), config.gitlab_token.clone())?;
             let metadata = gitlab.fetch_merge_request(&mr).await?;
             let diffs = gitlab.fetch_merge_request_diffs(&mr).await?;
@@ -44,7 +47,7 @@ async fn run() -> Result<()> {
             if args.dry_run {
                 print_dry_run_summary(&context);
             } else {
-                print_preview(&context);
+                print_preview(&context, &config, args.show_prompt).await?;
             }
         }
     }
@@ -67,28 +70,37 @@ fn print_dry_run_summary(context: &MergeRequestContext) {
     println!("Publish: skipped");
 }
 
-fn print_preview(context: &MergeRequestContext) {
-    println!("ReviewGate preview");
-    println!();
-    print_mr_summary(context);
-    print_diff_summary(context);
-    print_file_summary(context);
-    print_warnings(context);
-
-    let prompt = build_review_prompt(&context.metadata, &context.sanitized_diff);
-    let prompt_preview = truncate_for_terminal(&prompt, PROMPT_PREVIEW_LIMIT);
-
-    println!("Prompt preview:");
-    println!("{prompt_preview}");
-    if prompt.len() > PROMPT_PREVIEW_LIMIT {
-        println!(
-            "[truncated: showing first {} of {} bytes]",
-            PROMPT_PREVIEW_LIMIT,
-            prompt.len()
-        );
+async fn print_preview(
+    context: &MergeRequestContext,
+    config: &AppConfig,
+    show_prompt: bool,
+) -> Result<()> {
+    let prompt = build_sanitized_review_prompt(context);
+    if show_prompt {
+        println!("ReviewGate sanitized prompt");
+        println!("===========================");
+        println!("{prompt}");
+        println!("===========================");
+        println!();
     }
-    println!("LLM review not implemented in this step");
-    println!("Publish: skipped");
+
+    let ollama = OllamaClient::from_config(&config.llm)?;
+    let preview =
+        review_prompt_with_llm(
+            prompt,
+            move |prompt| async move { ollama.review(&prompt).await },
+        )
+        .await?;
+
+    println!("{}", preview.markdown);
+    print_run_metadata(
+        config,
+        &preview.metadata,
+        preview.prompt_token_estimate,
+        preview.parsed,
+    );
+
+    Ok(())
 }
 
 fn print_mr_summary(context: &MergeRequestContext) {
@@ -203,14 +215,39 @@ fn yes_no(value: bool) -> &'static str {
     }
 }
 
-fn truncate_for_terminal(input: &str, max_bytes: usize) -> &str {
-    if input.len() <= max_bytes {
-        return input;
+fn print_run_metadata(
+    config: &AppConfig,
+    metadata: &LlmRunMetadata,
+    prompt_token_estimate: u64,
+    parsed: bool,
+) {
+    println!();
+    println!("ReviewGate run metadata:");
+    println!("Provider: GitLab");
+    println!("LLM: {}/{}", config.llm.provider, config.llm.model);
+    println!("Local-only: {}", config.privacy.local_only);
+    match metadata.prompt_eval_count {
+        Some(tokens) => println!("Prompt tokens: {tokens}"),
+        None => println!("Prompt tokens: ~{prompt_token_estimate}"),
     }
+    match metadata.eval_count {
+        Some(tokens) => println!("Completion tokens: {tokens}"),
+        None => println!("Completion tokens: unavailable"),
+    }
+    if let Some(total_duration) = metadata.total_duration {
+        println!(
+            "Review duration: {}",
+            format_ollama_duration(total_duration)
+        );
+    }
+    println!(
+        "Structured JSON: {}",
+        if parsed { "parsed" } else { "fallback" }
+    );
+    println!("Publish: skipped");
+}
 
-    let mut end = max_bytes;
-    while !input.is_char_boundary(end) {
-        end -= 1;
-    }
-    &input[..end]
+fn format_ollama_duration(nanoseconds: u64) -> String {
+    let seconds = nanoseconds as f64 / 1_000_000_000.0;
+    format!("{seconds:.2}s")
 }

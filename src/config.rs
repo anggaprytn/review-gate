@@ -16,6 +16,9 @@ pub struct LlmConfig {
     pub provider: String,
     pub ollama_base_url: String,
     pub model: String,
+    pub timeout_seconds: u64,
+    pub max_context_tokens: u32,
+    pub temperature: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +58,9 @@ struct FileLlmConfig {
     provider: Option<String>,
     ollama_base_url: Option<String>,
     model: Option<String>,
+    timeout_seconds: Option<u64>,
+    max_context_tokens: Option<u32>,
+    temperature: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -96,6 +102,21 @@ impl AppConfig {
             .ok()
             .or_else(|| file_llm.and_then(|llm| llm.model.clone()))
             .unwrap_or_else(|| "qwen2.5-coder:7b".to_string());
+        let timeout_seconds = env::var("REVIEWGATE_LLM_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .or_else(|| file_llm.and_then(|llm| llm.timeout_seconds))
+            .unwrap_or(180);
+        let max_context_tokens = env::var("REVIEWGATE_MAX_CONTEXT_TOKENS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .or_else(|| file_llm.and_then(|llm| llm.max_context_tokens))
+            .unwrap_or(12_000);
+        let temperature = env::var("REVIEWGATE_TEMPERATURE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .or_else(|| file_llm.and_then(|llm| llm.temperature))
+            .unwrap_or(0.1);
 
         let file_privacy = file_config.privacy.as_ref();
         let privacy = PrivacyConfig {
@@ -139,6 +160,9 @@ impl AppConfig {
                 provider,
                 ollama_base_url,
                 model,
+                timeout_seconds,
+                max_context_tokens,
+                temperature,
             },
             privacy,
             review,
@@ -146,7 +170,7 @@ impl AppConfig {
     }
 
     pub fn validate_for_preview(&self) -> Result<()> {
-        if self.llm.provider != "ollama" {
+        if !self.llm.provider.eq_ignore_ascii_case("ollama") {
             return Err(ReviewGateError::UnsupportedLlmProvider(
                 self.llm.provider.clone(),
             ));
@@ -182,4 +206,57 @@ fn env_bool(name: &str) -> Option<bool> {
             "0" | "false" | "no" => Some(false),
             _ => None,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppConfig, LlmConfig, PrivacyConfig, ReviewConfig};
+    use crate::error::ReviewGateError;
+
+    #[test]
+    fn unsupported_provider_returns_guard_error() {
+        let config = config_with_provider("openai");
+
+        let err = config.validate_for_preview().unwrap_err();
+
+        assert!(matches!(err, ReviewGateError::UnsupportedLlmProvider(_)));
+        assert_eq!(
+            err.to_string(),
+            "Only Ollama provider is implemented in this version."
+        );
+    }
+
+    #[test]
+    fn empty_provider_returns_guard_error() {
+        let config = config_with_provider("");
+
+        let err = config.validate_for_preview().unwrap_err();
+
+        assert!(matches!(err, ReviewGateError::UnsupportedLlmProvider(_)));
+    }
+
+    fn config_with_provider(provider: &str) -> AppConfig {
+        AppConfig {
+            gitlab_token: Some("token".to_string()),
+            gitlab_base_url: None,
+            llm: LlmConfig {
+                provider: provider.to_string(),
+                ollama_base_url: "http://localhost:11434".to_string(),
+                model: "qwen2.5-coder:7b".to_string(),
+                timeout_seconds: 180,
+                max_context_tokens: 12000,
+                temperature: 0.1,
+            },
+            privacy: PrivacyConfig {
+                local_only: true,
+                redact_secrets: true,
+            },
+            review: ReviewConfig {
+                max_inline_comments: 8,
+                severity_threshold: "medium".to_string(),
+                max_diff_bytes: 200_000,
+                max_files: 50,
+            },
+        }
+    }
 }

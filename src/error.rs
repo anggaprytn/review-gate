@@ -40,10 +40,22 @@ pub enum ReviewGateError {
     #[error("cannot reach Ollama at {0}. Start Ollama or configure another model provider")]
     OllamaUnreachable(String),
 
+    #[error("Ollama request timed out after {seconds} seconds. Check model load time or increase REVIEWGATE_LLM_TIMEOUT_SECONDS")]
+    OllamaTimeout { seconds: u64 },
+
+    #[error("Ollama model '{0}' was not found. Pull it with: ollama pull {0}")]
+    OllamaModelNotFound(String),
+
+    #[error("Ollama response was malformed: {0}")]
+    InvalidOllamaResponse(String),
+
+    #[error("Ollama returned an empty model response")]
+    EmptyModelResponse,
+
     #[error("Ollama API error: {0}")]
     OllamaApi(String),
 
-    #[error("unsupported LLM provider '{0}'. v0.1 supports ollama only")]
+    #[error("Only Ollama provider is implemented in this version.")]
     UnsupportedLlmProvider(String),
 
     #[error("configuration error: {0}")]
