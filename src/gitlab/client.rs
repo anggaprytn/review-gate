@@ -3,8 +3,9 @@ use crate::{
     gitlab::{
         publish::{select_publish_target, summary_marker},
         types::{
-            CreateMergeRequestNoteRequest, GitLabNote, MergeRequestDiff, MergeRequestMetadata,
-            PublishAction, PublishResult, UpdateMergeRequestNoteRequest,
+            CreateMergeRequestDiscussionRequest, CreateMergeRequestNoteRequest, GitLabDiscussion,
+            GitLabNote, MergeRequestDiff, MergeRequestMetadata, PublishAction, PublishResult,
+            UpdateMergeRequestNoteRequest,
         },
         url::GitLabMrUrl,
     },
@@ -115,6 +116,28 @@ impl GitLabClient {
         Ok(notes)
     }
 
+    pub async fn list_merge_request_discussions(
+        &self,
+        mr: &GitLabMrUrl,
+    ) -> Result<Vec<GitLabDiscussion>> {
+        let mut page = 1;
+        let mut discussions = Vec::new();
+
+        loop {
+            let url = discussions_api_url(&self.base_url, mr, page, DEFAULT_PER_PAGE);
+            let (mut page_discussions, pagination) =
+                self.get_json_with_headers(&url, false).await?;
+            discussions.append(&mut page_discussions);
+
+            match pagination.next_page {
+                Some(next_page) => page = next_page,
+                None => break,
+            }
+        }
+
+        Ok(discussions)
+    }
+
     pub async fn create_merge_request_note(
         &self,
         mr: &GitLabMrUrl,
@@ -132,6 +155,20 @@ impl GitLabClient {
     ) -> Result<GitLabNote> {
         let url = update_note_api_url(&self.base_url, mr, note_id);
         self.send_json(reqwest::Method::PUT, &url, request).await
+    }
+
+    pub async fn create_merge_request_discussion(
+        &self,
+        mr: &GitLabMrUrl,
+        request: &CreateMergeRequestDiscussionRequest,
+    ) -> Result<GitLabDiscussion> {
+        let url = create_discussion_api_url(&self.base_url, mr);
+        self.send_form(
+            reqwest::Method::POST,
+            &url,
+            &discussion_form_fields(request),
+        )
+        .await
     }
 
     pub async fn publish_merge_request_summary(
@@ -269,6 +306,36 @@ impl GitLabClient {
         let body = response.text().await.unwrap_or_default();
         Err(map_gitlab_status_error(status, body, false))
     }
+
+    async fn send_form<T>(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        fields: &[(String, String)],
+    ) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let response = self
+            .http
+            .request(method, url)
+            .header(PRIVATE_TOKEN_HEADER, &self.token)
+            .form(fields)
+            .send()
+            .await
+            .map_err(map_gitlab_request_error)?;
+
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .json::<T>()
+                .await
+                .map_err(|err| ReviewGateError::MalformedGitLabResponse(err.to_string()));
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        Err(map_gitlab_status_error(status, body, false))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,6 +410,59 @@ pub fn create_note_api_url(base_url: &str, mr: &GitLabMrUrl) -> String {
 
 pub fn update_note_api_url(base_url: &str, mr: &GitLabMrUrl, note_id: u64) -> String {
     format!("{}/{}", create_note_api_url(base_url, mr), note_id)
+}
+
+pub fn discussions_api_url(base_url: &str, mr: &GitLabMrUrl, page: u32, per_page: u16) -> String {
+    let page_query = if page > 1 {
+        format!("&page={page}")
+    } else {
+        String::new()
+    };
+    format!(
+        "{}/api/v4/projects/{}/merge_requests/{}/discussions?per_page={per_page}{page_query}",
+        base_url.trim_end_matches('/'),
+        mr.encoded_project_path,
+        mr.mr_iid
+    )
+}
+
+pub fn create_discussion_api_url(base_url: &str, mr: &GitLabMrUrl) -> String {
+    format!(
+        "{}/api/v4/projects/{}/merge_requests/{}/discussions",
+        base_url.trim_end_matches('/'),
+        mr.encoded_project_path,
+        mr.mr_iid
+    )
+}
+
+pub fn discussion_form_fields(
+    request: &CreateMergeRequestDiscussionRequest,
+) -> Vec<(String, String)> {
+    let position = &request.position;
+    let mut fields = vec![
+        ("body".to_string(), request.body.clone()),
+        (
+            "position[position_type]".to_string(),
+            position.position_type.clone(),
+        ),
+        ("position[base_sha]".to_string(), position.base_sha.clone()),
+        (
+            "position[start_sha]".to_string(),
+            position.start_sha.clone(),
+        ),
+        ("position[head_sha]".to_string(), position.head_sha.clone()),
+        ("position[old_path]".to_string(), position.old_path.clone()),
+        ("position[new_path]".to_string(), position.new_path.clone()),
+    ];
+
+    if let Some(old_line) = position.old_line {
+        fields.push(("position[old_line]".to_string(), old_line.to_string()));
+    }
+    if let Some(new_line) = position.new_line {
+        fields.push(("position[new_line]".to_string(), new_line.to_string()));
+    }
+
+    fields
 }
 
 fn header_u32(headers: &HeaderMap, name: &str) -> Option<u32> {
@@ -422,10 +542,15 @@ fn map_gitlab_request_error(err: reqwest::Error) -> ReviewGateError {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_note_api_url, diffs_api_url, map_gitlab_status_error, metadata_api_url,
-        notes_api_url, unsupported_unidiff_response, update_note_api_url, Pagination,
+        create_discussion_api_url, create_note_api_url, diffs_api_url, discussion_form_fields,
+        discussions_api_url, map_gitlab_status_error, metadata_api_url, notes_api_url,
+        unsupported_unidiff_response, update_note_api_url, Pagination,
     };
-    use crate::{error::ReviewGateError, gitlab::url::GitLabMrUrl};
+    use crate::{
+        error::ReviewGateError,
+        gitlab::{types::CreateMergeRequestDiscussionRequest, url::GitLabMrUrl},
+        review::inline::GitLabInlinePosition,
+    };
     use reqwest::header::{HeaderMap, HeaderValue};
 
     #[test]
@@ -460,6 +585,38 @@ mod tests {
             update_note_api_url("https://gitlab.company.local", &mr, 123),
             "https://gitlab.company.local/api/v4/projects/group%2Frepo/merge_requests/59/notes/123"
         );
+        assert_eq!(
+            discussions_api_url("https://gitlab.company.local", &mr, 2, 100),
+            "https://gitlab.company.local/api/v4/projects/group%2Frepo/merge_requests/59/discussions?per_page=100&page=2"
+        );
+        assert_eq!(
+            create_discussion_api_url("https://gitlab.company.local", &mr),
+            "https://gitlab.company.local/api/v4/projects/group%2Frepo/merge_requests/59/discussions"
+        );
+    }
+
+    #[test]
+    fn builds_added_line_discussion_form_payload() {
+        let fields = discussion_form_fields(&discussion_request(None, Some(42)));
+
+        assert!(has_field(&fields, "position[new_line]", "42"));
+        assert!(!fields.iter().any(|(key, _)| key == "position[old_line]"));
+    }
+
+    #[test]
+    fn builds_removed_line_discussion_form_payload() {
+        let fields = discussion_form_fields(&discussion_request(Some(7), None));
+
+        assert!(has_field(&fields, "position[old_line]", "7"));
+        assert!(!fields.iter().any(|(key, _)| key == "position[new_line]"));
+    }
+
+    #[test]
+    fn builds_context_line_discussion_form_payload() {
+        let fields = discussion_form_fields(&discussion_request(Some(7), Some(9)));
+
+        assert!(has_field(&fields, "position[old_line]", "7"));
+        assert!(has_field(&fields, "position[new_line]", "9"));
     }
 
     #[test]
@@ -546,5 +703,30 @@ mod tests {
             ),
             ReviewGateError::GitLabValidation(_)
         ));
+    }
+
+    fn discussion_request(
+        old_line: Option<u32>,
+        new_line: Option<u32>,
+    ) -> CreateMergeRequestDiscussionRequest {
+        CreateMergeRequestDiscussionRequest {
+            body: "body".to_string(),
+            position: GitLabInlinePosition {
+                position_type: "text".to_string(),
+                base_sha: "base".to_string(),
+                start_sha: "start".to_string(),
+                head_sha: "head".to_string(),
+                old_path: "src/a.rs".to_string(),
+                new_path: "src/a.rs".to_string(),
+                old_line,
+                new_line,
+            },
+        }
+    }
+
+    fn has_field(fields: &[(String, String)], key: &str, value: &str) -> bool {
+        fields
+            .iter()
+            .any(|(field_key, field_value)| field_key == key && field_value == value)
     }
 }

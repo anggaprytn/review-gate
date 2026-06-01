@@ -4,8 +4,9 @@ use reviewgate::config::AppConfig;
 use reviewgate::error::Result;
 use reviewgate::gitlab::client::GitLabClient;
 use reviewgate::gitlab::context::{build_merge_request_context, MergeRequestContext};
+use reviewgate::gitlab::inline::{format_inline_publish_report, publish_inline_comments_with};
 use reviewgate::gitlab::publish::{build_summary_note_body, publish_summary_with};
-use reviewgate::gitlab::types::{PublishAction, PublishResult};
+use reviewgate::gitlab::types::{DiffRefs, PublishAction, PublishResult};
 use reviewgate::gitlab::url::GitLabMrUrl;
 use reviewgate::llm::ollama::OllamaClient;
 use reviewgate::llm::types::LlmRunMetadata;
@@ -33,6 +34,8 @@ async fn run() -> Result<()> {
 
     match cli.command {
         Commands::Review(args) => {
+            args.validate()?;
+            let publish_inline = args.publishes_inline()?;
             let mr = GitLabMrUrl::parse(&args.mr_url)?;
             let config = AppConfig::load()?;
             if args.calls_llm() {
@@ -48,8 +51,7 @@ async fn run() -> Result<()> {
                 &config.review,
                 config.privacy.redact_secrets,
             );
-            let inline_dry_run =
-                args.inline_dry_run || (config.inline.enabled && config.inline.dry_run);
+            let inline_dry_run = args.inline_dry_run;
 
             if args.dry_run {
                 print_dry_run_summary(&context);
@@ -61,6 +63,7 @@ async fn run() -> Result<()> {
                     &config,
                     args.force_new_note,
                     args.internal_note,
+                    publish_inline,
                     inline_dry_run,
                 )
                 .await?;
@@ -80,6 +83,7 @@ async fn publish_review(
     config: &AppConfig,
     force_new_note: bool,
     internal_note_flag: bool,
+    publish_inline: bool,
     inline_dry_run: bool,
 ) -> Result<()> {
     let preview = generate_preview(context, config, false).await?;
@@ -94,6 +98,7 @@ async fn publish_review(
         &format!("{}/{}", config.llm.provider, config.llm.model),
         config.privacy.local_only,
         head_sha(context),
+        inline_summary_label(publish_inline, inline_dry_run),
         config.publish.max_note_chars,
     )?;
 
@@ -107,10 +112,55 @@ async fn publish_review(
     })
     .await?;
 
-    print_publish_result(&result);
+    print_publish_result(&result, publish_inline, inline_dry_run);
     if inline_dry_run {
         print_inline_dry_run_report(&preview, context, diffs, config);
+    } else if publish_inline {
+        if !has_complete_diff_refs(context.metadata.diff_refs.as_ref()) {
+            return Err(reviewgate::error::ReviewGateError::MissingGitLabDiffRefs);
+        }
+        publish_inline_review_comments(gitlab, &preview, context, diffs, config).await?;
     }
+
+    Ok(())
+}
+
+async fn publish_inline_review_comments(
+    gitlab: &GitLabClient,
+    preview: &ReviewPreview,
+    context: &MergeRequestContext,
+    diffs: &[reviewgate::gitlab::types::MergeRequestDiff],
+    config: &AppConfig,
+) -> Result<()> {
+    let Some(analysis) = preview.analysis.as_ref() else {
+        return Err(reviewgate::error::ReviewGateError::PublishRequiresParsedReview);
+    };
+    let candidates = resolve_inline_candidates(
+        analysis,
+        diffs,
+        context.metadata.diff_refs.as_ref(),
+        &config.inline,
+    );
+
+    let report = publish_inline_comments_with(
+        &context.mr_url,
+        &candidates,
+        &analysis.findings,
+        &config.inline,
+        || async { gitlab.list_merge_request_discussions(&context.mr_url).await },
+        |request| async move {
+            gitlab
+                .create_merge_request_discussion(&context.mr_url, &request)
+                .await
+        },
+    )
+    .await?;
+
+    println!();
+    if report.eligible_count() == 0 {
+        println!("No eligible inline comments to publish. Summary note was still published.");
+    }
+    println!("{}", format_inline_publish_report(&report));
 
     Ok(())
 }
@@ -322,7 +372,7 @@ fn print_run_metadata(
     println!("Publish: skipped");
 }
 
-fn print_publish_result(result: &PublishResult) {
+fn print_publish_result(result: &PublishResult, publish_inline: bool, inline_dry_run: bool) {
     println!();
     println!("Publish result:");
     println!(
@@ -348,7 +398,14 @@ fn print_publish_result(result: &PublishResult) {
             "Warning: multiple ReviewGate summary notes were found; updated the most recently updated one"
         );
     }
-    println!("Inline comments: skipped");
+    let inline_status = if inline_dry_run {
+        "dry-run only"
+    } else if publish_inline {
+        "publishing enabled"
+    } else {
+        "skipped"
+    };
+    println!("Inline comments: {inline_status}");
 }
 
 fn print_inline_dry_run_report(
@@ -377,4 +434,27 @@ fn print_inline_dry_run_report(
 fn format_ollama_duration(nanoseconds: u64) -> String {
     let seconds = nanoseconds as f64 / 1_000_000_000.0;
     format!("{seconds:.2}s")
+}
+
+fn has_complete_diff_refs(diff_refs: Option<&DiffRefs>) -> bool {
+    let Some(diff_refs) = diff_refs else {
+        return false;
+    };
+    has_sha(diff_refs.base_sha.as_deref())
+        && has_sha(diff_refs.start_sha.as_deref())
+        && has_sha(diff_refs.head_sha.as_deref())
+}
+
+fn has_sha(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|value| !value.is_empty())
+}
+
+fn inline_summary_label(publish_inline: bool, inline_dry_run: bool) -> &'static str {
+    if inline_dry_run {
+        "dry-run only"
+    } else if publish_inline {
+        "publishing enabled"
+    } else {
+        "disabled"
+    }
 }

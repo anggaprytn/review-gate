@@ -2,7 +2,7 @@
 
 ReviewGate is a CLI-first AI merge request reviewer for private GitLab teams. v0.1 focuses on GitLab self-managed instances behind VPN and local-first review workflows.
 
-ReviewGate does not include a dashboard, SaaS backend, GitHub support, inline comment publishing, SQLite storage, Docker, GitLab Runner mode, Semgrep, LSP, or a full AST engine in v0.1.
+ReviewGate does not include a dashboard, SaaS backend, GitHub support, SQLite storage, Docker, GitLab Runner mode, Semgrep, LSP, remote LLM providers, or a full AST engine in this step.
 
 ## Real GitLab Dry Run
 
@@ -87,7 +87,7 @@ GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/
 
 ## GitLab Summary Publish
 
-Publish fetches real GitLab metadata and diffs, calls local Ollama, prints the normalized ReviewGate markdown, then creates or updates one top-level merge request note. Inline comments are not implemented yet.
+Publish fetches real GitLab metadata and diffs, calls local Ollama, prints the normalized ReviewGate markdown, then creates or updates one top-level merge request note. Plain `--publish` is summary-only and never posts inline comments.
 
 ```bash
 GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/merge_requests/59" --publish
@@ -107,6 +107,28 @@ cargo run -- review "$MR_URL" --publish --internal-note
 
 For publishing, `GITLAB_TOKEN` needs write permission for MR notes. On GitLab personal, project, or group access tokens, use `api` scope unless your instance has a narrower custom policy that permits note creation and updates.
 
+## GitLab Inline Publish
+
+Inline publishing is behind a second explicit safety gate:
+
+```bash
+GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/merge_requests/59" --publish --publish-inline
+```
+
+`--publish-inline` requires `--publish`. `REVIEWGATE_INLINE_ENABLED=true` does not publish inline comments by itself; the CLI flag is the final publish gate.
+
+ReviewGate posts only eligible single-line findings through the GitLab merge request Discussions API. It does not post LOW or NOTE findings inline, does not create multi-line comments, and does not resolve or delete existing discussions.
+
+Before posting, ReviewGate lists existing MR discussions and scans non-system notes for hidden markers like:
+
+```md
+<!-- reviewgate:inline project="group/repo" mr="59" fingerprint="..." head_sha="..." -->
+```
+
+If the deterministic fingerprint already exists, ReviewGate skips that inline comment and prints the skipped duplicate count. Fingerprints include project path, MR IID, head SHA, file path, old/new line, severity, and normalized title. They intentionally do not include the full comment body.
+
+GitLab can reject a position even when local diff parsing found a candidate, especially after force-pushes, collapsed diffs, or instance-specific validation differences. Those failures are isolated per candidate and reported as failed inline comments; the summary note remains published.
+
 ## Inline Dry Run
 
 Inline dry-run evaluates whether model findings can be mapped to valid GitLab inline diff positions. It does not post inline comments and does not call the GitLab Discussions API.
@@ -118,9 +140,15 @@ GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/
 
 With `--preview --inline-dry-run`, ReviewGate fetches GitLab data, calls local Ollama, prints ReviewGate markdown, and prints an inline candidate mapping report. It does not publish anything. With `--publish --inline-dry-run`, ReviewGate still only creates or updates the top-level summary note, then prints the inline candidate mapping report.
 
-Findings are eligible for inline placement only when severity is CRITICAL, HIGH, or MEDIUM; confidence is high or medium; the finding is actionable; file and line are present; the file exists in the MR diff; the requested line maps to a parsed diff position; the file is not generated, collapsed, or too large; GitLab `diff_refs` are available; and the severity limit has not been reached. Defaults are unlimited CRITICAL, up to 8 HIGH findings, up to 5 MEDIUM findings, and no LOW or NOTE inline candidates.
+Findings are eligible for inline placement only when severity is CRITICAL, HIGH, or MEDIUM; confidence is high or medium; the finding is actionable; file and line are present; the file exists in the MR diff; the requested line maps to a parsed diff position; the file is not generated, collapsed, or too large; GitLab `diff_refs` are available; and the inline limits have not been reached. Defaults are 10 total inline candidates, up to 8 HIGH findings, up to 5 MEDIUM findings, and no LOW or NOTE inline candidates.
 
-Invalid or unsafe mappings fall back to the summary. Real inline publishing is planned for the next step.
+Invalid or unsafe mappings fall back to the summary. Add `--inline-dry-run` to publish mode when you want the summary note updated but no inline comments posted:
+
+```bash
+GITLAB_TOKEN=xxx cargo run -- review "$MR_URL" --publish --publish-inline --inline-dry-run
+```
+
+Dry-run wins: this updates the summary note, prints the inline mapping report, and posts zero inline discussions.
 
 ## Environment
 
@@ -132,6 +160,8 @@ REVIEWGATE_MAX_DIFF_BYTES=200000
 REVIEWGATE_MAX_FILES=50
 REVIEWGATE_INLINE_ENABLED=false
 REVIEWGATE_INLINE_DRY_RUN=true
+REVIEWGATE_INLINE_DEDUPE=true
+REVIEWGATE_MAX_INLINE_TOTAL=10
 REVIEWGATE_MAX_HIGH_INLINE=8
 REVIEWGATE_MAX_MEDIUM_INLINE=5
 REVIEWGATE_LLM_PROVIDER=ollama
@@ -171,7 +201,9 @@ ReviewGate never prints the token and does not include it in debug output.
 - `cannot reach GitLab base URL`: connect to VPN and confirm the MR URL opens from the same machine.
 - `GITLAB_TOKEN is required`: export a token with permission to read merge request metadata and diffs.
 - `Only Ollama provider is implemented in this version`: set `REVIEWGATE_LLM_PROVIDER=ollama`.
-- Existing ReviewGate note is updated by default: pass `--force-new-note` only when a new summary note is intentional.
+- Existing ReviewGate summary note is updated by default: pass `--force-new-note` only when a new summary note is intentional.
+- `--publish-inline requires --publish`: add `--publish` or remove `--publish-inline`.
+- GitLab rejected inline position: the candidate could not be placed on the current diff; ReviewGate reports the failure and continues with other candidates.
 - Ollama must be running for both `--preview` and `--publish`.
 
 ## Disposable E2E Test
@@ -192,10 +224,12 @@ cargo run -- review "$MR_URL" --preview
 cargo run -- review "$MR_URL" --preview --inline-dry-run
 cargo run -- review "$MR_URL" --publish
 cargo run -- review "$MR_URL" --publish --inline-dry-run
+cargo run -- review "$MR_URL" --publish --publish-inline
+cargo run -- review "$MR_URL" --publish --publish-inline
 cargo run -- review "$MR_URL" --publish
 ```
 
-The first publish should create one ReviewGate summary note. The second publish should update that same note, not create a duplicate. Inline comments remain disabled.
+The first publish should create one ReviewGate summary note. Later summary publishes should update that same note, not create a duplicate. The first inline publish may create eligible inline comments. Re-running inline publish should skip duplicates by ReviewGate fingerprint instead of posting the same inline comments again.
 
 ## Privacy
 

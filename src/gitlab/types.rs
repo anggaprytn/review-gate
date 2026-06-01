@@ -1,3 +1,4 @@
+use crate::review::inline::GitLabInlinePosition;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -37,6 +38,40 @@ pub struct GitLabNote {
     pub author: Option<GitLabUser>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitLabDiscussion {
+    pub id: String,
+    pub individual_note: Option<bool>,
+    #[serde(default)]
+    pub notes: Vec<GitLabDiscussionNote>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitLabDiscussionNote {
+    pub id: u64,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub system: bool,
+    pub resolvable: Option<bool>,
+    pub resolved: Option<bool>,
+    pub position: Option<GitLabNotePosition>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitLabNotePosition {
+    pub position_type: Option<String>,
+    pub base_sha: Option<String>,
+    pub start_sha: Option<String>,
+    pub head_sha: Option<String>,
+    pub old_path: Option<String>,
+    pub new_path: Option<String>,
+    pub old_line: Option<u32>,
+    pub new_line: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateMergeRequestNoteRequest {
     pub body: String,
@@ -47,6 +82,12 @@ pub struct CreateMergeRequestNoteRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateMergeRequestNoteRequest {
     pub body: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateMergeRequestDiscussionRequest {
+    pub body: String,
+    pub position: GitLabInlinePosition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

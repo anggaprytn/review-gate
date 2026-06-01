@@ -44,6 +44,7 @@ pub fn build_summary_note_body(
     llm_label: &str,
     local_only: bool,
     head_sha: &str,
+    inline_comments: &str,
     max_chars: usize,
 ) -> Result<String> {
     if markdown.trim().is_empty() {
@@ -51,7 +52,7 @@ pub fn build_summary_note_body(
     }
 
     let body = format!(
-        "{marker}\n\n{markdown}\n\n---\n\nReviewGate run metadata:\n\n- Provider: GitLab\n- LLM: {llm_label}\n- Local-only: {local_only}\n- Head SHA: {head_sha}\n- Publish mode: summary note\n- Inline comments: disabled\n\n{AI_FOOTER}\n",
+        "{marker}\n\n{markdown}\n\n---\n\nReviewGate run metadata:\n\n- Provider: GitLab\n- LLM: {llm_label}\n- Local-only: {local_only}\n- Head SHA: {head_sha}\n- Publish mode: summary note\n- Inline comments: {inline_comments}\n\n{AI_FOOTER}\n",
         marker = summary_marker(project_path, mr_iid),
         markdown = strip_terminal_ai_footer(markdown).trim_end(),
     );
@@ -234,6 +235,7 @@ mod tests {
             "ollama/qwen2.5-coder:7b",
             true,
             "abc123",
+            "disabled",
             10_000,
         )
         .unwrap();

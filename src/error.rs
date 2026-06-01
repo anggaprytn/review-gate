@@ -33,6 +33,9 @@ pub enum ReviewGateError {
     #[error("GitLab response was malformed: {0}")]
     MalformedGitLabResponse(String),
 
+    #[error("GitLab merge request diff refs are required for inline publishing")]
+    MissingGitLabDiffRefs,
+
     #[error("GitLab does not support the requested API parameter: {0}")]
     UnsupportedGitLabParameter(String),
 
@@ -50,6 +53,12 @@ pub enum ReviewGateError {
 
     #[error("model output could not be parsed into structured ReviewGate markdown, so publishing was skipped")]
     PublishRequiresParsedReview,
+
+    #[error("--publish-inline requires --publish")]
+    PublishInlineRequiresPublish,
+
+    #[error("inline comment body is empty")]
+    EmptyInlineCommentBody,
 
     #[error("cannot reach Ollama at {0}. Start Ollama or configure another model provider")]
     OllamaUnreachable(String),

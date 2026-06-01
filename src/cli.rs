@@ -1,5 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 
+use crate::error::{Result, ReviewGateError};
+
 #[derive(Debug, Parser)]
 #[command(name = "reviewgate")]
 #[command(about = "Local-first AI merge request review for private GitLab")]
@@ -37,15 +39,31 @@ pub struct ReviewArgs {
 
     #[arg(long, conflicts_with = "dry_run")]
     pub inline_dry_run: bool,
+
+    #[arg(long)]
+    pub publish_inline: bool,
 }
 
 impl ReviewArgs {
+    pub fn validate(&self) -> Result<()> {
+        if self.publish_inline && !self.publish {
+            return Err(ReviewGateError::PublishInlineRequiresPublish);
+        }
+
+        Ok(())
+    }
+
     pub fn calls_llm(&self) -> bool {
         !self.dry_run
     }
 
     pub fn publishes(&self) -> bool {
         self.publish
+    }
+
+    pub fn publishes_inline(&self) -> Result<bool> {
+        self.validate()?;
+        Ok(self.publish && self.publish_inline && !self.inline_dry_run)
     }
 }
 
@@ -140,5 +158,40 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn publish_inline_without_publish_is_rejected() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--publish-inline",
+        ]);
+
+        let Commands::Review(args) = cli.command;
+        let err = args.validate().unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::error::ReviewGateError::PublishInlineRequiresPublish
+        ));
+        assert_eq!(err.to_string(), "--publish-inline requires --publish");
+    }
+
+    #[test]
+    fn inline_dry_run_prevents_inline_publish() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--publish",
+            "--publish-inline",
+            "--inline-dry-run",
+        ]);
+
+        let Commands::Review(args) = cli.command;
+
+        assert!(!args.publishes_inline().unwrap());
     }
 }

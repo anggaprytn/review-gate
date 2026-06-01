@@ -41,6 +41,8 @@ pub struct ReviewConfig {
 pub struct InlineConfig {
     pub enabled: bool,
     pub dry_run: bool,
+    pub dedupe: bool,
+    pub max_inline_total: usize,
     pub max_high_inline: usize,
     pub max_medium_inline: usize,
 }
@@ -169,6 +171,11 @@ impl AppConfig {
         let inline = InlineConfig {
             enabled: env_bool("REVIEWGATE_INLINE_ENABLED").unwrap_or(false),
             dry_run: env_bool("REVIEWGATE_INLINE_DRY_RUN").unwrap_or(true),
+            dedupe: env_bool("REVIEWGATE_INLINE_DEDUPE").unwrap_or(true),
+            max_inline_total: env::var("REVIEWGATE_MAX_INLINE_TOTAL")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(10),
             max_high_inline: env::var("REVIEWGATE_MAX_HIGH_INLINE")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -297,6 +304,8 @@ mod tests {
             inline: InlineConfig {
                 enabled: false,
                 dry_run: true,
+                dedupe: true,
+                max_inline_total: 10,
                 max_high_inline: 8,
                 max_medium_inline: 5,
             },

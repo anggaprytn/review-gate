@@ -51,6 +51,27 @@ pub enum InlineEligibilityReason {
     MaxInlineLimitReached,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlinePublishStatus {
+    Created,
+    SkippedDuplicate,
+    Failed,
+    NotEligible,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlinePublishResult {
+    pub finding_id: String,
+    pub title: String,
+    pub severity: Severity,
+    pub file_path: Option<String>,
+    pub line: Option<u32>,
+    pub status: InlinePublishStatus,
+    pub discussion_id: Option<String>,
+    pub note_id: Option<u64>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InlineCandidate {
     pub finding_id: String,
@@ -185,6 +206,7 @@ pub fn resolve_inline_candidates(
 ) -> Vec<InlineCandidate> {
     let index = build_diff_position_index(diffs);
     let refs = complete_diff_refs(diff_refs);
+    let mut total_count = 0usize;
     let mut high_count = 0usize;
     let mut medium_count = 0usize;
 
@@ -199,6 +221,7 @@ pub fn resolve_inline_candidates(
                 &index,
                 refs.as_ref(),
                 config,
+                &mut total_count,
                 &mut high_count,
                 &mut medium_count,
             )
@@ -235,6 +258,7 @@ fn resolve_candidate(
     index: &DiffPositionIndex,
     diff_refs: Option<&CompleteDiffRefs>,
     config: &InlineConfig,
+    total_count: &mut usize,
     high_count: &mut usize,
     medium_count: &mut usize,
 ) -> InlineCandidate {
@@ -295,6 +319,10 @@ fn resolve_candidate(
         return ineligible(base, InlineEligibilityReason::LineNotInDiff);
     };
 
+    if *total_count >= config.max_inline_total {
+        return ineligible(base, InlineEligibilityReason::MaxInlineLimitReached);
+    }
+
     match finding.severity {
         Severity::Critical => {}
         Severity::High => {
@@ -311,6 +339,8 @@ fn resolve_candidate(
         }
         Severity::Low | Severity::Note => unreachable!("low and note severities returned earlier"),
     }
+
+    *total_count += 1;
 
     InlineCandidate {
         eligible: true,
@@ -952,6 +982,8 @@ mod tests {
         InlineConfig {
             enabled: false,
             dry_run: true,
+            dedupe: true,
+            max_inline_total: 10,
             max_high_inline,
             max_medium_inline,
         }
