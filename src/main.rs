@@ -30,6 +30,10 @@ use reviewgate::llm::{
     auth_label, external_model_call_label, payload_label, provider_local_only, review_with_config,
 };
 use reviewgate::plan::{build_review_plan, format_review_plan, PlanOptions};
+use reviewgate::review::comparison::{
+    compare_current_run_with_previous, format_comparison_terminal_default,
+    insert_comparison_section, ReviewComparison,
+};
 use reviewgate::review::engine::{
     build_sanitized_review_prompt, review_prompt_with_llm, ReviewPreview,
 };
@@ -454,8 +458,12 @@ async fn run_large_review(
         )
         .await?;
     } else {
+        let mut preview = preview;
+        let (persisted, comparison) =
+            persist_review_run_and_apply_comparison(storage, &context, &config, &mut preview);
         println!("{}", preview.markdown);
         print_finding_counters(&preview);
+        print_review_comparison(comparison.as_ref());
         print_run_metadata(
             &config,
             &preview.metadata,
@@ -465,7 +473,6 @@ async fn run_large_review(
         if args.inline_dry_run {
             print_inline_dry_run_report(&preview, &context, &selected_diffs, &config);
         }
-        let persisted = persist_review_run_best_effort(storage, &context, &config, &preview);
         print_persisted_review_run(storage, persisted.as_ref());
     }
 
@@ -496,7 +503,9 @@ async fn publish_review_preview(
     if !preview.parsed {
         return Err(reviewgate::error::ReviewGateError::PublishRequiresParsedReview);
     }
-    let persisted = persist_review_run_best_effort(storage, context, config, &preview);
+    let mut preview = preview;
+    let (persisted, comparison) =
+        persist_review_run_and_apply_comparison(storage, context, config, &mut preview);
 
     let body = build_summary_note_body(
         &preview.markdown,
@@ -530,6 +539,7 @@ async fn publish_review_preview(
 
     print_publish_result(&result, options.publish_inline, options.inline_dry_run);
     print_finding_counters(&preview);
+    print_review_comparison(comparison.as_ref());
     if options.inline_dry_run {
         print_inline_dry_run_report(&preview, context, diffs, config);
     } else if options.publish_inline {
@@ -679,10 +689,13 @@ async fn print_preview(
     inline_dry_run: bool,
     storage: &mut Option<Storage>,
 ) -> Result<()> {
-    let preview = generate_preview(context, config, show_prompt).await?;
+    let mut preview = generate_preview(context, config, show_prompt).await?;
+    let (persisted, comparison) =
+        persist_review_run_and_apply_comparison(storage, context, config, &mut preview);
 
     println!("{}", preview.markdown);
     print_finding_counters(&preview);
+    print_review_comparison(comparison.as_ref());
     print_run_metadata(
         config,
         &preview.metadata,
@@ -692,7 +705,6 @@ async fn print_preview(
     if inline_dry_run {
         print_inline_dry_run_report(&preview, context, diffs, config);
     }
-    let persisted = persist_review_run_best_effort(storage, context, config, &preview);
     print_persisted_review_run(storage, persisted.as_ref());
 
     Ok(())
@@ -1095,6 +1107,42 @@ fn persist_review_run_best_effort(
     }
 }
 
+fn persist_review_run_and_apply_comparison(
+    storage: &mut Option<Storage>,
+    context: &MergeRequestContext,
+    config: &AppConfig,
+    preview: &mut ReviewPreview,
+) -> (Option<PersistedReviewRun>, Option<ReviewComparison>) {
+    let persisted = persist_review_run_best_effort(storage, context, config, preview);
+    let comparison = persisted.as_ref().and_then(|persisted| {
+        compare_review_run_best_effort(storage, context, persisted.id.as_str())
+    });
+    if let Some(comparison) = comparison.as_ref() {
+        preview.markdown = insert_comparison_section(&preview.markdown, comparison);
+    }
+    (persisted, comparison)
+}
+
+fn compare_review_run_best_effort(
+    storage: &Option<Storage>,
+    context: &MergeRequestContext,
+    current_run_id: &str,
+) -> Option<ReviewComparison> {
+    let storage = storage.as_ref()?;
+    match compare_current_run_with_previous(
+        storage,
+        &context.mr_url.project_path,
+        context.metadata.iid,
+        current_run_id,
+    ) {
+        Ok(comparison) => Some(comparison),
+        Err(err) => {
+            eprintln!("warning: comparison failed; review will continue: {err}");
+            None
+        }
+    }
+}
+
 fn update_summary_publish_best_effort(
     storage: &mut Option<Storage>,
     run_id: &str,
@@ -1142,6 +1190,14 @@ fn print_finding_counters(preview: &ReviewPreview) {
         "{}",
         format_finding_counters_terminal(&count_findings_from_analysis(analysis), emoji_enabled())
     );
+}
+
+fn print_review_comparison(comparison: Option<&ReviewComparison>) {
+    let Some(comparison) = comparison else {
+        return;
+    };
+    println!();
+    print!("{}", format_comparison_terminal_default(comparison));
 }
 
 fn print_storage_open_warning(outcome: &reviewgate::storage::StorageOpenOutcome) {

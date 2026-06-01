@@ -91,6 +91,12 @@ pub struct StoredReviewFinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredVerificationStatus {
+    pub previous_finding_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedVerificationRun {
     pub id: String,
 }
@@ -412,6 +418,37 @@ impl Storage {
             .map_err(storage_error)
     }
 
+    pub fn previous_completed_review_run(
+        &self,
+        project_path: &str,
+        mr_iid: u64,
+        exclude_run_id: &str,
+    ) -> Result<Option<LatestReviewRun>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_path, mr_iid, mr_url, head_sha, model_provider, model_name, completed_at
+                 FROM review_runs
+                 WHERE project_path = ?1 AND mr_iid = ?2 AND status = 'completed' AND id <> ?3
+                 ORDER BY completed_at DESC, rowid DESC
+                 LIMIT 1",
+                params![project_path, mr_iid as i64, exclude_run_id],
+                |row| {
+                    Ok(LatestReviewRun {
+                        id: row.get(0)?,
+                        project_path: row.get(1)?,
+                        mr_iid: i64_to_u64(row.get::<_, i64>(2)?),
+                        mr_url: row.get(3)?,
+                        head_sha: row.get(4)?,
+                        model_provider: row.get(5)?,
+                        model_name: row.get(6)?,
+                        completed_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(storage_error)
+    }
+
     pub fn completed_review_run_by_id_for_mr(
         &self,
         run_id: &str,
@@ -529,6 +566,88 @@ impl Storage {
             findings.push(row.map_err(storage_error)?);
         }
         Ok(findings)
+    }
+
+    pub fn comparison_findings_for_run(&self, run_id: &str) -> Result<Vec<StoredPreviousFinding>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT id, severity, effort, category, risk_code, anchor_id, file_path,
+                        old_line, new_line, title, body, suggested_fix, actionable, fingerprint_v2
+                 FROM review_findings
+                 WHERE run_id = ?1
+                   AND actionable = 1
+                   AND severity IN ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW')
+                 ORDER BY
+                   CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END,
+                   file_path,
+                   COALESCE(new_line, old_line, 0),
+                   title",
+            )
+            .map_err(storage_error)?;
+
+        let rows = statement
+            .query_map([run_id], |row| {
+                Ok(StoredPreviousFinding {
+                    id: row.get(0)?,
+                    severity: row.get(1)?,
+                    effort: row.get(2)?,
+                    category: row.get(3)?,
+                    risk_code: row.get(4)?,
+                    anchor_id: row.get(5)?,
+                    file_path: row.get(6)?,
+                    old_line: optional_i64_to_u32(row.get(7)?),
+                    new_line: optional_i64_to_u32(row.get(8)?),
+                    title: row.get(9)?,
+                    body: row.get(10)?,
+                    suggested_fix: row.get(11)?,
+                    actionable: row.get::<_, i64>(12)? != 0,
+                    fingerprint_v2: row.get(13)?,
+                })
+            })
+            .map_err(storage_error)?;
+
+        let mut findings = Vec::new();
+        for row in rows {
+            findings.push(row.map_err(storage_error)?);
+        }
+        Ok(findings)
+    }
+
+    pub fn latest_verification_statuses(
+        &self,
+        project_path: &str,
+        mr_iid: u64,
+    ) -> Result<Vec<StoredVerificationStatus>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT verification_results.previous_finding_id, verification_results.status
+                 FROM verification_results
+                 JOIN verification_runs
+                   ON verification_runs.id = verification_results.verification_run_id
+                 WHERE verification_runs.project_path = ?1
+                   AND verification_runs.mr_iid = ?2
+                   AND verification_runs.status = 'completed'
+                 ORDER BY verification_runs.completed_at DESC,
+                          verification_runs.rowid DESC,
+                          verification_results.rowid DESC",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(params![project_path, mr_iid as i64], |row| {
+                Ok(StoredVerificationStatus {
+                    previous_finding_id: row.get(0)?,
+                    status: row.get(1)?,
+                })
+            })
+            .map_err(storage_error)?;
+
+        let mut statuses = Vec::new();
+        for row in rows {
+            statuses.push(row.map_err(storage_error)?);
+        }
+        Ok(statuses)
     }
 
     pub fn persist_verification_run(

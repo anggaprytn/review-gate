@@ -1,4 +1,5 @@
 pub mod anchors;
+pub mod comparison;
 pub mod engine;
 pub mod formatter;
 pub mod inline;

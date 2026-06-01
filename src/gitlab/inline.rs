@@ -1108,6 +1108,7 @@ body
         assert!(!body.contains("Confidence:"));
         assert!(body.contains(r#"<!-- reviewgate:inline version="2" project="group/repo" mr="59" fingerprint="fp" head_sha="head" risk_code="missing_timeout" -->"#));
         assert!(!body.contains("raw prompt"));
+        assert!(!body.contains("Change Since Previous Review"));
     }
 
     #[test]

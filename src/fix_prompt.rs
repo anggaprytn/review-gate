@@ -5,6 +5,10 @@ use crate::{
     },
     error::{Result, ReviewGateError},
     gitlab::url::GitLabMrUrl,
+    review::comparison::{
+        compare_current_run_with_previous, format_comparison_terminal,
+        format_comparison_terminal_default, ReviewComparison,
+    },
     storage::{LatestReviewRun, Storage, StoredReviewFinding},
 };
 use std::{
@@ -42,6 +46,7 @@ pub struct FixPromptOptions {
 pub struct GeneratedFixPrompt {
     pub run: LatestReviewRun,
     pub findings: Vec<StoredReviewFinding>,
+    pub comparison: ReviewComparison,
     pub prompt: String,
 }
 
@@ -49,6 +54,7 @@ pub struct GeneratedFixPrompt {
 pub struct FindingsSummary {
     pub run: LatestReviewRun,
     pub findings: Vec<StoredReviewFinding>,
+    pub comparison: ReviewComparison,
     pub latest_verification: Option<VerificationCounters>,
 }
 
@@ -111,11 +117,18 @@ pub fn build_fix_prompt(
     if findings.is_empty() {
         return Err(ReviewGateError::NoActionableFindings);
     }
+    let comparison =
+        compare_current_run_with_previous(storage, &run.project_path, run.mr_iid, &run.id)?;
 
-    let prompt = render_fix_prompt(&findings, options.format);
+    let prompt = render_fix_prompt(
+        &findings,
+        options.format,
+        comparison.previous_run_id.as_ref().map(|_| &comparison),
+    );
     Ok(GeneratedFixPrompt {
         run,
         findings,
+        comparison,
         prompt,
     })
 }
@@ -123,10 +136,13 @@ pub fn build_fix_prompt(
 pub fn latest_findings_summary(storage: &Storage, mr: &GitLabMrUrl) -> Result<FindingsSummary> {
     let run = select_run(storage, mr, None)?;
     let findings = storage.review_findings_for_run(&run.id)?;
+    let comparison =
+        compare_current_run_with_previous(storage, &run.project_path, run.mr_iid, &run.id)?;
     let latest_verification = storage.latest_verification_counters(&mr.project_path, mr.mr_iid)?;
     Ok(FindingsSummary {
         run,
         findings,
+        comparison,
         latest_verification,
     })
 }
@@ -177,10 +193,12 @@ pub fn format_findings_summary(summary: &FindingsSummary) -> String {
     output.push_str("ReviewGate latest findings summary\n");
     output.push_str(&format!("Run ID: {}\n", summary.run.id));
     output.push_str(&format!("MR URL: {}\n", summary.run.mr_url));
-    output.push_str(&format_finding_counters_terminal(
+    output.push_str("Latest review:\n");
+    output.push_str(&format_finding_counter_lines(
         &count_stored_findings(&summary.findings),
         emoji_enabled(),
     ));
+    output.push_str(&format_comparison_terminal_default(&summary.comparison));
     output.push_str("Latest verification:\n");
     if let Some(counters) = summary.latest_verification.as_ref() {
         output.push_str(&format_verification_counter_lines(
@@ -239,11 +257,16 @@ fn filtered_actionable_findings(
         .collect()
 }
 
-fn render_fix_prompt(findings: &[StoredReviewFinding], format: FixPromptFormat) -> String {
+fn render_fix_prompt(
+    findings: &[StoredReviewFinding],
+    format: FixPromptFormat,
+    comparison: Option<&ReviewComparison>,
+) -> String {
     let mut prompt = String::new();
     prompt.push_str(&render_fix_prompt_header(
         &count_stored_findings(findings),
         emoji_enabled(),
+        comparison,
     ));
     prompt.push_str("You are an AI coding agent.\n\n");
     prompt.push_str("Fix only the ReviewGate findings listed below.\n\n");
@@ -305,7 +328,11 @@ fn render_fix_prompt(findings: &[StoredReviewFinding], format: FixPromptFormat) 
     prompt
 }
 
-fn render_fix_prompt_header(counters: &FindingCounters, emoji: bool) -> String {
+fn render_fix_prompt_header(
+    counters: &FindingCounters,
+    emoji: bool,
+    comparison: Option<&ReviewComparison>,
+) -> String {
     let mut header = String::new();
     header.push_str("ReviewGate fix prompt\n\n");
     header.push_str(&format!("Findings included: {}\n", counters.total));
@@ -338,12 +365,24 @@ fn render_fix_prompt_header(counters: &FindingCounters, emoji: bool) -> String {
             counters.note
         ));
     }
+    if let Some(comparison) = comparison {
+        header.push('\n');
+        header.push_str(&format_comparison_terminal(comparison, emoji));
+    }
     header.push_str("\n---\n\n");
     header
 }
 
 fn format_verification_counter_lines(counters: &VerificationCounters, emoji: bool) -> String {
     format_verification_counters_terminal(counters, emoji)
+        .lines()
+        .skip(1)
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+fn format_finding_counter_lines(counters: &FindingCounters, emoji: bool) -> String {
+    format_finding_counters_terminal(counters, emoji)
         .lines()
         .skip(1)
         .map(|line| format!("{line}\n"))
@@ -737,6 +776,7 @@ mod tests {
         let summary = latest_findings_summary(&storage, &mr).unwrap();
         let output = format_findings_summary(&summary);
 
+        assert!(output.contains("Latest review:"));
         assert!(output.contains("Open actionable findings: 3"));
         assert!(output.contains("🔴 Critical: 1"));
         assert!(output.contains("🟠 High: 1"));
@@ -744,6 +784,54 @@ mod tests {
         assert!(output.contains("🟢 Low: 1"));
         assert!(output.contains("🔵 Notes: 1"));
         assert!(output.contains("Latest verification:"));
+    }
+
+    #[test]
+    fn findings_summary_output_includes_comparison() {
+        let (storage, mr) = storage_with_runs(&[
+            RunFixture {
+                id: "run-old",
+                completed_at: "001",
+                findings: vec![finding("HIGH", "Old high", true)],
+            },
+            RunFixture {
+                id: "run-new",
+                completed_at: "002",
+                findings: vec![finding("HIGH", "New high", true)],
+            },
+        ]);
+
+        let summary = latest_findings_summary(&storage, &mr).unwrap();
+        let output = format_findings_summary(&summary);
+
+        assert!(output.contains("Change since previous review:"));
+        assert!(output.contains("Previous run: run-old"));
+        assert!(output.contains("⚠️ Still detected: 1"));
+    }
+
+    #[test]
+    fn fix_prompt_header_includes_comparison_when_previous_run_exists() {
+        let (storage, mr) = storage_with_runs(&[
+            RunFixture {
+                id: "run-old",
+                completed_at: "001",
+                findings: vec![finding("HIGH", "Old high", true)],
+            },
+            RunFixture {
+                id: "run-new",
+                completed_at: "002",
+                findings: vec![finding("HIGH", "New high", true)],
+            },
+        ]);
+
+        let generated = build_fix_prompt(&storage, &mr, default_options()).unwrap();
+
+        assert!(generated.prompt.contains("Change since previous review:"));
+        assert!(generated.prompt.contains("🆕 New findings: 0"));
+        assert!(generated.prompt.contains("⚠️ Still detected: 1"));
+        assert!(generated
+            .prompt
+            .contains("ReviewGate findings from latest SQLite run:"));
     }
 
     #[test]
