@@ -13,6 +13,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    Plan(PlanArgs),
     Review(ReviewArgs),
     Verify(VerifyArgs),
     FixPrompt(FixPromptArgs),
@@ -24,6 +25,27 @@ pub enum Commands {
 pub struct DoctorArgs {
     #[arg(long)]
     pub network: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PlanArgs {
+    #[arg(required_unless_present = "ci", value_name = "MR_URL")]
+    pub mr_url: Option<String>,
+
+    #[arg(long, conflicts_with = "mr_url")]
+    pub ci: bool,
+
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(long, value_name = "N")]
+    pub max_files: Option<usize>,
+
+    #[arg(long, value_name = "BYTES")]
+    pub max_diff_bytes: Option<usize>,
+
+    #[arg(long)]
+    pub include_low_risk: bool,
 }
 
 #[derive(Debug, Args)]
@@ -131,6 +153,7 @@ pub struct VerifyArgs {
 impl Cli {
     pub fn soft_fail(&self) -> bool {
         match &self.command {
+            Commands::Plan(_) => false,
             Commands::Review(args) => args.soft_fail,
             Commands::Verify(args) => args.soft_fail,
             Commands::FixPrompt(_) | Commands::Findings(_) => false,
@@ -142,6 +165,16 @@ impl Cli {
 impl VerifyArgs {
     pub fn publishes(&self) -> bool {
         self.publish
+    }
+}
+
+impl PlanArgs {
+    pub fn calls_llm(&self) -> bool {
+        false
+    }
+
+    pub fn publishes(&self) -> bool {
+        false
     }
 }
 
@@ -180,7 +213,7 @@ pub fn exit_code_for_result(failed: bool, soft_fail: bool) -> i32 {
 mod tests {
     use clap::Parser;
 
-    use super::{exit_code_for_result, Cli, Commands, ReviewArgs};
+    use super::{exit_code_for_result, Cli, Commands, PlanArgs, ReviewArgs};
 
     #[test]
     fn dry_run_mode_does_not_call_llm() {
@@ -192,6 +225,19 @@ mod tests {
         ]);
 
         let args = review_args(cli.command);
+        assert!(!args.calls_llm());
+        assert!(!args.publishes());
+    }
+
+    #[test]
+    fn plan_mode_does_not_call_llm_or_publish() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "plan",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+        ]);
+
+        let args = plan_args(cli.command);
         assert!(!args.calls_llm());
         assert!(!args.publishes());
     }
@@ -389,11 +435,23 @@ mod tests {
 
     fn review_args(command: Commands) -> ReviewArgs {
         match command {
+            Commands::Plan(_) => panic!("expected review command"),
             Commands::Review(args) => args,
             Commands::Verify(_) => panic!("expected review command"),
             Commands::FixPrompt(_) => panic!("expected review command"),
             Commands::Findings(_) => panic!("expected review command"),
             Commands::Doctor(_) => panic!("expected review command"),
+        }
+    }
+
+    fn plan_args(command: Commands) -> PlanArgs {
+        match command {
+            Commands::Plan(args) => args,
+            Commands::Review(_) => panic!("expected plan command"),
+            Commands::Verify(_) => panic!("expected plan command"),
+            Commands::FixPrompt(_) => panic!("expected plan command"),
+            Commands::Findings(_) => panic!("expected plan command"),
+            Commands::Doctor(_) => panic!("expected plan command"),
         }
     }
 }

@@ -6,6 +6,7 @@ pub mod error;
 pub mod fix_prompt;
 pub mod gitlab;
 pub mod llm;
+pub mod plan;
 pub mod redaction;
 pub mod review;
 pub mod storage;

@@ -162,5 +162,8 @@ pub enum ReviewGateError {
     Toml(#[from] toml::de::Error),
 
     #[error(transparent)]
+    Json(#[from] serde_json::Error),
+
+    #[error(transparent)]
     Io(#[from] std::io::Error),
 }

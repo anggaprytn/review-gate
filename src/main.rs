@@ -1,6 +1,7 @@
 use clap::Parser;
 use reviewgate::cli::{
-    exit_code_for_result, Cli, Commands, FindingsArgs, FixPromptArgs, ReviewArgs, VerifyArgs,
+    exit_code_for_result, Cli, Commands, FindingsArgs, FixPromptArgs, PlanArgs, ReviewArgs,
+    VerifyArgs,
 };
 use reviewgate::config::AppConfig;
 use reviewgate::doctor::{run_doctor, DoctorOptions};
@@ -24,6 +25,7 @@ use reviewgate::llm::types::LlmRunMetadata;
 use reviewgate::llm::{
     auth_label, external_model_call_label, payload_label, provider_local_only, review_with_config,
 };
+use reviewgate::plan::{build_review_plan, format_review_plan, PlanOptions};
 use reviewgate::review::engine::{
     build_sanitized_review_prompt, review_prompt_with_llm, ReviewPreview,
 };
@@ -64,6 +66,7 @@ async fn run() -> i32 {
 
 async fn run_command(cli: Cli) -> Result<()> {
     match cli.command {
+        Commands::Plan(args) => run_plan(args).await?,
         Commands::Review(args) => run_review(args).await?,
         Commands::Verify(args) => {
             let publish = args.publishes();
@@ -80,6 +83,36 @@ async fn run_command(cli: Cli) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn run_plan(args: PlanArgs) -> Result<()> {
+    let mr_url = resolve_mr_url(args.ci, args.mr_url.as_deref(), false)?;
+    let mr = GitLabMrUrl::parse(&mr_url)?;
+    let config = AppConfig::load()?;
+    let gitlab = GitLabClient::new_with_token_source(
+        mr.base_url.clone(),
+        config.gitlab_token.clone(),
+        config.gitlab_token_source,
+    )?;
+    let metadata = gitlab.fetch_merge_request(&mr).await?;
+    let diffs = gitlab.fetch_merge_request_diffs(&mr).await?;
+    let mut options = PlanOptions::from_env();
+    if let Some(max_files) = args.max_files {
+        options.max_files = max_files;
+    }
+    if let Some(max_diff_bytes) = args.max_diff_bytes {
+        options.max_diff_bytes = max_diff_bytes;
+        options.large_mr_diff_bytes = max_diff_bytes;
+    }
+    options.include_low_risk = args.include_low_risk;
+
+    let plan = build_review_plan(&mr, metadata, diffs, options);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        print!("{}", format_review_plan(&plan));
+    }
     Ok(())
 }
 
