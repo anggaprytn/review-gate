@@ -359,8 +359,11 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    static TEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn latest_findings_query_uses_latest_completed_run() {
@@ -610,6 +613,16 @@ mod tests {
     }
 
     #[test]
+    fn fix_prompt_test_dbs_do_not_share_state() {
+        let first = temp_db_path("fix_prompt");
+        let second = temp_db_path("fix_prompt");
+
+        assert_ne!(first, second);
+        assert!(!first.ends_with(".reviewgate/reviewgate.sqlite"));
+        assert!(!second.ends_with(".reviewgate/reviewgate.sqlite"));
+    }
+
+    #[test]
     fn generated_prompt_does_not_include_raw_diff() {
         let (storage, mr) = storage_with_single_run(vec![finding("HIGH", "Timeout missing", true)]);
 
@@ -750,11 +763,15 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
+        let sequence = TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("reviewgate-{name}-{nanos}"));
+        let path = std::env::temp_dir().join(format!(
+            "reviewgate-fix-prompt-{name}-{}-{nanos}-{sequence}",
+            std::process::id()
+        ));
         fs::create_dir_all(&path).unwrap();
         path
     }

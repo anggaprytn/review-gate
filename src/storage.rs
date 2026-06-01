@@ -17,10 +17,12 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 const MIGRATION_VERSION: i64 = 1;
+static STORAGE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub struct Storage {
@@ -203,6 +205,7 @@ impl Storage {
         preview: &ReviewPreview,
     ) -> Result<PersistedReviewRun> {
         let completed_at = now_text();
+        let id_nonce = id_nonce();
         let run_id = review_run_id(
             &context.mr_url.project_path,
             context.metadata.iid,
@@ -210,6 +213,7 @@ impl Storage {
             &config.llm.provider,
             &config.llm.model,
             &completed_at,
+            &id_nonce,
         );
         let tx = self.conn.transaction().map_err(storage_error)?;
 
@@ -387,7 +391,7 @@ impl Storage {
                 "SELECT id, project_path, mr_iid, mr_url, head_sha, model_provider, model_name, completed_at
                  FROM review_runs
                  WHERE project_path = ?1 AND mr_iid = ?2 AND status = 'completed'
-                 ORDER BY completed_at DESC
+                 ORDER BY completed_at DESC, rowid DESC
                  LIMIT 1",
                 params![project_path, mr_iid as i64],
                 |row| {
@@ -534,6 +538,7 @@ impl Storage {
         outcome: &VerificationOutcome,
     ) -> Result<PersistedVerificationRun> {
         let completed_at = now_text();
+        let id_nonce = id_nonce();
         let run_id = verification_run_id(
             &context.mr_url.project_path,
             context.metadata.iid,
@@ -541,6 +546,7 @@ impl Storage {
             &config.llm.provider,
             &config.llm.model,
             &completed_at,
+            &id_nonce,
         );
         let tx = self.conn.transaction().map_err(storage_error)?;
         tx.execute(
@@ -812,6 +818,7 @@ fn review_run_id(
     provider: &str,
     model: &str,
     completed_at: &str,
+    nonce: &str,
 ) -> String {
     stable_id(
         "rgrun",
@@ -822,6 +829,7 @@ fn review_run_id(
             provider,
             model,
             completed_at,
+            nonce,
         ],
     )
 }
@@ -851,6 +859,7 @@ fn verification_run_id(
     provider: &str,
     model: &str,
     completed_at: &str,
+    nonce: &str,
 ) -> String {
     stable_id(
         "rgverify",
@@ -861,6 +870,7 @@ fn verification_run_id(
             provider,
             model,
             completed_at,
+            nonce,
         ],
     )
 }
@@ -902,6 +912,11 @@ fn now_text() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     format!("{:020}", duration.as_nanos())
+}
+
+fn id_nonce() -> String {
+    let sequence = STORAGE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{sequence}", std::process::id())
 }
 
 fn optional_i64_to_u32(value: Option<i64>) -> Option<u32> {
@@ -1059,10 +1074,15 @@ mod tests {
     };
     use rusqlite::Connection;
     use std::{
+        collections::HashSet,
         fs,
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
+
+    static TEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn migration_creates_all_tables() {
@@ -1240,6 +1260,182 @@ mod tests {
     }
 
     #[test]
+    fn two_review_runs_inserted_in_same_second_do_not_collide() {
+        let path = temp_db_path("two_review_runs_inserted_in_same_second_do_not_collide");
+        let mut storage = Storage::open_path(&path).unwrap();
+
+        wait_for_same_second_insert_window();
+        let first = storage
+            .persist_review_run(&context(), &config(path.clone()), &preview_with_findings())
+            .unwrap();
+        let second = storage
+            .persist_review_run(&context(), &config(path), &preview_with_findings())
+            .unwrap();
+
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            review_run_completed_second(&storage.conn, &first.id),
+            review_run_completed_second(&storage.conn, &second.id)
+        );
+        assert_eq!(count(&storage.conn, "review_runs"), 2);
+    }
+
+    #[test]
+    fn two_verification_runs_inserted_in_same_second_do_not_collide() {
+        let path = temp_db_path("two_verification_runs_inserted_in_same_second_do_not_collide");
+        let mut storage = Storage::open_path(&path).unwrap();
+        let persisted_review = storage
+            .persist_review_run(&context(), &config(path.clone()), &preview_with_findings())
+            .unwrap();
+        let previous = storage
+            .previous_findings_for_verification(&persisted_review.id, 30)
+            .unwrap();
+        let outcome = VerificationOutcome {
+            summary: "1 fixed.".to_string(),
+            results: vec![VerificationResult {
+                previous_finding: previous[0].clone(),
+                status: VerificationStatus::Fixed,
+                reason: "fixed".to_string(),
+                evidence: Some("evidence".to_string()),
+            }],
+            parsed: true,
+            parse_warning: None,
+        };
+
+        wait_for_same_second_insert_window();
+        let first = storage
+            .persist_verification_run(
+                &context(),
+                &config(path.clone()),
+                Some(&persisted_review.id),
+                &outcome,
+            )
+            .unwrap();
+        let second = storage
+            .persist_verification_run(
+                &context(),
+                &config(path),
+                Some(&persisted_review.id),
+                &outcome,
+            )
+            .unwrap();
+
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            verification_run_completed_second(&storage.conn, &first.id),
+            verification_run_completed_second(&storage.conn, &second.id)
+        );
+        assert_eq!(count(&storage.conn, "verification_runs"), 2);
+        assert_eq!(count(&storage.conn, "verification_results"), 2);
+    }
+
+    #[test]
+    fn duplicate_findings_in_same_run_get_distinct_ids() {
+        let path = temp_db_path("duplicate_findings_in_same_run_get_distinct_ids");
+        let mut storage = Storage::open_path(&path).unwrap();
+        let mut preview = preview_with_findings();
+        let analysis = preview.analysis.as_mut().unwrap();
+        let duplicate = analysis.findings[0].clone();
+        analysis.findings = vec![duplicate.clone(), duplicate];
+
+        let persisted = storage
+            .persist_review_run(&context(), &config(path), &preview)
+            .unwrap();
+
+        let unique_ids: HashSet<&String> = persisted.finding_ids.iter().collect();
+        assert_eq!(persisted.finding_ids.len(), 2);
+        assert_eq!(unique_ids.len(), 2);
+        assert_eq!(count(&storage.conn, "review_findings"), 2);
+    }
+
+    #[test]
+    fn parallel_test_dbs_do_not_share_state() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                thread::spawn(|| {
+                    let path = temp_db_path("parallel_test_dbs_do_not_share_state");
+                    let mut storage = Storage::open_path(&path).unwrap();
+                    let persisted = storage
+                        .persist_review_run(
+                            &context(),
+                            &config(path.clone()),
+                            &preview_with_findings(),
+                        )
+                        .unwrap();
+                    (path, persisted.id, count(&storage.conn, "review_runs"))
+                })
+            })
+            .collect();
+
+        let mut paths = HashSet::new();
+        let mut run_ids = HashSet::new();
+        for handle in handles {
+            let (path, run_id, run_count) = handle.join().unwrap();
+            assert!(paths.insert(path));
+            assert!(run_ids.insert(run_id));
+            assert_eq!(run_count, 1);
+        }
+    }
+
+    #[test]
+    fn storage_test_db_paths_do_not_use_default_reviewgate_sqlite() {
+        let path = temp_db_path("storage_test_db_paths_do_not_use_default_reviewgate_sqlite");
+        let default_path = Path::new(".reviewgate").join("reviewgate.sqlite");
+
+        assert!(path.is_absolute());
+        assert_ne!(path, default_path);
+        assert!(!path.ends_with(&default_path));
+    }
+
+    #[test]
+    fn review_run_ids_do_not_collide_when_completed_at_matches() {
+        let first = super::review_run_id(
+            "group/repo",
+            59,
+            "head",
+            "gemini_cli",
+            "gemini-2.5-pro",
+            "1700000000000000000",
+            "nonce-1",
+        );
+        let second = super::review_run_id(
+            "group/repo",
+            59,
+            "head",
+            "gemini_cli",
+            "gemini-2.5-pro",
+            "1700000000000000000",
+            "nonce-2",
+        );
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn verification_run_ids_do_not_collide_when_completed_at_matches() {
+        let first = super::verification_run_id(
+            "group/repo",
+            59,
+            "head",
+            "gemini_cli",
+            "gemini-2.5-pro",
+            "1700000000000000000",
+            "nonce-1",
+        );
+        let second = super::verification_run_id(
+            "group/repo",
+            59,
+            "head",
+            "gemini_cli",
+            "gemini-2.5-pro",
+            "1700000000000000000",
+            "nonce-2",
+        );
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn storage_disabled_skips_db_writes() {
         let path = temp_db_path("storage_disabled_skips_db_writes");
         let storage = Storage::open(&StorageConfig {
@@ -1306,6 +1502,36 @@ mod tests {
             row.get(0)
         })
         .unwrap()
+    }
+
+    fn review_run_completed_second(conn: &Connection, run_id: &str) -> u128 {
+        completed_second(conn, "review_runs", run_id)
+    }
+
+    fn verification_run_completed_second(conn: &Connection, run_id: &str) -> u128 {
+        completed_second(conn, "verification_runs", run_id)
+    }
+
+    fn completed_second(conn: &Connection, table: &str, run_id: &str) -> u128 {
+        let table = match table {
+            "review_runs" => "review_runs",
+            "verification_runs" => "verification_runs",
+            _ => panic!("unsupported completed_at table"),
+        };
+        let completed_at: String = conn
+            .query_row(
+                &format!("SELECT completed_at FROM {table} WHERE id = ?1"),
+                [run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        completed_at.parse::<u128>().unwrap() / 1_000_000_000
+    }
+
+    fn wait_for_same_second_insert_window() {
+        while super::now_text().parse::<u128>().unwrap() % 1_000_000_000 > 700_000_000 {
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn inline_result(finding_id: &str, status: InlinePublishStatus) -> InlinePublishResult {
@@ -1471,11 +1697,15 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
+        let sequence = TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("reviewgate-{name}-{nanos}"));
+        let path = std::env::temp_dir().join(format!(
+            "reviewgate-storage-{name}-{}-{nanos}-{sequence}",
+            std::process::id()
+        ));
         fs::create_dir_all(&path).unwrap();
         path
     }
