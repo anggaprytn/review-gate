@@ -138,7 +138,7 @@ ReviewGate v0.1 is intentionally CLI-first and alpha-quality:
 - No dashboard.
 - No SaaS backend.
 - No public webhook required.
-- No Docker image yet.
+- Docker images are intended for GitLab CI, private runners, and internal networks.
 - No Semgrep integration.
 - Inline GitLab comments are optional and gated behind `--publish-inline`.
 - Remote CLI providers can change behavior outside ReviewGate's control.
@@ -148,6 +148,7 @@ ReviewGate v0.1 is intentionally CLI-first and alpha-quality:
 
 - [Quickstart](docs/quickstart.md)
 - [GitLab CI](docs/gitlab-ci.md)
+- [Docker](docs/docker.md)
 - [Providers](docs/providers.md)
 - [Configuration](docs/configuration.md)
 - [Privacy](docs/privacy.md)

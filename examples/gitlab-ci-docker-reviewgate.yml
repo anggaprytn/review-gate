@@ -1,0 +1,28 @@
+stages:
+  - review
+
+reviewgate:
+  stage: review
+  image: ghcr.io/anggaprytn/review-gate:v0.1.0-alpha.3
+  variables:
+    REVIEWGATE_LLM_PROVIDER: "ollama"
+    OLLAMA_BASE_URL: "http://ollama:11434"
+  script:
+    - reviewgate doctor
+    - reviewgate review --ci --publish
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# Safer soft-fail alternative:
+#
+# reviewgate:
+#   stage: review
+#   image: ghcr.io/anggaprytn/review-gate:v0.1.0-alpha.3
+#   variables:
+#     REVIEWGATE_LLM_PROVIDER: "ollama"
+#     OLLAMA_BASE_URL: "http://ollama:11434"
+#   script:
+#     - reviewgate doctor
+#     - reviewgate review --ci --publish --soft-fail
+#   rules:
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'

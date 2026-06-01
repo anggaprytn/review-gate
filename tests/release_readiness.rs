@@ -129,6 +129,79 @@ fn ci_example_targets_merge_request_events() {
 }
 
 #[test]
+fn docker_packaging_files_are_release_ready() {
+    for path in [
+        "Dockerfile",
+        ".dockerignore",
+        "docs/docker.md",
+        "examples/gitlab-ci-docker-reviewgate.yml",
+        ".github/workflows/docker.yml",
+    ] {
+        assert!(Path::new(path).is_file(), "{path} should exist");
+    }
+
+    let dockerignore = fs::read_to_string(".dockerignore").unwrap();
+    assert!(
+        dockerignore.lines().any(|line| line.trim() == ".git"),
+        ".dockerignore should exclude .git"
+    );
+    assert!(
+        dockerignore.lines().any(|line| line.trim() == "target"),
+        ".dockerignore should exclude target"
+    );
+    assert!(
+        dockerignore.lines().any(|line| line.trim() == ".env"),
+        ".dockerignore should exclude .env"
+    );
+    assert!(
+        dockerignore
+            .lines()
+            .any(|line| line.trim() == ".reviewgate"),
+        ".dockerignore should exclude .reviewgate"
+    );
+    assert!(
+        dockerignore
+            .lines()
+            .any(|line| line.trim() == "docs/PRD.md"),
+        ".dockerignore should exclude docs/PRD.md"
+    );
+
+    let dockerfile = fs::read_to_string("Dockerfile").unwrap();
+    assert!(dockerfile.contains("FROM rust:"));
+    assert!(dockerfile.contains("FROM debian:bookworm-slim"));
+    assert!(dockerfile.contains("/usr/local/bin/reviewgate"));
+    assert!(dockerfile.contains("ca-certificates"));
+    assert!(dockerfile.contains("USER reviewgate"));
+    assert!(dockerfile.contains("CMD [\"--help\"]"));
+    assert!(!dockerfile.contains("COPY ."));
+
+    let docs = fs::read_to_string("docs/docker.md").unwrap();
+    assert!(docs.contains("docker build -t reviewgate:local ."));
+    assert!(docs.contains("docker run --rm reviewgate:local --version"));
+    assert!(docs.contains("docker run --rm reviewgate:local doctor"));
+    assert!(docs.contains("ollama"));
+    assert!(docs.contains("Privacy"));
+
+    let example = fs::read_to_string("examples/gitlab-ci-docker-reviewgate.yml").unwrap();
+    assert!(example.contains("ghcr.io/anggaprytn/review-gate:v0.1.0-alpha.3"));
+    assert!(example.contains("REVIEWGATE_LLM_PROVIDER: \"ollama\""));
+    assert!(example.contains("OLLAMA_BASE_URL: \"http://ollama:11434\""));
+    assert!(example.contains("reviewgate doctor"));
+    assert!(example.contains("reviewgate review --ci --publish"));
+    assert!(example.contains("reviewgate review --ci --publish --soft-fail"));
+    assert!(example.contains("merge_request_event"));
+
+    let workflow = fs::read_to_string(".github/workflows/docker.yml").unwrap();
+    assert!(workflow.contains("tags:"));
+    assert!(workflow.contains("- \"v*\""));
+    assert!(workflow.contains("ghcr.io/anggaprytn/review-gate"));
+    assert!(workflow.contains("docker/build-push-action"));
+    assert!(workflow.contains("docker/metadata-action"));
+    assert!(workflow.contains("latest"));
+    assert!(workflow.contains("alpha"));
+}
+
+#[test]
 fn install_script_exists_and_is_executable() {
     let metadata = fs::metadata("scripts/install.sh").unwrap();
     assert!(metadata.is_file());
