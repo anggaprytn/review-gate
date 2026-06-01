@@ -561,6 +561,23 @@ mod tests {
     }
 
     #[test]
+    fn fix_prompt_excludes_non_actionable_positive_notes() {
+        let (storage, mr) = storage_with_single_run(vec![
+            finding("HIGH", "Actionable", true),
+            finding("NOTE", "Credentials removed from persisted state", false),
+        ]);
+        let options = FixPromptOptions {
+            include_notes: true,
+            ..default_options()
+        };
+
+        let generated = build_fix_prompt(&storage, &mr, options).unwrap();
+
+        assert_eq!(titles(&generated), vec!["Actionable"]);
+        assert!(!generated.prompt.contains("Credentials removed"));
+    }
+
+    #[test]
     fn low_and_note_are_excluded_by_default() {
         let (storage, mr) = storage_with_single_run(vec![
             finding("HIGH", "High", true),

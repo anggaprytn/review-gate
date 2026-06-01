@@ -6,6 +6,7 @@ use crate::{
         formatter::{format_malformed_review_markdown, format_review_markdown},
         parser::parse_review_analysis,
         prompt::build_review_prompt,
+        quality::normalize_review_analysis,
         types::ReviewAnalysis,
     },
 };
@@ -33,7 +34,10 @@ where
     let llm_response = call_llm(prompt).await?;
 
     let (markdown, parsed, analysis) = match parse_review_analysis(&llm_response.text) {
-        Ok(analysis) => (format_review_markdown(&analysis), true, Some(analysis)),
+        Ok(analysis) => {
+            let analysis = normalize_review_analysis(analysis);
+            (format_review_markdown(&analysis), true, Some(analysis))
+        }
         Err(err) => (
             format_malformed_review_markdown(&llm_response.text, &err),
             false,

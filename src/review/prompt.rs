@@ -49,6 +49,12 @@ Rules:
 - effort=moderate means the fix needs some code change or test update, usually 15-60 minutes.
 - effort=heavy means the fix may require design, refactor, migration, or cross-file changes.
 - Use NOTE for positive or informational observations.
+- Positive changes must be returned as NOTE only with actionable=false.
+- Do not assign CRITICAL, HIGH, or MEDIUM to positive notes.
+- Do not create a finding if the suggested fix is "No action needed."
+- CRITICAL is reserved for exploitable security flaws, data loss, auth bypass, credential exposure, destructive migration, or build/runtime breakage.
+- If a finding is just a good practice or improvement, either omit it or return as NOTE with actionable=false.
+- Return fewer findings. Prefer no finding over a weak finding.
 - Do not include confidence.
 - Do not ask for full AST, LSP, Semgrep, repository-wide analysis, or code not shown.
 - Produce JSON only. Do not wrap the JSON in markdown fences. Do not include prose before or after the JSON.
@@ -121,6 +127,10 @@ mod tests {
         assert!(prompt.contains("anchor_id"));
         assert!(prompt.contains("risk_code"));
         assert!(prompt.contains("effort"));
+        assert!(prompt.contains("Positive changes must be returned as NOTE only"));
+        assert!(prompt
+            .contains("Do not create a finding if the suggested fix is \"No action needed.\""));
+        assert!(prompt.contains("Prefer no finding over a weak finding."));
         assert!(!prompt.contains(r#""confidence": "high""#));
         assert!(prompt.contains("[A0001] new_line=42 old_line=- kind=added"));
     }

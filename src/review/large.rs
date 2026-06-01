@@ -9,6 +9,7 @@ use crate::{
         engine::{estimate_prompt_tokens, ReviewPreview},
         formatter::format_review_markdown,
         parser::parse_review_analysis,
+        quality::normalize_review_analysis,
         types::{OverallRisk, ReviewAnalysis, ReviewFinding, Severity},
     },
 };
@@ -311,6 +312,12 @@ Rules:
 - Include file_path and line from the same anchor when anchor_id is present. If a line is not visible, use null.
 - Use risk_code from the allowed list. If no specific value fits, use other.
 - For every finding, include effort.
+- Positive changes must be returned as NOTE only with actionable=false.
+- Do not assign CRITICAL, HIGH, or MEDIUM to positive notes.
+- Do not create a finding if the suggested fix is "No action needed."
+- CRITICAL is reserved for exploitable security flaws, data loss, auth bypass, credential exposure, destructive migration, or build/runtime breakage.
+- If a finding is just a good practice or improvement, either omit it or return as NOTE with actionable=false.
+- Return fewer findings. Prefer no finding over a weak finding.
 - Produce JSON only. Do not wrap the JSON in markdown fences. Do not include prose before or after the JSON.
 
 Return exactly one JSON object matching this schema:
@@ -393,7 +400,7 @@ where
             Ok(response) => {
                 merge_metadata(&mut metadata_total, &response.metadata);
                 match parse_review_analysis(&response.text) {
-                    Ok(analysis) => analyses.push(analysis),
+                    Ok(analysis) => analyses.push(normalize_review_analysis(analysis)),
                     Err(err) => failures.push(ChunkFailure {
                         chunk_index: chunk.index,
                         message: err.to_string(),
@@ -424,7 +431,7 @@ where
         skipped_files: selection.skipped_files,
         skipped_reasons: selection.skipped_reasons.clone(),
     };
-    let analysis = merge_chunk_analyses(analyses, &report);
+    let analysis = normalize_review_analysis(merge_chunk_analyses(analyses, &report));
     let markdown = format_large_review_markdown(&analysis, &report);
 
     Ok(ReviewPreview {
@@ -1064,6 +1071,8 @@ mod tests {
 
         assert!(prompt.contains("Review only this chunk."));
         assert!(prompt.contains("Do not comment on files outside this chunk."));
+        assert!(prompt.contains("Positive changes must be returned as NOTE only"));
+        assert!(prompt.contains("Prefer no finding over a weak finding."));
     }
 
     #[test]
@@ -1238,6 +1247,23 @@ mod tests {
         assert!(markdown.contains("## Finding Summary"));
         assert!(markdown.contains("Reviewed chunks: 3"));
         assert!(markdown.contains("Review mode: risk-prioritized partial review"));
+    }
+
+    #[test]
+    fn large_review_markdown_caps_note_findings_by_default() {
+        let findings = (0..8)
+            .map(|index| finding(&format!("note {index}"), Severity::Note, None))
+            .collect::<Vec<_>>();
+        let markdown = format_large_review_markdown(&analysis(findings), &report(3, 0));
+
+        let note_headings = markdown
+            .lines()
+            .filter(|line| line.starts_with("### ") && line.contains("NOTE"))
+            .count();
+        assert!(note_headings <= 3);
+        assert!(
+            markdown.contains("Additional low/note findings omitted from the published summary: 5")
+        );
     }
 
     fn options() -> LargeReviewOptions {

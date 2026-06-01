@@ -694,6 +694,7 @@ mod tests {
         gitlab::types::{DiffRefs, MergeRequestDiff},
         review::{
             anchors::AnchorBuilder,
+            quality::normalize_review_analysis,
             types::{Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, Severity},
         },
     };
@@ -1016,6 +1017,33 @@ mod tests {
         let candidate = single_candidate(Severity::High, Effort::Quick, false);
 
         assert_eq!(candidate.reason, InlineEligibilityReason::NotActionable);
+    }
+
+    #[test]
+    fn normalized_positive_notes_are_not_inline_candidates() {
+        let mut positive = finding(
+            Severity::Critical,
+            Effort::Moderate,
+            true,
+            Some("src/a.rs"),
+            Some(1),
+        );
+        positive.title = "Positive: Credentials removed from Redux state".to_string();
+        positive.body = "This change improves credential handling.".to_string();
+        positive.suggested_fix = Some("No action needed".to_string());
+        let analysis = normalize_review_analysis(analysis(vec![positive]));
+
+        let candidate = resolve_inline_candidates(
+            &analysis,
+            &[diff("src/a.rs", "@@ -1 +1 @@\n-old\n+new")],
+            Some(&diff_refs()),
+            &inline_config(8, 5),
+        )
+        .remove(0);
+
+        assert!(!candidate.eligible);
+        assert_eq!(candidate.severity, Severity::Note);
+        assert_eq!(candidate.reason, InlineEligibilityReason::SeverityTooLow);
     }
 
     #[test]

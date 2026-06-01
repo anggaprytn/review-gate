@@ -8,6 +8,9 @@ use crate::{
 };
 use regex::Regex;
 
+const LOW_DISPLAY_LIMIT: usize = 3;
+const NOTE_DISPLAY_LIMIT: usize = 3;
+
 pub fn format_review_markdown(analysis: &ReviewAnalysis) -> String {
     format_review_markdown_with_emoji(analysis, emoji_enabled())
 }
@@ -130,7 +133,53 @@ fn push_severity_section(
         return;
     }
 
-    for (index, finding) in section_findings.iter().enumerate() {
+    if severities == [Severity::Low, Severity::Note] {
+        push_capped_low_note_section(output, &section_findings, emoji);
+        return;
+    }
+
+    push_findings(output, &section_findings, emoji);
+}
+
+fn push_capped_low_note_section(
+    output: &mut String,
+    section_findings: &[&ReviewFinding],
+    emoji: bool,
+) {
+    let displayed = section_findings
+        .iter()
+        .copied()
+        .filter(|finding| finding.severity == Severity::Low)
+        .take(LOW_DISPLAY_LIMIT)
+        .chain(
+            section_findings
+                .iter()
+                .copied()
+                .filter(|finding| finding.severity == Severity::Note)
+                .take(NOTE_DISPLAY_LIMIT),
+        )
+        .collect::<Vec<_>>();
+    push_findings(output, &displayed, emoji);
+
+    let omitted = section_findings.len().saturating_sub(displayed.len());
+    if omitted > 0 {
+        if !displayed.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&format!(
+            "Additional low/note findings omitted from the published summary: {omitted}\n"
+        ));
+        output.push_str(
+            "Run `reviewgate review <MR_URL> --preview --include-low-risk` or inspect SQLite history for full details.\n\n",
+        );
+        output.push_str(
+            "Collapsed low/note findings are summarized only; notes are not counted as open actionable blockers.\n",
+        );
+    }
+}
+
+fn push_findings(output: &mut String, findings: &[&ReviewFinding], emoji: bool) {
+    for (index, finding) in findings.iter().enumerate() {
         if index > 0 {
             output.push('\n');
         }
@@ -348,6 +397,30 @@ mod tests {
 
         assert!(!markdown.contains("confidence"));
         assert!(!markdown.contains("Confidence:"));
+    }
+
+    #[test]
+    fn low_and_note_display_is_capped_in_published_markdown() {
+        let findings = (0..4)
+            .map(|index| finding(Severity::Low, &format!("low {index}")))
+            .chain((0..5).map(|index| finding(Severity::Note, &format!("note {index}"))))
+            .collect::<Vec<_>>();
+        let markdown = format_review_markdown_with_emoji(
+            &ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings,
+                test_coverage_note: None,
+                privacy_note: None,
+                overall_risk: OverallRisk::Low,
+            },
+            false,
+        );
+
+        assert_eq!(markdown.matches("### LOW").count(), 3);
+        assert_eq!(markdown.matches("### NOTE").count(), 3);
+        assert!(
+            markdown.contains("Additional low/note findings omitted from the published summary: 3")
+        );
     }
 
     fn finding(severity: Severity, title: &str) -> ReviewFinding {
