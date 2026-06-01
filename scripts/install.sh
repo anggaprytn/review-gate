@@ -6,7 +6,7 @@ fi
 
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 BIN_NAME="reviewgate"
-DEFAULT_REPO="Anggaprytn/review-gate"
+DEFAULT_REPO="anggaprytn/review-gate"
 DRY_RUN="${REVIEWGATE_INSTALL_DRY_RUN:-false}"
 
 error() {

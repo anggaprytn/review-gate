@@ -148,9 +148,28 @@ fn install_script_supports_release_overrides_and_dry_run() {
     assert!(script.contains("REVIEWGATE_REPO"));
     assert!(script.contains("REVIEWGATE_VERSION"));
     assert!(script.contains("REVIEWGATE_INSTALL_DRY_RUN"));
-    assert!(script.contains("Anggaprytn/review-gate"));
+    assert!(script.contains("anggaprytn/review-gate"));
     assert!(script.contains("reviewgate-${version}-${target}.tar.gz"));
     assert!(script.contains("No prebuilt ReviewGate binary is available"));
+}
+
+#[test]
+fn install_script_handles_explicit_alpha_prerelease_version() {
+    let output = Command::new("sh")
+        .arg("scripts/install.sh")
+        .env("REVIEWGATE_INSTALL_DRY_RUN", "true")
+        .env("REVIEWGATE_VERSION", "v0.1.0-alpha.1")
+        .env("INSTALL_DIR", "/tmp/reviewgate-install-test/bin")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("repo: anggaprytn/review-gate"));
+    assert!(stdout.contains("release version/latest: v0.1.0-alpha.1"));
+    assert!(stdout.contains("/releases/download/v0.1.0-alpha.1/reviewgate-v0.1.0-alpha.1-"));
+    assert!(!stdout.contains("reviewgate-<version>"));
 }
 
 #[test]
