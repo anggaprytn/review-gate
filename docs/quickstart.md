@@ -47,6 +47,8 @@ reviewgate review "$MR_URL" --dry-run
 reviewgate review "$MR_URL" --preview
 reviewgate review "$MR_URL" --publish
 reviewgate review "$MR_URL" --publish --publish-inline
+reviewgate review "$MR_URL" --mode single --preview
+reviewgate review "$MR_URL" --mode large --preview
 reviewgate verify "$MR_URL" --preview
 reviewgate verify "$MR_URL" --publish
 ```
@@ -54,6 +56,8 @@ reviewgate verify "$MR_URL" --publish
 Dry-run fetches GitLab metadata and diffs but skips model calls and publishing.
 
 Preview fetches GitLab data, calls the configured provider, and prints markdown.
+
+Review defaults to `--mode auto`, which keeps small MRs on single-pass review and switches large MRs to plan-driven chunked review. `--large` is still accepted as an alias for `--mode large`.
 
 Plain `--publish` creates or updates one summary note. It does not publish inline comments.
 

@@ -36,6 +36,10 @@ use reviewgate::review::large::{
     build_large_review_plan, review_large_chunks_with_llm, selected_diffs_in_order,
     validate_large_inline_mapping, LargeReviewOptions,
 };
+use reviewgate::review::mode::{
+    build_auto_review_plan, decide_auto_review_mode, AutoLargeOptions, AutoReviewDecision,
+    ReviewMode, SelectedReviewMode,
+};
 use reviewgate::storage::{PersistedReviewRun, Storage};
 use reviewgate::verify::{
     no_previous_run_message, verification_prompt_with_llm, VerificationPreview,
@@ -210,7 +214,21 @@ async fn run_review(args: ReviewArgs) -> Result<()> {
     )?;
     let metadata = gitlab.fetch_merge_request(&mr).await?;
     let diffs = gitlab.fetch_merge_request_diffs(&mr).await?;
-    if args.large {
+    let review_mode = args.effective_review_mode()?;
+    let selected_review_mode = match review_mode {
+        ReviewMode::Auto => {
+            let auto_options = AutoLargeOptions::from_env();
+            let auto_plan =
+                build_auto_review_plan(&mr, metadata.clone(), diffs.clone(), auto_options);
+            let decision = decide_auto_review_mode(&auto_plan, auto_options);
+            print_auto_review_decision(&decision);
+            decision.selected
+        }
+        ReviewMode::Single => SelectedReviewMode::SinglePass,
+        ReviewMode::Large => SelectedReviewMode::Large,
+    };
+
+    if selected_review_mode == SelectedReviewMode::Large {
         run_large_review(args, mr, metadata, diffs, config, gitlab, &mut storage).await?;
         return Ok(());
     }
@@ -583,6 +601,22 @@ fn review_mode_label(publish: bool, publish_inline: bool, dry_run: bool) -> &'st
     } else {
         "preview"
     }
+}
+
+fn print_auto_review_decision(decision: &AutoReviewDecision) {
+    match decision.selected {
+        SelectedReviewMode::SinglePass => {
+            println!("Review mode: auto -> single-pass");
+            println!("Reason: MR below large-review thresholds");
+        }
+        SelectedReviewMode::Large => {
+            println!("Review mode: auto -> large");
+            println!("Reason: MR exceeds large-review threshold");
+            println!("Changed files: {}", decision.changed_files);
+            println!("Diff bytes: {}", decision.diff_bytes);
+        }
+    }
+    println!();
 }
 
 fn review_config_for_large_anchors(

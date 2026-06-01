@@ -136,12 +136,15 @@ impl PlanOptions {
     pub fn from_env() -> Self {
         Self {
             max_files: env_usize("REVIEWGATE_PLAN_MAX_FILES").unwrap_or(DEFAULT_PLAN_MAX_FILES),
-            max_diff_bytes: env_usize("REVIEWGATE_LARGE_MR_DIFF_BYTES")
+            max_diff_bytes: env_usize("REVIEWGATE_AUTO_LARGE_DIFF_BYTES")
+                .or_else(|| env_usize("REVIEWGATE_LARGE_MR_DIFF_BYTES"))
                 .unwrap_or(DEFAULT_LARGE_MR_DIFF_BYTES),
             include_low_risk: false,
-            large_mr_file_threshold: env_usize("REVIEWGATE_LARGE_MR_FILE_THRESHOLD")
+            large_mr_file_threshold: env_usize("REVIEWGATE_AUTO_LARGE_FILE_THRESHOLD")
+                .or_else(|| env_usize("REVIEWGATE_LARGE_MR_FILE_THRESHOLD"))
                 .unwrap_or(DEFAULT_LARGE_MR_FILE_THRESHOLD),
-            large_mr_diff_bytes: env_usize("REVIEWGATE_LARGE_MR_DIFF_BYTES")
+            large_mr_diff_bytes: env_usize("REVIEWGATE_AUTO_LARGE_DIFF_BYTES")
+                .or_else(|| env_usize("REVIEWGATE_LARGE_MR_DIFF_BYTES"))
                 .unwrap_or(DEFAULT_LARGE_MR_DIFF_BYTES),
         }
     }
@@ -154,8 +157,8 @@ pub fn build_review_plan(
     options: PlanOptions,
 ) -> ReviewPlan {
     let total_diff_bytes = diffs.iter().map(diff_size).sum();
-    let large_by_files = diffs.len() > options.large_mr_file_threshold;
-    let large_by_bytes = total_diff_bytes > options.large_mr_diff_bytes;
+    let large_by_files = diffs.len() >= options.large_mr_file_threshold;
+    let large_by_bytes = total_diff_bytes >= options.large_mr_diff_bytes;
     let large_mr = large_by_files || large_by_bytes;
     let mut files: Vec<PlannedFile> = diffs.into_iter().map(classify_file).collect();
 
@@ -176,14 +179,14 @@ pub fn build_review_plan(
     }
     if large_by_files {
         warnings.push(format!(
-            "Changed file count {} exceeds REVIEWGATE_LARGE_MR_FILE_THRESHOLD={}.",
+            "Changed file count {} meets or exceeds REVIEWGATE_AUTO_LARGE_FILE_THRESHOLD={}.",
             files.len(),
             options.large_mr_file_threshold
         ));
     }
     if large_by_bytes {
         warnings.push(format!(
-            "Total diff bytes {} exceeds REVIEWGATE_LARGE_MR_DIFF_BYTES={}.",
+            "Total diff bytes {} meets or exceeds REVIEWGATE_AUTO_LARGE_DIFF_BYTES={}.",
             total_diff_bytes, options.large_mr_diff_bytes
         ));
     }
@@ -560,7 +563,8 @@ fn apply_plan_limits(files: &mut [PlannedFile], options: PlanOptions) {
         let include_by_risk = file.risk == FileRiskLevel::Medium
             || (file.risk == FileRiskLevel::Low && options.include_low_risk);
         let has_file_budget = included < options.max_files;
-        let has_byte_budget = included_bytes + file.diff_bytes <= options.max_diff_bytes;
+        let has_byte_budget =
+            included_bytes.saturating_add(file.diff_bytes) <= options.max_diff_bytes;
         if include_by_risk && has_file_budget && has_byte_budget {
             included += 1;
             included_bytes += file.diff_bytes;

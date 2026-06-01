@@ -60,6 +60,12 @@ pub enum ReviewGateError {
     #[error("--publish-inline requires --publish")]
     PublishInlineRequiresPublish,
 
+    #[error("invalid review mode '{0}'. Use auto, single, or large")]
+    InvalidReviewMode(String),
+
+    #[error("--large conflicts with --mode {0}; use --mode large or omit --large")]
+    ReviewModeConflict(String),
+
     #[error("large MR review mode is disabled. Set REVIEWGATE_LARGE_REVIEW_ENABLED=true or omit --large")]
     LargeReviewDisabled,
 

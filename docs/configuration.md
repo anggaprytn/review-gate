@@ -29,11 +29,16 @@ Supported providers:
 ## Review Limits
 
 ```bash
+REVIEWGATE_REVIEW_MODE=auto
+REVIEWGATE_AUTO_LARGE_FILE_THRESHOLD=30
+REVIEWGATE_AUTO_LARGE_DIFF_BYTES=200000
 REVIEWGATE_MAX_DIFF_BYTES=200000
 REVIEWGATE_MAX_FILES=50
 REVIEWGATE_MAX_CONTEXT_TOKENS=12000
 REVIEWGATE_TEMPERATURE=0.1
 ```
+
+`reviewgate review` defaults to `--mode auto`. Auto mode runs a lightweight plan first and switches to large-review chunking when the changed file count or total diff bytes meets the auto-large thresholds. `--large` remains supported as an alias for `--mode large`.
 
 ## Publishing
 

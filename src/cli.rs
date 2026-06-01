@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 
 use crate::error::{Result, ReviewGateError};
+use crate::review::mode::ReviewMode;
 
 #[derive(Debug, Parser)]
 #[command(name = "reviewgate")]
@@ -85,6 +86,9 @@ pub struct ReviewArgs {
 
     #[arg(long)]
     pub large: bool,
+
+    #[arg(long, value_enum, value_name = "auto|single|large")]
+    pub mode: Option<ReviewMode>,
 
     #[arg(long)]
     pub include_low_risk: bool,
@@ -189,8 +193,28 @@ impl ReviewArgs {
         if self.publish_inline && !self.publish {
             return Err(ReviewGateError::PublishInlineRequiresPublish);
         }
+        self.effective_review_mode()?;
 
         Ok(())
+    }
+
+    pub fn effective_review_mode(&self) -> Result<ReviewMode> {
+        if self.large {
+            if let Some(mode) = self.mode {
+                if mode != ReviewMode::Large {
+                    return Err(ReviewGateError::ReviewModeConflict(
+                        review_mode_label(mode).to_string(),
+                    ));
+                }
+            }
+            return Ok(ReviewMode::Large);
+        }
+
+        if let Some(mode) = self.mode {
+            return Ok(mode);
+        }
+
+        Ok(ReviewMode::from_env()?.unwrap_or(ReviewMode::Auto))
     }
 
     pub fn calls_llm(&self) -> bool {
@@ -207,6 +231,14 @@ impl ReviewArgs {
     }
 }
 
+fn review_mode_label(mode: ReviewMode) -> &'static str {
+    match mode {
+        ReviewMode::Auto => "auto",
+        ReviewMode::Single => "single",
+        ReviewMode::Large => "large",
+    }
+}
+
 pub fn exit_code_for_result(failed: bool, soft_fail: bool) -> i32 {
     if failed && !soft_fail {
         1
@@ -217,9 +249,14 @@ pub fn exit_code_for_result(failed: bool, soft_fail: bool) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+
     use clap::Parser;
 
     use super::{exit_code_for_result, Cli, Commands, PlanArgs, ReviewArgs};
+    use crate::review::mode::ReviewMode;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn dry_run_mode_does_not_call_llm() {
@@ -274,6 +311,21 @@ mod tests {
         let args = review_args(cli.command);
         assert!(args.calls_llm());
         assert!(args.publishes());
+    }
+
+    #[test]
+    fn plain_publish_remains_summary_only() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--publish",
+        ]);
+
+        let args = review_args(cli.command);
+        assert!(args.publishes());
+        assert!(!args.publish_inline);
+        assert!(!args.publishes_inline().unwrap());
     }
 
     #[test]
@@ -371,6 +423,43 @@ mod tests {
     }
 
     #[test]
+    fn large_aliases_mode_large() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--large",
+        ]);
+
+        let args = review_args(cli.command);
+        assert_eq!(args.effective_review_mode().unwrap(), ReviewMode::Large);
+    }
+
+    #[test]
+    fn large_and_mode_single_conflict() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--large",
+            "--mode",
+            "single",
+        ]);
+
+        let args = review_args(cli.command);
+        let err = args.validate().unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::error::ReviewGateError::ReviewModeConflict(_)
+        ));
+        assert_eq!(
+            err.to_string(),
+            "--large conflicts with --mode single; use --mode large or omit --large"
+        );
+    }
+
+    #[test]
     fn large_publish_inline_requires_explicit_flag() {
         let cli = Cli::parse_from([
             "reviewgate",
@@ -397,6 +486,37 @@ mod tests {
     }
 
     #[test]
+    fn env_default_mode_works() {
+        let _guard = env_guard();
+        std::env::set_var("REVIEWGATE_REVIEW_MODE", "single");
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--preview",
+        ]);
+
+        let args = review_args(cli.command);
+        assert_eq!(args.effective_review_mode().unwrap(), ReviewMode::Single);
+        std::env::remove_var("REVIEWGATE_REVIEW_MODE");
+    }
+
+    #[test]
+    fn invalid_mode_errors_cleanly() {
+        let err = Cli::try_parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--mode",
+            "banana",
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+        assert!(err.to_string().contains("invalid value 'banana'"));
+    }
+
+    #[test]
     fn review_ci_defaults_to_preview_behavior() {
         let cli = Cli::parse_from(["reviewgate", "review", "--ci"]);
 
@@ -404,6 +524,18 @@ mod tests {
         assert!(args.ci);
         assert!(args.calls_llm());
         assert!(!args.publishes());
+    }
+
+    #[test]
+    fn review_ci_uses_auto_mode_by_default() {
+        let _guard = env_guard();
+        std::env::remove_var("REVIEWGATE_REVIEW_MODE");
+        let cli = Cli::parse_from(["reviewgate", "review", "--ci", "--publish"]);
+
+        let args = review_args(cli.command);
+        assert!(args.ci);
+        assert!(args.publishes());
+        assert_eq!(args.effective_review_mode().unwrap(), ReviewMode::Auto);
     }
 
     #[test]
@@ -502,5 +634,11 @@ mod tests {
             Commands::Findings(_) => panic!("expected plan command"),
             Commands::Doctor(_) => panic!("expected plan command"),
         }
+    }
+
+    fn env_guard() -> MutexGuard<'static, ()> {
+        let guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("REVIEWGATE_REVIEW_MODE");
+        guard
     }
 }
