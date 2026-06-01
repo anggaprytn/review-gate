@@ -1,6 +1,7 @@
 use clap::Parser;
 use reviewgate::cli::{exit_code_for_result, Cli, Commands, ReviewArgs, VerifyArgs};
 use reviewgate::config::AppConfig;
+use reviewgate::doctor::{run_doctor, DoctorOptions};
 use reviewgate::error::Result;
 use reviewgate::gitlab::ci::{CiContextError, GitLabCiContext};
 use reviewgate::gitlab::client::GitLabClient;
@@ -61,6 +62,13 @@ async fn run_command(cli: Cli) -> Result<()> {
         Commands::Verify(args) => {
             let publish = args.publishes();
             verify_merge_request(args, publish).await?;
+        }
+        Commands::Doctor(args) => {
+            let output = run_doctor(DoctorOptions {
+                network: args.network,
+            })
+            .await?;
+            print!("{output}");
         }
     }
 

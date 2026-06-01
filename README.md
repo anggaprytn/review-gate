@@ -1,478 +1,136 @@
 # ReviewGate
 
-ReviewGate is a CLI-first AI merge request reviewer for private GitLab teams. v0.1 focuses on GitLab self-managed instances behind VPN and local-first review workflows.
+ReviewGate is a local-first AI merge request review tool for GitLab. It is built for teams that use GitLab self-managed, GitLab behind a VPN, or private network review workflows.
 
-ReviewGate does not include a dashboard, SaaS backend, GitHub support, Docker image, published packages, Semgrep, LSP, new model providers, or a full AST engine in this step.
+ReviewGate runs where your code already is: on a developer machine, in GitLab CI, or inside your private network. It has no SaaS backend, requires no public webhook, and does not include a dashboard in v0.1.
 
-## Real GitLab Dry Run
+## What It Does
 
-Connect to your VPN, export a GitLab token, then run:
+- Fetches merge request metadata and diffs from GitLab.
+- Redacts obvious secrets and builds a bounded review prompt.
+- Produces a review preview locally in the CLI.
+- Publishes one top-level summary note with `--publish`.
+- Optionally publishes inline GitLab comments with `--publish --publish-inline`.
+- Verifies whether previous ReviewGate findings were fixed.
+- Stores local review and verification history in SQLite.
 
-```bash
-GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/merge_requests/59" --dry-run
-```
+Plain `reviewgate review --publish` is summary-only. Inline comments require the explicit second flag `--publish-inline`.
 
-Dry-run contacts GitLab, fetches MR metadata, fetches MR diffs from the current `/diffs` API, redacts obvious secrets, applies local size limits, and prints a summary. It does not call an LLM and does not publish comments.
+## Providers
 
-Example output:
+ReviewGate supports these provider modes:
 
-```txt
-ReviewGate dry run
+- `gemini_cli`: default provider. Uses the local Gemini CLI client and local CLI auth, but still sends the sanitized review payload to an external model service.
+- `codex_cli`: uses the local Codex CLI client and local CLI auth, but still sends the sanitized review payload to an external model service.
+- `ollama`: true local-only model mode when Ollama and the selected model run inside your environment.
 
-Provider: GitLab
-Base URL: https://gitlab.company.local
-Project: group/repo
-MR: !59
-Title: Fix payment callback timeout
-State: opened
-Source: feature/payment-timeout
-Target: main
-Head SHA: abc123
+ReviewGate does not include direct OpenAI or Gemini API providers in v0.1.
 
-Diff summary:
-Changed files: 7
-Generated files skipped: 0
-Collapsed files: 0
-Too large files: 0
-Approx added lines: 120
-Approx removed lines: 42
-Diff bytes after redaction: 18342
+## Quick Start
 
-Files:
-- src/payment/client.ts (+42 -10)
-- src/payment/webhook.ts (+55 -12)
-- tests/payment/client.test.ts (+23 -20)
-
-Status:
-GitLab reachable: yes
-Token valid: yes
-Diff fetched: yes
-LLM call: skipped in dry-run
-Publish: skipped
-```
-
-## LLM Providers
-
-Preview fetches real GitLab metadata and diffs, builds an anchored sanitized review prompt, sends it to the configured provider, parses the model JSON, and prints ReviewGate markdown. It does not publish comments.
-
-Default dev mode is Gemini CLI:
-
-```env
-REVIEWGATE_LLM_PROVIDER=gemini_cli
-REVIEWGATE_MODEL=gemini-2.5-pro
-REVIEWGATE_GEMINI_TIMEOUT_SECONDS=240
-REVIEWGATE_GEMINI_BIN=gemini
-REVIEWGATE_GEMINI_OUTPUT_FORMAT=json
-```
-
-Run `gemini` once and choose Login with Google, or configure Gemini CLI auth. ReviewGate does not require a direct `GEMINI_API_KEY` when Gemini CLI cached auth is available. Gemini CLI is a local client, but it still makes an external model call, so ReviewGate reports `Local-only: false` and `External model call: enabled through Gemini CLI`.
-
-Codex CLI mode is also available:
-
-```env
-REVIEWGATE_LLM_PROVIDER=codex_cli
-REVIEWGATE_MODEL=gpt-5.2-codex
-REVIEWGATE_CODEX_TIMEOUT_SECONDS=240
-REVIEWGATE_CODEX_BIN=codex
-REVIEWGATE_CODEX_FULL_AUTO=false
-```
-
-Run `codex login` first. Codex CLI mode uses local Codex CLI authentication and does not require ReviewGate to read `OPENAI_API_KEY`. It is also an external model call and is not zero-code-exfiltration mode.
-
-Ollama remains the true local-only provider:
-
-Install Ollama from https://ollama.com, start it, then pull a local coding model:
+Install a provider first. For the default Gemini CLI mode, authenticate the `gemini` CLI before running ReviewGate.
 
 ```bash
-ollama pull qwen2.5-coder:7b
+export GITLAB_TOKEN="your-token"
+export REVIEWGATE_LLM_PROVIDER=gemini_cli
+
+reviewgate review "$MR_URL" --dry-run
+reviewgate review "$MR_URL" --preview
+reviewgate review "$MR_URL" --publish
+reviewgate review "$MR_URL" --publish --publish-inline
+reviewgate verify "$MR_URL" --preview
+reviewgate verify "$MR_URL" --publish
 ```
 
-Example environment:
-
-```env
-GITLAB_TOKEN=xxx
-REVIEWGATE_LLM_PROVIDER=ollama
-OLLAMA_BASE_URL=http://localhost:11434
-REVIEWGATE_MODEL=qwen2.5-coder:7b
-REVIEWGATE_LLM_TIMEOUT_SECONDS=180
-REVIEWGATE_MAX_CONTEXT_TOKENS=12000
-REVIEWGATE_TEMPERATURE=0.1
-```
-
-Run a preview:
+For local development from source:
 
 ```bash
-GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/merge_requests/59" --preview
+cargo run -- review "$MR_URL" --preview
+cargo run -- doctor
 ```
 
-To inspect model input while debugging, print the sanitized prompt before the Ollama call:
+More detail: [docs/quickstart.md](docs/quickstart.md).
 
-```bash
-GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/merge_requests/59" --preview --show-prompt
-```
+## GitLab Support
 
-The prompt converts the selected diff hunks into compact line anchors:
+ReviewGate works with GitLab.com, GitLab self-managed, and GitLab instances only reachable through a VPN or private network. Set `GITLAB_TOKEN` or `REVIEWGATE_GITLAB_TOKEN` for API access.
 
-```txt
-File: src/paymentClient.ts
-
-[A0001] new_line=10 old_line=8 kind=context | export async function chargeUser(...) {
-[A0002] new_line=11 old_line=- kind=added   | Authorization: [REDACTED_TOKEN]
-```
-
-The model is instructed to return `anchor_id` for line-specific findings and must not invent anchors. When an anchor is present, ReviewGate prefers it over model-provided `file_path` and `line`. If no exact anchor exists, the model may omit `anchor_id` and ReviewGate falls back to file and line mapping.
-
-Findings also include `risk_code`, a stable machine-readable risk label such as `missing_timeout`, `pii_or_secret_logging`, `missing_authorization_check`, `api_contract_break`, or `other`. Risk codes help keep inline dedupe stable even when the model changes the title or body wording.
-
-ReviewGate renders severity and effort labels in markdown:
-
-```md
-## 🟠 High
-
-### 🟠 HIGH · ⚡ Quick fix · src/paymentClient.ts:11
-
-**Authorization header is logged**
-
-Suggested fix:
-Remove the raw authorization header log or replace it with a sanitized request identifier.
-
-Category: privacy
-Risk code: pii_or_secret_logging
-```
-
-Severity is impact/risk. Effort is estimated fix complexity. Confidence is accepted from old model outputs but ignored and not shown. Set `REVIEWGATE_EMOJI=false` for plain labels in CI logs.
-
-## GitLab Summary Publish
-
-Publish fetches real GitLab metadata and diffs, calls the configured provider, prints the normalized ReviewGate markdown, then creates or updates one top-level merge request note. Plain `--publish` is summary-only and never posts inline comments.
-
-```bash
-GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/merge_requests/59" --publish
-```
-
-By default, ReviewGate adds a hidden marker like `<!-- reviewgate:summary project="group/repo" mr="59" -->`. On later publish runs, it lists existing MR notes and updates the existing non-system ReviewGate note instead of creating duplicates. Use `--force-new-note` only when you intentionally want another summary note:
-
-```bash
-cargo run -- review "$MR_URL" --publish --force-new-note
-```
-
-To create an internal GitLab note, use either `--internal-note` or `REVIEWGATE_GITLAB_INTERNAL_NOTE=true`:
-
-```bash
-cargo run -- review "$MR_URL" --publish --internal-note
-```
-
-For publishing, `GITLAB_TOKEN` needs write permission for MR notes. On GitLab personal, project, or group access tokens, use `api` scope unless your instance has a narrower custom policy that permits note creation and updates.
-
-## GitLab Inline Publish
-
-Inline publishing is behind a second explicit safety gate:
-
-```bash
-GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/merge_requests/59" --publish --publish-inline
-```
-
-`--publish-inline` requires `--publish`. `REVIEWGATE_INLINE_ENABLED=true` does not publish inline comments by itself; the CLI flag is the final publish gate.
-
-ReviewGate posts only eligible single-line findings through the GitLab merge request Discussions API. It does not post LOW or NOTE findings inline, does not create multi-line comments, and does not resolve or delete existing discussions.
-
-Before posting, ReviewGate lists existing MR discussions and scans non-system notes for hidden markers like:
-
-```md
-<!-- reviewgate:inline version="2" project="group/repo" mr="59" fingerprint="..." head_sha="..." risk_code="missing_timeout" -->
-```
-
-If the deterministic fingerprint already exists, ReviewGate skips that inline comment and prints the skipped duplicate count. v2 fingerprints include project path, MR IID, head SHA, resolved file path, old/new line, severity, category, and `risk_code`. They intentionally do not include title, body, or suggested fix, so model wording variance should not create duplicate inline comments.
-
-ReviewGate still reads old v1 inline markers where possible. It checks v2 fingerprints, old v1 title-based fingerprints, and position signatures from existing ReviewGate inline notes on the same head SHA. Those signatures let old v1 comments suppress equivalent new v2 comments when the resolved line and compatible risk code match, even if model wording or severity shifts between runs.
-
-GitLab can reject a position even when local diff parsing found a candidate, especially after force-pushes, collapsed diffs, or instance-specific validation differences. Those failures are isolated per candidate and reported as failed inline comments; the summary note remains published.
-
-## Local SQLite Storage
-
-ReviewGate stores local review history in SQLite by default:
-
-```env
-REVIEWGATE_STORAGE_ENABLED=true
-REVIEWGATE_DB_PATH=.reviewgate/reviewgate.sqlite
-REVIEWGATE_STORE_RAW_DIFF=false
-REVIEWGATE_STORE_RAW_LLM=false
-REVIEWGATE_VERIFY_MAX_PREVIOUS_FINDINGS=30
-```
-
-The `.reviewgate/` directory is created automatically and is ignored by git. ReviewGate stores review run metadata, normalized findings, summary note publish metadata, inline publish counts, inline discussion/note IDs, verification runs, and verification results.
-
-By default, ReviewGate does not store raw repository source, raw diffs, raw prompts, or raw model payloads. The stored finding text is the normalized ReviewGate finding returned by the model, plus file/line metadata and deterministic fingerprints for local history and dedupe.
-
-Review storage is best-effort. If SQLite cannot be opened or updated during `review`, ReviewGate prints a warning and continues the review. Verification requires readable local history because it compares against previous findings.
-
-## Change Verification
-
-After a review has been stored, verify whether previous CRITICAL, HIGH, and MEDIUM findings were fixed:
-
-```bash
-GITLAB_TOKEN=xxx cargo run -- verify "https://gitlab.company.local/group/repo/-/merge_requests/59"
-GITLAB_TOKEN=xxx cargo run -- verify "https://gitlab.company.local/group/repo/-/merge_requests/59" --preview
-```
-
-`verify` defaults to preview mode. It fetches the current MR metadata and diff, loads the latest completed local ReviewGate run for the same project and MR, sends only previous findings plus the current sanitized anchored diff to the configured LLM, then prints grouped verification markdown.
-
-Verification statuses are:
-
-- `fixed`: current diff clearly resolves the previous finding.
-- `still_open`: current diff still shows the same risk.
-- `skipped`: the finding is intentionally skipped or no longer relevant.
-- `needs_manual_confirmation`: evidence is insufficient or model output is unclear.
-
-Publish one top-level verification note:
-
-```bash
-GITLAB_TOKEN=xxx cargo run -- verify "$MR_URL" --publish
-```
-
-Verification publishing uses a hidden marker like:
-
-```md
-<!-- reviewgate:verification project="group/repo" mr="59" -->
-```
-
-On later `verify --publish` runs, ReviewGate lists existing MR notes, ignores system notes, and updates the existing verification note instead of creating duplicates. It does not post inline verification comments and does not resolve or delete existing discussions.
-
-## Inline Dry Run
-
-Inline dry-run evaluates whether model findings can be mapped to valid GitLab inline diff positions. It does not post inline comments and does not call the GitLab Discussions API.
-
-```bash
-GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/merge_requests/59" --preview --inline-dry-run
-GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/merge_requests/59" --publish --inline-dry-run
-```
-
-With `--preview --inline-dry-run`, ReviewGate fetches GitLab data, calls the configured provider, prints ReviewGate markdown, and prints an inline candidate mapping report. It does not publish anything. With `--publish --inline-dry-run`, ReviewGate still only creates or updates the top-level summary note, then prints the inline candidate mapping report.
-
-Findings are eligible for inline placement only when severity is CRITICAL, HIGH, or MEDIUM; the finding is actionable; a valid `anchor_id` or file and line are present; the file exists in the MR diff; the requested line maps to a parsed diff position; the file is not generated, collapsed, or too large; GitLab `diff_refs` are available; and the inline limits have not been reached. Effort does not block inline placement. Defaults are 10 total inline candidates, up to 8 HIGH findings, up to 5 MEDIUM findings, and no LOW or NOTE inline candidates.
-
-Invalid or unsafe mappings fall back to the summary. Add `--inline-dry-run` to publish mode when you want the summary note updated but no inline comments posted:
-
-```bash
-GITLAB_TOKEN=xxx cargo run -- review "$MR_URL" --publish --publish-inline --inline-dry-run
-```
-
-Dry-run wins: this updates the summary note, prints the inline mapping report, and posts zero inline discussions.
-
-## GitLab CI Mode
-
-GitLab Runner mode lets ReviewGate infer the merge request URL from CI variables:
-
-```bash
-reviewgate review --ci
-reviewgate review --ci --publish
-reviewgate review --ci --publish --publish-inline
-reviewgate verify --ci
-reviewgate verify --ci --publish
-```
-
-`review --ci` and `verify --ci` default to preview behavior unless `--publish` is passed. `--publish-inline` still requires `--publish`, including in CI.
-
-ReviewGate constructs the MR URL from:
-
-```txt
-{CI_PROJECT_URL}/-/merge_requests/{CI_MERGE_REQUEST_IID}
-```
-
-If `CI_PROJECT_URL` is missing, it falls back to:
-
-```txt
-{CI_SERVER_URL}/{CI_PROJECT_PATH}/-/merge_requests/{CI_MERGE_REQUEST_IID}
-```
-
-Required or preferred GitLab CI variables:
-
-- `CI_API_V4_URL`
-- `CI_PROJECT_PATH`
-- `CI_PROJECT_URL`
-- `CI_MERGE_REQUEST_IID`
-- `CI_PIPELINE_SOURCE`
-- `CI_COMMIT_SHA`
-- `CI_PROJECT_ID`
-
-`CI_MERGE_REQUEST_IID` is required. If `CI_PIPELINE_SOURCE` is present and is not `merge_request_event`, CI mode fails closed. Use `--allow-non-mr-ci` only when you are intentionally simulating CI and merge request variables are present.
-
-Token selection in CI uses this priority:
-
-1. `GITLAB_TOKEN`
-2. `REVIEWGATE_GITLAB_TOKEN`
-3. `CI_JOB_TOKEN`, only when `REVIEWGATE_ALLOW_CI_JOB_TOKEN=true`
-
-`CI_JOB_TOKEN` is rejected by default because not every GitLab instance permits MR note publishing with job tokens. ReviewGate never prints tokens, logs tokens, or writes tokens to SQLite.
-
-CLI providers may need cached interactive auth in CI:
-
-```txt
-Warning: gemini_cli/codex_cli may require cached interactive auth. For CI, prefer ollama inside the network or a future direct API provider.
-```
-
-Storage defaults to `.reviewgate/reviewgate.sqlite`. In CI this database is local to the job unless you persist it as an artifact or cache. `verify --ci` only works when previous ReviewGate history exists in the job workspace, cache, or artifact. Missing verification history is a non-zero error unless `--soft-fail` is passed.
-
-`--soft-fail` logs the error but exits with code 0 for early adoption:
-
-```bash
-reviewgate review --ci --publish --soft-fail
-reviewgate verify --ci --soft-fail
-```
-
-Sample `.gitlab-ci.reviewgate.yml` using the Rust image:
-
-```yaml
-stages:
-  - review
-
-reviewgate:
-  stage: review
-  image: rust:1.82
-  before_script:
-    - cargo build --release
-  script:
-    - ./target/release/reviewgate review --ci --publish
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-```
-
-Local binary example:
+In GitLab CI:
 
 ```yaml
 reviewgate:
   stage: review
-  image: alpine:latest
-  before_script:
-    - apk add --no-cache curl ca-certificates
-    - curl -L "$REVIEWGATE_BINARY_URL" -o /usr/local/bin/reviewgate
-    - chmod +x /usr/local/bin/reviewgate
   script:
     - reviewgate review --ci --publish
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
 ```
 
-No Docker image or package publishing is provided yet.
+`CI_JOB_TOKEN` is opt-in only with `REVIEWGATE_ALLOW_CI_JOB_TOKEN=true`. The recommended token source is `GITLAB_TOKEN` or `REVIEWGATE_GITLAB_TOKEN`.
 
-## Environment
+More detail: [docs/gitlab-ci.md](docs/gitlab-ci.md).
 
-Copy `.env.example` to `.env` or export variables in your shell:
+## Publishing And Attribution
 
-```env
-GITLAB_TOKEN=
-REVIEWGATE_GITLAB_TOKEN=
-REVIEWGATE_ALLOW_CI_JOB_TOKEN=false
-REVIEWGATE_CI_HISTORY_REQUIRED=false
-REVIEWGATE_MAX_DIFF_BYTES=200000
-REVIEWGATE_MAX_FILES=50
-REVIEWGATE_INLINE_ENABLED=false
-REVIEWGATE_INLINE_DRY_RUN=true
-REVIEWGATE_INLINE_DEDUPE=true
-REVIEWGATE_MAX_INLINE_TOTAL=10
-REVIEWGATE_MAX_HIGH_INLINE=8
-REVIEWGATE_MAX_MEDIUM_INLINE=5
-REVIEWGATE_EMOJI=true
-REVIEWGATE_LLM_PROVIDER=gemini_cli
-REVIEWGATE_MODEL=gemini-2.5-pro
-REVIEWGATE_GEMINI_TIMEOUT_SECONDS=240
-REVIEWGATE_GEMINI_BIN=gemini
-REVIEWGATE_GEMINI_OUTPUT_FORMAT=json
-REVIEWGATE_CODEX_TIMEOUT_SECONDS=240
-REVIEWGATE_CODEX_BIN=codex
-REVIEWGATE_CODEX_FULL_AUTO=false
-OLLAMA_BASE_URL=http://localhost:11434
-REVIEWGATE_LLM_TIMEOUT_SECONDS=180
-REVIEWGATE_MAX_CONTEXT_TOKENS=12000
-REVIEWGATE_TEMPERATURE=0.1
-REVIEWGATE_PUBLISH_MAX_NOTE_CHARS=60000
-REVIEWGATE_GITLAB_INTERNAL_NOTE=false
-REVIEWGATE_STORAGE_ENABLED=true
-REVIEWGATE_DB_PATH=.reviewgate/reviewgate.sqlite
-REVIEWGATE_STORE_RAW_DIFF=false
-REVIEWGATE_STORE_RAW_LLM=false
-REVIEWGATE_VERIFY_MAX_PREVIOUS_FINDINGS=30
+Every generated GitLab note includes visible attribution:
+
+```text
+[AI generated by ReviewGate]
 ```
 
-`GITLAB_TOKEN` needs permission to read merge request metadata and diffs. For publish mode it also needs permission to create and update merge request notes, which usually means `api` scope.
+ReviewGate also keeps hidden markers for dedupe and updates:
 
-## Diff Limits
+- `reviewgate:summary`
+- `reviewgate:inline`
+- `reviewgate:verification`
 
-ReviewGate skips generated files and files GitLab marks as `too_large`. It reports collapsed files as warnings and excludes collapsed files from anchored prompt lines. If sanitized diff content exceeds `REVIEWGATE_MAX_DIFF_BYTES` or included files exceed `REVIEWGATE_MAX_FILES`, ReviewGate stops adding more diff content and prints a partial review warning instead of failing the command.
+These markers let ReviewGate update existing notes and avoid duplicate inline comments.
 
-## VPN Troubleshooting
+## Local History
 
-If dry-run fails with a GitLab reachability or timeout error:
+ReviewGate stores SQLite history at `.reviewgate/reviewgate.sqlite` by default. This history powers verification and local dedupe metadata.
 
-- Confirm the VPN is connected.
-- Open the MR URL in a browser from the same machine.
-- Check that DNS for the GitLab host resolves on VPN.
-- Confirm the MR URL base host is the same host your token can access.
-- Retry with a token that has `read_api` or `api` scope if you see 401 or 403.
-- If publish returns 403, the token likely lacks write permission for MR notes.
-- If ReviewGate says the GitLab base URL is unreachable, connect or reconnect the VPN and retry.
+By default, ReviewGate does not store raw diffs, raw prompts, or raw model payloads. Tokens are loaded from config or environment and are not persisted.
 
-## Storage And Verification Troubleshooting
+## Doctor
 
-- No previous run: run `reviewgate review <mr-url> --publish` first so ReviewGate has local findings to verify.
-- DB permission issue: check `REVIEWGATE_DB_PATH`, parent directory permissions, and whether another process has locked the SQLite file.
-- Malformed verification JSON: ReviewGate falls back to `needs_manual_confirmation` for previous findings and prints a warning instead of panicking.
-- Storage disabled: set `REVIEWGATE_STORAGE_ENABLED=true`; verification cannot load prior findings while storage is disabled.
-
-ReviewGate never prints the token and does not include it in debug output.
-
-## Common Errors
-
-- `cannot reach Ollama`: start Ollama and confirm `OLLAMA_BASE_URL` is reachable from this machine.
-- `Ollama model ... was not found`: run `ollama pull qwen2.5-coder:7b` or set `REVIEWGATE_MODEL` to a model you have locally.
-- `Gemini CLI binary was not found`: install Gemini CLI or set `REVIEWGATE_GEMINI_BIN`.
-- `Gemini CLI is not authenticated`: run `gemini` once and choose Login with Google, or configure Gemini CLI auth.
-- `Gemini CLI request timed out`: increase `REVIEWGATE_GEMINI_TIMEOUT_SECONDS` or use a faster model.
-- Unsupported Gemini `--output-format json`: ReviewGate falls back to text mode when detected and still extracts JSON when possible.
-- Malformed Gemini JSON output: ReviewGate renders the existing malformed-output fallback and skips publish.
-- `Codex CLI binary was not found`: install Codex CLI or set `REVIEWGATE_CODEX_BIN`.
-- `Codex CLI is not authenticated`: run `codex login`.
-- `Codex CLI request timed out`: increase `REVIEWGATE_CODEX_TIMEOUT_SECONDS` or use a faster model.
-- `cannot reach GitLab base URL`: connect to VPN and confirm the MR URL opens from the same machine.
-- `GITLAB_TOKEN is required`: export a token with permission to read merge request metadata and diffs.
-- `CI_MERGE_REQUEST_IID is missing`: `--ci` must run in a merge request pipeline or in a local simulation that exports MR variables.
-- `CI_JOB_TOKEN detected but not allowed`: set `REVIEWGATE_ALLOW_CI_JOB_TOKEN=true` only if your GitLab instance permits job-token MR note access, or provide `GITLAB_TOKEN`.
-- `No previous ReviewGate run found`: `verify --ci` needs `.reviewgate/reviewgate.sqlite` from a previous review job via workspace, cache, or artifact.
-- `unsupported LLM provider`: set `REVIEWGATE_LLM_PROVIDER=gemini_cli`, `codex_cli`, or `ollama`.
-- Existing ReviewGate summary note is updated by default: pass `--force-new-note` only when a new summary note is intentional.
-- `--publish-inline requires --publish`: add `--publish` or remove `--publish-inline`.
-- GitLab rejected inline position: the candidate could not be placed on the current diff; ReviewGate reports the failure and continues with other candidates.
-- Ollama must be running for both `--preview` and `--publish`.
-
-## Disposable E2E Test
-
-Use the prepared local repo without deleting it:
+Run local environment checks without contacting GitLab or model services:
 
 ```bash
-cd /Users/macbookprom1pro/Documents/Project/review-gate-test
-git status
-git remote -v
+reviewgate doctor
 ```
 
-If the repo has no remote, set one of `REVIEWGATE_TEST_REMOTE_URL`, `GITLAB_TEST_REMOTE_URL`, or `REVIEWGATE_TEST_PROJECT_URL` before running the E2E flow. Create a branch such as `reviewgate/e2e-risky-change`, add harmless fake TypeScript or JavaScript code with reviewable risks, commit, push, and create or reuse a GitLab MR. Then run from this repository:
+Run optional network checks:
 
 ```bash
-cargo run -- review "$MR_URL" --dry-run
-cargo run -- review "$MR_URL" --preview
-cargo run -- review "$MR_URL" --preview --inline-dry-run
-cargo run -- review "$MR_URL" --publish
-cargo run -- review "$MR_URL" --publish --inline-dry-run
-cargo run -- review "$MR_URL" --publish --publish-inline
-cargo run -- review "$MR_URL" --publish --publish-inline
-cargo run -- review "$MR_URL" --publish
+reviewgate doctor --network
 ```
 
-The first publish should create one ReviewGate summary note. Later summary publishes should update that same note, not create a duplicate. The first inline publish may create eligible inline comments. Re-running inline publish should skip duplicates by ReviewGate fingerprint instead of posting the same inline comments again.
+## Project Status
 
-## Privacy
+v0.1 is intentionally CLI-first:
 
-Before diff text is printed with `--show-prompt` or sent to the configured model endpoint, ReviewGate redacts common secret patterns such as authorization headers, bearer tokens, passwords, API keys, cookies, database URLs, `.env`-style credentials, and multiline private keys.
+- No dashboard.
+- No SaaS backend.
+- No public webhook required.
+- No GitHub provider support.
+- No Docker image yet.
+- No Semgrep integration.
 
-Local Ollama mode keeps the model call local to the configured `OLLAMA_BASE_URL`. The sanitized diff is sent only to that endpoint. ReviewGate does not publish GitLab comments in preview mode.
+## Documentation
 
-Publish mode posts only normalized ReviewGate markdown with run metadata. It does not publish the raw prompt, raw diff, or raw Ollama response.
+- [Quickstart](docs/quickstart.md)
+- [GitLab CI](docs/gitlab-ci.md)
+- [Providers](docs/providers.md)
+- [Configuration](docs/configuration.md)
+- [Privacy](docs/privacy.md)
+- [Release](docs/release.md)
+- [Product overview](docs/product-overview.md)
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -1,0 +1,22 @@
+[providers.gitlab]
+base_url = "https://gitlab.example.com"
+
+[llm]
+provider = "gemini_cli"
+model = "gemini-2.5-pro"
+timeout_seconds = 180
+max_context_tokens = 12000
+temperature = 0.1
+gemini_bin = "gemini"
+gemini_timeout_seconds = 240
+gemini_output_format = "json"
+
+[privacy]
+local_only = false
+redact_secrets = true
+
+[review]
+severity_threshold = "medium"
+max_inline_comments = 8
+max_diff_bytes = 200000
+max_files = 50

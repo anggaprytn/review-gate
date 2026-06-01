@@ -1,7 +1,7 @@
 /target/
-/.env
+.env
 /.reviewgate.toml
-/.reviewgate/
+.reviewgate/
 /docs/PRD.md
 *.log
 .DS_Store

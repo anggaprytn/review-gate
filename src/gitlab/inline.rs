@@ -1,4 +1,5 @@
 use crate::{
+    branding::REVIEWGATE_ATTRIBUTION,
     config::InlineConfig,
     error::{Result, ReviewGateError},
     gitlab::{
@@ -618,6 +619,8 @@ pub fn format_inline_comment_body_with_emoji(
         output.push_str("\nRisk code: ");
         output.push_str(risk_code.display_lower());
     }
+    output.push_str("\n\n");
+    output.push_str(REVIEWGATE_ATTRIBUTION);
     output.push_str("\n\n");
     output.push_str(&inline_marker(
         &mr.project_path,

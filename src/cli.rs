@@ -5,6 +5,7 @@ use crate::error::{Result, ReviewGateError};
 #[derive(Debug, Parser)]
 #[command(name = "reviewgate")]
 #[command(about = "Local-first AI merge request review for private GitLab")]
+#[command(version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -14,6 +15,13 @@ pub struct Cli {
 pub enum Commands {
     Review(ReviewArgs),
     Verify(VerifyArgs),
+    Doctor(DoctorArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    #[arg(long)]
+    pub network: bool,
 }
 
 #[derive(Debug, Args)]
@@ -84,6 +92,7 @@ impl Cli {
         match &self.command {
             Commands::Review(args) => args.soft_fail,
             Commands::Verify(args) => args.soft_fail,
+            Commands::Doctor(_) => false,
         }
     }
 }
@@ -340,6 +349,7 @@ mod tests {
         match command {
             Commands::Review(args) => args,
             Commands::Verify(_) => panic!("expected review command"),
+            Commands::Doctor(_) => panic!("expected review command"),
         }
     }
 }

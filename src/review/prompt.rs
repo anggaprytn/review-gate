@@ -16,7 +16,7 @@ pub fn build_review_prompt(
     };
 
     format!(
-        r#"You are ReviewGate, a risk-focused merge request reviewer for private GitLab teams.
+        r#"You are ReviewGate, a risk oriented merge request reviewer for private GitLab teams.
 
 Review only the provided anchored merge request diff. Do not guess about code, files, functions, tests, or runtime behavior that are not visible in the diff context.
 

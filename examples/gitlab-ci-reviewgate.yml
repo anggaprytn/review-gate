@@ -1,0 +1,9 @@
+stages:
+  - review
+
+reviewgate:
+  stage: review
+  script:
+    - reviewgate review --ci --publish
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
