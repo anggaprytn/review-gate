@@ -1,6 +1,8 @@
 # Providers
 
-ReviewGate v0.1 supports three provider modes.
+ReviewGate v0.1 supports three provider modes. Provider choice controls where model inference happens.
+
+ReviewGate does not require a ReviewGate SaaS backend, and it does not require public webhooks. It sends merge request data to GitLab and to the model provider mode you configure.
 
 ## gemini_cli
 
@@ -35,6 +37,8 @@ export REVIEWGATE_MODEL=qwen2.5-coder:7b
 ```
 
 Ollama is the true local-only model mode when Ollama and the model run inside your environment.
+
+Use `ollama` when you need model inference to stay on your machine or private network.
 
 ## Unsupported In v0.1
 

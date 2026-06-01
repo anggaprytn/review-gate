@@ -7,7 +7,7 @@ Use this checklist after publishing a GitHub Release to verify a new user can in
 ```bash
 mkdir -p /tmp/reviewgate-smoke
 cd /tmp/reviewgate-smoke
-curl -fsSL https://raw.githubusercontent.com/Anggaprytn/review-gate/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/anggaprytn/review-gate/main/scripts/install.sh | sh
 reviewgate --version
 reviewgate doctor
 ```
@@ -15,7 +15,7 @@ reviewgate doctor
 To test a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Anggaprytn/review-gate/main/scripts/install.sh | REVIEWGATE_VERSION=v0.1.0-alpha sh
+curl -fsSL https://raw.githubusercontent.com/anggaprytn/review-gate/main/scripts/install.sh | REVIEWGATE_VERSION=v0.1.0-alpha.2 sh
 ```
 
 ## Review Flow

@@ -1,10 +1,13 @@
 # GitLab CI
 
-ReviewGate can run inside GitLab merge request pipelines.
+ReviewGate can run inside GitLab merge request pipelines without a ReviewGate SaaS backend or public webhook.
 
 ```yaml
 reviewgate:
   stage: review
+  before_script:
+    - curl -fsSL https://raw.githubusercontent.com/anggaprytn/review-gate/main/scripts/install.sh | sh
+    - reviewgate doctor
   script:
     - reviewgate review --ci --publish
   rules:
@@ -41,3 +44,5 @@ Verification needs previous ReviewGate history. In CI, that history is local unl
 ## Provider Notes
 
 `gemini_cli` and `codex_cli` may require cached interactive authentication. For locked-down CI, use a runner image or private runner where the CLI auth is already configured, or use `ollama` inside the private network.
+
+Plain `--publish` creates or updates a summary note only. Inline GitLab comments are optional and require the explicit `--publish-inline` flag.

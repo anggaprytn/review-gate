@@ -1,6 +1,6 @@
 # Privacy
 
-ReviewGate is local-first.
+ReviewGate is local-first alpha software for GitLab merge request review.
 
 - No SaaS backend.
 - No public webhook required.
@@ -11,9 +11,11 @@ ReviewGate fetches merge request metadata and diffs from GitLab using your confi
 
 ## Provider Privacy
 
-`ollama` can keep model inference local when Ollama and the selected model run inside your machine or private network.
+`ollama` is the local-only model mode when Ollama and the selected model run inside your machine or private network.
 
 `gemini_cli` and `codex_cli` are local CLI clients, but they still send the sanitized review payload to external model services through those CLIs.
+
+ReviewGate does not send code, prompts, or model output to a ReviewGate-operated service because there is no ReviewGate SaaS backend in v0.1.
 
 ## Storage
 
@@ -31,3 +33,5 @@ Stored data includes run metadata, normalized findings, publish metadata, inline
 ## Tokens
 
 Tokens are loaded from environment or config at runtime. ReviewGate never prints token values intentionally and does not persist tokens.
+
+Secret redaction is best-effort. Treat ReviewGate output as review assistance, not as a substitute for normal secret scanning, access controls, or human review.

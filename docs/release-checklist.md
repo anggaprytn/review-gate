@@ -11,11 +11,9 @@ cargo build --release
 ./target/release/reviewgate --version
 ./target/release/reviewgate doctor
 git diff --check
-git ls-files docs/PRD.md
 ```
 
 Expected:
 
-- `docs/PRD.md` is not tracked.
 - `.env` is not tracked.
 - `.reviewgate/` is not tracked.

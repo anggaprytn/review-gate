@@ -2,9 +2,20 @@
 
 # ReviewGate
 
-ReviewGate is a local-first AI merge request review tool for GitLab. It is built for teams that use GitLab self-managed, GitLab behind a VPN, or private network review workflows.
+ReviewGate is an alpha, local-first AI merge request review CLI for GitLab. It is built for teams that review code on GitLab.com, GitLab self-managed, or GitLab instances reachable only through a VPN or private network.
 
-ReviewGate runs where your code already is: on a developer machine, in GitLab CI, or inside your private network. It has no SaaS backend, requires no public webhook, and does not include a dashboard in v0.1.
+ReviewGate runs where your code already is: on a developer machine, in GitLab CI, or inside your private network. It targets GitLab first, has no SaaS backend, requires no public webhook, and does not include a dashboard in v0.1.
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/anggaprytn/review-gate/main/scripts/install.sh | sh
+reviewgate doctor
+```
+
+The default installer resolves the latest GitHub Release and downloads the matching prebuilt binary. You do not need to set `REVIEWGATE_VERSION` for the normal install path.
+
+Current release: `v0.1.0-alpha.2`. ReviewGate is alpha software: expect rough edges, keep review output human-reviewed, and start with `--dry-run` or `--preview` before publishing to a merge request.
 
 ## What It Does
 
@@ -20,7 +31,7 @@ Plain `reviewgate review --publish` is summary-only. Inline comments require the
 
 ## Providers
 
-ReviewGate supports these provider modes:
+ReviewGate supports these provider modes. Provider choice controls where model inference happens:
 
 - `gemini_cli`: default provider. Uses the local Gemini CLI client and local CLI auth, but still sends the sanitized review payload to an external model service.
 - `codex_cli`: uses the local Codex CLI client and local CLI auth, but still sends the sanitized review payload to an external model service.
@@ -30,7 +41,7 @@ ReviewGate does not include direct OpenAI or Gemini API providers in v0.1.
 
 ## Quick Start
 
-Install a provider first. For the default Gemini CLI mode, authenticate the `gemini` CLI before running ReviewGate.
+Install ReviewGate, then install and authenticate a provider. For the default Gemini CLI mode, authenticate the `gemini` CLI before running ReviewGate.
 
 ```bash
 export GITLAB_TOKEN="your-token"
@@ -55,13 +66,15 @@ More detail: [docs/quickstart.md](docs/quickstart.md).
 
 ## GitLab Support
 
-ReviewGate works with GitLab.com, GitLab self-managed, and GitLab instances only reachable through a VPN or private network. Set `GITLAB_TOKEN` or `REVIEWGATE_GITLAB_TOKEN` for API access.
+ReviewGate is GitLab-first in v0.1. It works with GitLab.com, GitLab self-managed, and GitLab instances only reachable through a VPN or private network. Set `GITLAB_TOKEN` or `REVIEWGATE_GITLAB_TOKEN` for API access.
 
 In GitLab CI:
 
 ```yaml
 reviewgate:
   stage: review
+  before_script:
+    - curl -fsSL https://raw.githubusercontent.com/anggaprytn/review-gate/main/scripts/install.sh | sh
   script:
     - reviewgate review --ci --publish
   rules:
@@ -71,6 +84,15 @@ reviewgate:
 `CI_JOB_TOKEN` is opt-in only with `REVIEWGATE_ALLOW_CI_JOB_TOKEN=true`. The recommended token source is `GITLAB_TOKEN` or `REVIEWGATE_GITLAB_TOKEN`.
 
 More detail: [docs/gitlab-ci.md](docs/gitlab-ci.md).
+
+## Verification
+
+`reviewgate verify` checks whether previous ReviewGate findings appear fixed in the current merge request state. It uses local SQLite history from earlier ReviewGate runs, so it works best when `.reviewgate/reviewgate.sqlite` is kept between local runs or restored between CI jobs.
+
+```bash
+reviewgate verify "$MR_URL" --preview
+reviewgate verify "$MR_URL" --publish
+```
 
 ## Publishing And Attribution
 
@@ -92,7 +114,7 @@ These markers let ReviewGate update existing notes and avoid duplicate inline co
 
 ReviewGate stores SQLite history at `.reviewgate/reviewgate.sqlite` by default. This history powers verification and local dedupe metadata.
 
-By default, ReviewGate does not store raw diffs, raw prompts, or raw model payloads. Tokens are loaded from config or environment and are not persisted.
+By default, ReviewGate does not store raw diffs, raw prompts, or raw model payloads. Tokens are loaded from config or environment and are not persisted. ReviewGate does not send code to a ReviewGate backend because there is no ReviewGate SaaS backend in v0.1; model traffic goes only to the provider mode you configure.
 
 ## Doctor
 
@@ -108,16 +130,19 @@ Run optional network checks:
 reviewgate doctor --network
 ```
 
-## Project Status
+## Alpha Caveats
 
-v0.1 is intentionally CLI-first:
+ReviewGate v0.1 is intentionally CLI-first and alpha-quality:
 
+- GitLab-first; no GitHub provider support.
 - No dashboard.
 - No SaaS backend.
 - No public webhook required.
-- No GitHub provider support.
 - No Docker image yet.
 - No Semgrep integration.
+- Inline GitLab comments are optional and gated behind `--publish-inline`.
+- Remote CLI providers can change behavior outside ReviewGate's control.
+- Secret redaction is best-effort and should not replace normal secret handling.
 
 ## Documentation
 

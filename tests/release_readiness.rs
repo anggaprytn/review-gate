@@ -213,7 +213,7 @@ fn release_smoke_docs_and_templates_exist() {
     let checklist = fs::read_to_string("docs/release-checklist.md").unwrap();
     assert!(checklist.contains("cargo fmt --all -- --check"));
     assert!(checklist.contains("cargo clippy --all-targets --all-features -- -D warnings"));
-    assert!(checklist.contains("git ls-files docs/PRD.md"));
+    assert!(checklist.contains("git diff --check"));
 
     let pr_template = fs::read_to_string(".github/pull_request_template.md").unwrap();
     assert!(pr_template.contains("Plain `review --publish` remains summary-only"));
