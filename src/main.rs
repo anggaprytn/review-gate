@@ -1,8 +1,14 @@
 use clap::Parser;
-use reviewgate::cli::{exit_code_for_result, Cli, Commands, ReviewArgs, VerifyArgs};
+use reviewgate::cli::{
+    exit_code_for_result, Cli, Commands, FindingsArgs, FixPromptArgs, ReviewArgs, VerifyArgs,
+};
 use reviewgate::config::AppConfig;
 use reviewgate::doctor::{run_doctor, DoctorOptions};
 use reviewgate::error::Result;
+use reviewgate::fix_prompt::{
+    build_fix_prompt, copy_to_clipboard, effective_min_severity, format_findings_summary,
+    latest_findings_summary, write_prompt_output, FixPromptFormat, FixPromptOptions,
+};
 use reviewgate::gitlab::ci::{CiContextError, GitLabCiContext};
 use reviewgate::gitlab::client::GitLabClient;
 use reviewgate::gitlab::context::{build_merge_request_context, MergeRequestContext};
@@ -63,6 +69,8 @@ async fn run_command(cli: Cli) -> Result<()> {
             let publish = args.publishes();
             verify_merge_request(args, publish).await?;
         }
+        Commands::FixPrompt(args) => run_fix_prompt(args)?,
+        Commands::Findings(args) => run_findings(args)?,
         Commands::Doctor(args) => {
             let output = run_doctor(DoctorOptions {
                 network: args.network,
@@ -72,6 +80,57 @@ async fn run_command(cli: Cli) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn run_fix_prompt(args: FixPromptArgs) -> Result<()> {
+    let mr = GitLabMrUrl::parse(&args.mr_url)?;
+    let config = AppConfig::load()?;
+    if !config.storage.db_path.exists() {
+        return Err(reviewgate::error::ReviewGateError::SqliteDbMissing(
+            config.storage.db_path.display().to_string(),
+        ));
+    }
+
+    let storage = Storage::open_read_only(&config.storage.db_path)?;
+    let min_severity = effective_min_severity(args.min_severity.as_deref(), args.include_low)?;
+    let format = FixPromptFormat::parse(&args.format)?;
+    let generated = build_fix_prompt(
+        &storage,
+        &mr,
+        FixPromptOptions {
+            run_id: args.run_id,
+            min_severity,
+            include_notes: args.include_notes,
+            format,
+        },
+    )?;
+
+    if let Some(output) = args.output.as_deref() {
+        write_prompt_output(output, &generated.prompt, args.force)?;
+    }
+
+    print!("{}", generated.prompt);
+
+    if args.copy {
+        copy_to_clipboard(&generated.prompt)?;
+    }
+
+    Ok(())
+}
+
+fn run_findings(args: FindingsArgs) -> Result<()> {
+    let mr = GitLabMrUrl::parse(&args.mr_url)?;
+    let config = AppConfig::load()?;
+    if !config.storage.db_path.exists() {
+        return Err(reviewgate::error::ReviewGateError::SqliteDbMissing(
+            config.storage.db_path.display().to_string(),
+        ));
+    }
+
+    let storage = Storage::open_read_only(&config.storage.db_path)?;
+    let summary = latest_findings_summary(&storage, &mr)?;
+    print!("{}", format_findings_summary(&summary));
     Ok(())
 }
 

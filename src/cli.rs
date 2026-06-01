@@ -15,6 +15,8 @@ pub struct Cli {
 pub enum Commands {
     Review(ReviewArgs),
     Verify(VerifyArgs),
+    FixPrompt(FixPromptArgs),
+    Findings(FindingsArgs),
     Doctor(DoctorArgs),
 }
 
@@ -64,6 +66,45 @@ pub struct ReviewArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct FixPromptArgs {
+    #[arg(value_name = "MR_URL")]
+    pub mr_url: String,
+
+    #[arg(long, conflicts_with = "run_id")]
+    pub latest: bool,
+
+    #[arg(long, value_name = "RUN_ID")]
+    pub run_id: Option<String>,
+
+    #[arg(long, value_name = "CRITICAL|HIGH|MEDIUM|LOW")]
+    pub min_severity: Option<String>,
+
+    #[arg(long)]
+    pub include_low: bool,
+
+    #[arg(long)]
+    pub include_notes: bool,
+
+    #[arg(long, default_value = "markdown", value_name = "markdown|codex|gemini")]
+    pub format: String,
+
+    #[arg(long, value_name = "PATH")]
+    pub output: Option<std::path::PathBuf>,
+
+    #[arg(long, requires = "output")]
+    pub force: bool,
+
+    #[arg(long)]
+    pub copy: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct FindingsArgs {
+    #[arg(value_name = "MR_URL")]
+    pub mr_url: String,
+}
+
+#[derive(Debug, Args)]
 pub struct VerifyArgs {
     #[arg(required_unless_present = "ci", value_name = "MR_URL")]
     pub mr_url: Option<String>,
@@ -92,6 +133,7 @@ impl Cli {
         match &self.command {
             Commands::Review(args) => args.soft_fail,
             Commands::Verify(args) => args.soft_fail,
+            Commands::FixPrompt(_) | Commands::Findings(_) => false,
             Commands::Doctor(_) => false,
         }
     }
@@ -349,6 +391,8 @@ mod tests {
         match command {
             Commands::Review(args) => args,
             Commands::Verify(_) => panic!("expected review command"),
+            Commands::FixPrompt(_) => panic!("expected review command"),
+            Commands::Findings(_) => panic!("expected review command"),
             Commands::Doctor(_) => panic!("expected review command"),
         }
     }

@@ -63,6 +63,30 @@ pub enum ReviewGateError {
     #[error("No previous ReviewGate run found for this MR. Verification in CI requires review history in the job workspace, cache, or artifact. Run review first or persist REVIEWGATE_DB_PATH.")]
     NoPreviousVerificationHistory,
 
+    #[error("SQLite DB missing: {0}")]
+    SqliteDbMissing(String),
+
+    #[error("no previous completed ReviewGate review run found for this MR in SQLite")]
+    NoPreviousReviewRun,
+
+    #[error("review run ID not found for this MR: {0}")]
+    ReviewRunNotFound(String),
+
+    #[error("invalid severity '{0}'. Use CRITICAL, HIGH, MEDIUM, or LOW")]
+    InvalidSeverity(String),
+
+    #[error("unsupported fix-prompt format '{0}'. Use markdown, codex, or gemini")]
+    InvalidFixPromptFormat(String),
+
+    #[error("no actionable ReviewGate findings matched the requested filters")]
+    NoActionableFindings,
+
+    #[error("output file already exists; pass --force to overwrite: {0}")]
+    OutputFileExists(String),
+
+    #[error("clipboard unavailable: {0}")]
+    ClipboardUnavailable(String),
+
     #[error("inline comment body is empty")]
     EmptyInlineCommentBody,
 

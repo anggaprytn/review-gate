@@ -12,7 +12,7 @@ use crate::{
     },
     verify::VerificationOutcome,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -69,6 +69,22 @@ pub struct StoredPreviousFinding {
     pub suggested_fix: Option<String>,
     pub actionable: bool,
     pub fingerprint_v2: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredReviewFinding {
+    pub id: String,
+    pub severity: String,
+    pub effort: String,
+    pub category: String,
+    pub risk_code: Option<String>,
+    pub file_path: Option<String>,
+    pub old_line: Option<u32>,
+    pub new_line: Option<u32>,
+    pub title: String,
+    pub body: String,
+    pub suggested_fix: Option<String>,
+    pub actionable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +148,16 @@ impl Storage {
         };
         storage.migrate()?;
         Ok(storage)
+    }
+
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(storage_error)?;
+        Ok(Self {
+            conn,
+            db_path: path.to_path_buf(),
+        })
     }
 
     pub fn db_path(&self) -> &Path {
@@ -379,6 +405,76 @@ impl Storage {
             )
             .optional()
             .map_err(storage_error)
+    }
+
+    pub fn completed_review_run_by_id_for_mr(
+        &self,
+        run_id: &str,
+        project_path: &str,
+        mr_iid: u64,
+    ) -> Result<Option<LatestReviewRun>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_path, mr_iid, mr_url, head_sha, model_provider, model_name, completed_at
+                 FROM review_runs
+                 WHERE id = ?1 AND project_path = ?2 AND mr_iid = ?3 AND status = 'completed'
+                 LIMIT 1",
+                params![run_id, project_path, mr_iid as i64],
+                |row| {
+                    Ok(LatestReviewRun {
+                        id: row.get(0)?,
+                        project_path: row.get(1)?,
+                        mr_iid: i64_to_u64(row.get::<_, i64>(2)?),
+                        mr_url: row.get(3)?,
+                        head_sha: row.get(4)?,
+                        model_provider: row.get(5)?,
+                        model_name: row.get(6)?,
+                        completed_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(storage_error)
+    }
+
+    pub fn review_findings_for_run(&self, run_id: &str) -> Result<Vec<StoredReviewFinding>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT id, severity, effort, category, risk_code, file_path,
+                        old_line, new_line, title, body, suggested_fix, actionable
+                 FROM review_findings
+                 WHERE run_id = ?1
+                 ORDER BY
+                   CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 WHEN 'NOTE' THEN 4 ELSE 5 END,
+                   rowid",
+            )
+            .map_err(storage_error)?;
+
+        let rows = statement
+            .query_map([run_id], |row| {
+                Ok(StoredReviewFinding {
+                    id: row.get(0)?,
+                    severity: row.get(1)?,
+                    effort: row.get(2)?,
+                    category: row.get(3)?,
+                    risk_code: row.get(4)?,
+                    file_path: row.get(5)?,
+                    old_line: optional_i64_to_u32(row.get(6)?),
+                    new_line: optional_i64_to_u32(row.get(7)?),
+                    title: row.get(8)?,
+                    body: row.get(9)?,
+                    suggested_fix: row.get(10)?,
+                    actionable: row.get::<_, i64>(11)? != 0,
+                })
+            })
+            .map_err(storage_error)?;
+
+        let mut findings = Vec::new();
+        for row in rows {
+            findings.push(row.map_err(storage_error)?);
+        }
+        Ok(findings)
     }
 
     pub fn previous_findings_for_verification(

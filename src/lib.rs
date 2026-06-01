@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod doctor;
 pub mod error;
+pub mod fix_prompt;
 pub mod gitlab;
 pub mod llm;
 pub mod redaction;
