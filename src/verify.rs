@@ -1,6 +1,6 @@
 use crate::{
     branding::REVIEWGATE_ATTRIBUTION,
-    counters::{count_verification_results, emoji_enabled, format_verification_summary_markdown},
+    counters::{count_verification_results, emoji_enabled, format_verification_counters_markdown},
     error::Result,
     gitlab::context::MergeRequestContext,
     llm::types::{LlmReviewResponse, LlmRunMetadata},
@@ -216,7 +216,7 @@ pub fn format_verification_markdown(
 ) -> String {
     let mut output = String::new();
     output.push_str("# ReviewGate Change Verification\n\n");
-    output.push_str(&format_verification_summary_markdown(
+    output.push_str(&format_verification_counters_markdown(
         &count_verification_results(outcome),
         emoji_enabled(),
     ));

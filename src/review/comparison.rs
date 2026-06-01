@@ -36,7 +36,7 @@ pub fn compare_current_run_with_previous(
 ) -> Result<ReviewComparison> {
     let current_findings = storage.comparison_findings_for_run(current_run_id)?;
     let Some(previous_run) =
-        storage.previous_completed_review_run(project_path, mr_iid, current_run_id)?
+        storage.previous_completed_published_review_run(project_path, mr_iid, current_run_id)?
     else {
         return Ok(ReviewComparison {
             previous_run_id: None,
@@ -131,12 +131,12 @@ pub fn format_comparison_markdown(comparison: &ReviewComparison, emoji: bool) ->
     let mut output = String::new();
     output.push_str("## Change Since Previous Review\n\n");
     let Some(previous_run_id) = comparison.previous_run_id.as_deref() else {
-        output.push_str("No previous ReviewGate run found for this MR.\n");
+        output.push_str("No previous published ReviewGate run found for this MR.\n");
         return output;
     };
 
     output.push_str(&format!(
-        "Compared with previous run: `{previous_run_id}`\n\n"
+        "Compared with previous published run: `{previous_run_id}`\n\n"
     ));
     output.push_str("| Status | Count |\n|---|---:|\n");
     output.push_str(&format!(
@@ -170,12 +170,12 @@ pub fn format_comparison_markdown(comparison: &ReviewComparison, emoji: bool) ->
 pub fn format_comparison_terminal(comparison: &ReviewComparison, emoji: bool) -> String {
     let mut output = String::new();
     let Some(previous_run_id) = comparison.previous_run_id.as_deref() else {
-        output.push_str("Change since previous review: no previous run found\n");
+        output.push_str("Change since previous review: no previous published run found\n");
         return output;
     };
 
     output.push_str("Change since previous review:\n");
-    output.push_str(&format!("Previous run: {previous_run_id}\n"));
+    output.push_str(&format!("Previous published run: {previous_run_id}\n"));
     output.push_str(&format!(
         "{}: {}\n",
         comparison_label(FindingDeltaStatus::New, emoji),
@@ -399,7 +399,11 @@ mod tests {
         assert_eq!(comparison.new_findings, 0);
         assert_eq!(
             format_comparison_terminal(&comparison, false),
-            "Change since previous review: no previous run found\n"
+            "Change since previous review: no previous published run found\n"
+        );
+        assert_eq!(
+            format_comparison_markdown(&comparison, false),
+            "## Change Since Previous Review\n\nNo previous published ReviewGate run found for this MR.\n"
         );
     }
 
@@ -498,9 +502,12 @@ mod tests {
         let markdown = format_comparison_markdown(&comparison(), true);
 
         assert!(markdown.contains("## Change Since Previous Review"));
-        assert!(markdown.contains("Compared with previous run: `previous-run`"));
+        assert!(markdown.contains("Compared with previous published run: `previous-run`"));
+        assert!(markdown.contains("| Status | Count |\n|---|---:|"));
         assert!(markdown.contains("| 🆕 New findings | 4 |"));
         assert!(markdown.contains("| ✅ Verified fixed | 2 |"));
+        assert!(!markdown.contains('━'));
+        assert!(!markdown.contains('─'));
     }
 
     #[test]
@@ -517,7 +524,7 @@ mod tests {
         let output = format_comparison_terminal(&comparison(), true);
 
         assert!(output.contains("Change since previous review:"));
-        assert!(output.contains("Previous run: previous-run"));
+        assert!(output.contains("Previous published run: previous-run"));
         assert!(output.contains("🟣 Not detected in this review: 3"));
     }
 

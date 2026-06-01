@@ -5,7 +5,13 @@ use reviewgate::{
         publish::{build_summary_note_body, build_verification_note_body},
         url::GitLabMrUrl,
     },
-    review::types::{Effort, ReviewCategory, ReviewFinding, RiskCode, Severity},
+    review::{
+        comparison::{insert_comparison_section_with_emoji, ReviewComparison},
+        formatter::format_review_markdown_with_emoji,
+        types::{
+            Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, RiskCode, Severity,
+        },
+    },
     storage::StoredPreviousFinding,
     verify::{
         format_verification_markdown, VerificationOutcome, VerificationResult, VerificationStatus,
@@ -58,6 +64,9 @@ fn inline_output_keeps_attribution_and_hidden_marker() {
     assert!(body.contains(REVIEWGATE_ATTRIBUTION));
     assert!(body.contains("reviewgate:inline"));
     assert!(!body.contains("## Finding Summary"));
+    assert!(!body.contains("## Change Since Previous Review"));
+    assert!(!body.contains("| Severity | Count |"));
+    assert!(!body.contains("| Status | Count |"));
 }
 
 #[test]
@@ -84,6 +93,46 @@ fn verification_output_keeps_attribution_and_hidden_marker() {
     assert!(body.contains(REVIEWGATE_ATTRIBUTION));
     assert!(body.contains("reviewgate:verification"));
     assert!(body.contains("## Verification Summary"));
+}
+
+#[test]
+fn review_markdown_uses_pipe_tables_for_counters_and_comparison() {
+    let markdown = format_review_markdown_with_emoji(&analysis(), true);
+    let markdown = insert_comparison_section_with_emoji(&markdown, &comparison(), true);
+
+    assert!(markdown.contains("## Finding Summary"));
+    assert!(markdown.contains("| Severity | Count |\n|---|---:|"));
+    assert!(markdown.contains("## Change Since Previous Review"));
+    assert!(markdown.contains("Compared with previous published run: `previous-run`"));
+    assert!(markdown.contains("| Status | Count |\n|---|---:|"));
+    assert!(!markdown.contains('━'));
+    assert!(!markdown.contains('─'));
+}
+
+#[test]
+fn verification_markdown_uses_pipe_table_for_summary() {
+    let markdown = format_verification_markdown(
+        &VerificationOutcome {
+            summary: "1 fixed.".to_string(),
+            results: vec![VerificationResult {
+                previous_finding: previous_finding(),
+                status: VerificationStatus::Fixed,
+                reason: "Fixed by the current diff.".to_string(),
+                evidence: Some("Timeout added.".to_string()),
+            }],
+            parsed: true,
+            parse_warning: None,
+        },
+        "run-1",
+        "head",
+        "ollama/qwen2.5-coder:7b",
+        "preview",
+    );
+
+    assert!(markdown.contains("## Verification Summary"));
+    assert!(markdown.contains("| Status | Count |\n|---|---:|"));
+    assert!(!markdown.contains('━'));
+    assert!(!markdown.contains('─'));
 }
 
 #[test]
@@ -350,6 +399,30 @@ fn finding() -> ReviewFinding {
         suggested_fix: Some("Add a request timeout.".to_string()),
         effort: Effort::Quick,
         actionable: true,
+    }
+}
+
+fn analysis() -> ReviewAnalysis {
+    ReviewAnalysis {
+        summary: "summary".to_string(),
+        findings: vec![finding()],
+        test_coverage_note: None,
+        privacy_note: None,
+        overall_risk: OverallRisk::High,
+    }
+}
+
+fn comparison() -> ReviewComparison {
+    ReviewComparison {
+        previous_run_id: Some("previous-run".to_string()),
+        current_run_id: "current-run".to_string(),
+        new_findings: 1,
+        still_detected: 5,
+        not_detected: 0,
+        verified_fixed: 0,
+        needs_verification: 0,
+        previous_total_actionable: 5,
+        current_total_actionable: 6,
     }
 }
 

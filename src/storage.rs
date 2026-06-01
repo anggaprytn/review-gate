@@ -449,6 +449,41 @@ impl Storage {
             .map_err(storage_error)
     }
 
+    pub fn previous_completed_published_review_run(
+        &self,
+        project_path: &str,
+        mr_iid: u64,
+        exclude_run_id: &str,
+    ) -> Result<Option<LatestReviewRun>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_path, mr_iid, mr_url, head_sha, model_provider, model_name, completed_at
+                 FROM review_runs
+                 WHERE project_path = ?1
+                   AND mr_iid = ?2
+                   AND status = 'completed'
+                   AND summary_note_id IS NOT NULL
+                   AND id <> ?3
+                 ORDER BY completed_at DESC, rowid DESC
+                 LIMIT 1",
+                params![project_path, mr_iid as i64, exclude_run_id],
+                |row| {
+                    Ok(LatestReviewRun {
+                        id: row.get(0)?,
+                        project_path: row.get(1)?,
+                        mr_iid: i64_to_u64(row.get::<_, i64>(2)?),
+                        mr_url: row.get(3)?,
+                        head_sha: row.get(4)?,
+                        model_provider: row.get(5)?,
+                        model_name: row.get(6)?,
+                        completed_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(storage_error)
+    }
+
     pub fn completed_review_run_by_id_for_mr(
         &self,
         run_id: &str,
@@ -1372,6 +1407,71 @@ mod tests {
     }
 
     #[test]
+    fn previous_published_run_query_ignores_preview_runs() {
+        let path = temp_db_path("previous_published_run_query_ignores_preview_runs");
+        let mut storage = Storage::open_path(&path).unwrap();
+        let preview = storage
+            .persist_review_run(&context(), &config(path.clone()), &preview_with_findings())
+            .unwrap();
+        let current = storage
+            .persist_review_run(&context(), &config(path), &preview_with_findings())
+            .unwrap();
+
+        let previous = storage
+            .previous_completed_published_review_run("group/repo", 59, &current.id)
+            .unwrap();
+
+        assert!(previous.is_none());
+        assert_ne!(preview.id, current.id);
+    }
+
+    #[test]
+    fn previous_published_run_query_selects_published_baseline() {
+        let path = temp_db_path("previous_published_run_query_selects_published_baseline");
+        let mut storage = Storage::open_path(&path).unwrap();
+        let published = storage
+            .persist_review_run(&context(), &config(path.clone()), &preview_with_findings())
+            .unwrap();
+        publish_review_run(&mut storage, &published.id, 100);
+        let preview = storage
+            .persist_review_run(&context(), &config(path.clone()), &preview_with_findings())
+            .unwrap();
+        let current = storage
+            .persist_review_run(&context(), &config(path), &preview_with_findings())
+            .unwrap();
+
+        let previous = storage
+            .previous_completed_published_review_run("group/repo", 59, &current.id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(previous.id, published.id);
+        assert_ne!(previous.id, preview.id);
+    }
+
+    #[test]
+    fn previous_published_run_query_excludes_current_run() {
+        let path = temp_db_path("previous_published_run_query_excludes_current_run");
+        let mut storage = Storage::open_path(&path).unwrap();
+        let older = storage
+            .persist_review_run(&context(), &config(path.clone()), &preview_with_findings())
+            .unwrap();
+        publish_review_run(&mut storage, &older.id, 100);
+        let current = storage
+            .persist_review_run(&context(), &config(path), &preview_with_findings())
+            .unwrap();
+        publish_review_run(&mut storage, &current.id, 101);
+
+        let previous = storage
+            .previous_completed_published_review_run("group/repo", 59, &current.id)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(previous.id, older.id);
+        assert_ne!(previous.id, current.id);
+    }
+
+    #[test]
     fn previous_findings_query_excludes_note_by_default() {
         let path = temp_db_path("previous_findings_query_excludes_note_by_default");
         let mut storage = Storage::open_path(&path).unwrap();
@@ -1769,6 +1869,20 @@ mod tests {
             note_id: Some(10),
             error: None,
         }
+    }
+
+    fn publish_review_run(storage: &mut Storage, run_id: &str, note_id: u64) {
+        storage
+            .update_summary_publish(
+                run_id,
+                &PublishResult {
+                    action: PublishAction::Updated,
+                    note_id: Some(note_id),
+                    web_url: None,
+                    duplicate_count: 0,
+                },
+            )
+            .unwrap();
     }
 
     fn config(path: PathBuf) -> AppConfig {

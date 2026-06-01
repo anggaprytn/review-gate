@@ -1,6 +1,6 @@
 use crate::{
     branding::REVIEWGATE_ATTRIBUTION,
-    counters::{count_findings_from_analysis, emoji_enabled, format_finding_summary_markdown},
+    counters::{count_findings_from_analysis, emoji_enabled, format_finding_counters_markdown},
     review::{
         parser::ReviewParseError,
         types::{ReviewAnalysis, ReviewFinding, Severity},
@@ -17,7 +17,7 @@ pub fn format_review_markdown_with_emoji(analysis: &ReviewAnalysis, emoji: bool)
     let mut output = String::new();
 
     output.push_str("# ReviewGate AI Code Review\n\n");
-    output.push_str(&format_finding_summary_markdown(
+    output.push_str(&format_finding_counters_markdown(
         &count_findings_from_analysis(analysis),
         emoji,
     ));

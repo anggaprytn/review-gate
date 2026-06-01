@@ -106,7 +106,7 @@ pub fn format_finding_counters_terminal(counters: &FindingCounters, emoji: bool)
     )
 }
 
-pub fn format_finding_summary_markdown(counters: &FindingCounters, emoji: bool) -> String {
+pub fn format_finding_counters_markdown(counters: &FindingCounters, emoji: bool) -> String {
     format!(
         "## Finding Summary\n\nOpen actionable findings: {}\n\n| Severity | Count |\n|---|---:|\n| {} | {} |\n| {} | {} |\n| {} | {} |\n| {} | {} |\n| {} | {} |\n",
         counters.open_actionable,
@@ -121,6 +121,10 @@ pub fn format_finding_summary_markdown(counters: &FindingCounters, emoji: bool) 
         finding_label(Severity::Note, emoji),
         counters.note,
     )
+}
+
+pub fn format_finding_summary_markdown(counters: &FindingCounters, emoji: bool) -> String {
+    format_finding_counters_markdown(counters, emoji)
 }
 
 pub fn format_verification_counters_terminal(
@@ -140,7 +144,7 @@ pub fn format_verification_counters_terminal(
     )
 }
 
-pub fn format_verification_summary_markdown(
+pub fn format_verification_counters_markdown(
     counters: &VerificationCounters,
     emoji: bool,
 ) -> String {
@@ -155,6 +159,13 @@ pub fn format_verification_summary_markdown(
         verification_label(VerificationStatus::NeedsManualConfirmation, emoji),
         counters.needs_manual_confirmation,
     )
+}
+
+pub fn format_verification_summary_markdown(
+    counters: &VerificationCounters,
+    emoji: bool,
+) -> String {
+    format_verification_counters_markdown(counters, emoji)
 }
 
 pub fn emoji_enabled() -> bool {
@@ -227,9 +238,9 @@ fn verification_label(status: VerificationStatus, emoji: bool) -> String {
 mod tests {
     use super::{
         count_findings_from_analysis, count_stored_findings, count_verification_result_slice,
-        count_verification_status_strings, format_finding_counters_terminal,
-        format_finding_summary_markdown, format_verification_counters_terminal,
-        format_verification_summary_markdown,
+        count_verification_status_strings, format_finding_counters_markdown,
+        format_finding_counters_terminal, format_verification_counters_markdown,
+        format_verification_counters_terminal,
     };
     use crate::{
         review::types::{
@@ -284,7 +295,7 @@ mod tests {
 
     #[test]
     fn markdown_finding_summary_table_formats_expected_rows() {
-        let markdown = format_finding_summary_markdown(
+        let markdown = format_finding_counters_markdown(
             &super::FindingCounters {
                 open_actionable: 7,
                 critical: 3,
@@ -306,7 +317,7 @@ mod tests {
 
     #[test]
     fn markdown_verification_summary_table_formats_expected_rows() {
-        let markdown = format_verification_summary_markdown(
+        let markdown = format_verification_counters_markdown(
             &super::VerificationCounters {
                 still_open: 7,
                 ..super::VerificationCounters::default()
@@ -358,14 +369,14 @@ mod tests {
 
     #[test]
     fn emoji_disabled_formatting_uses_plain_labels() {
-        let finding = format_finding_summary_markdown(
+        let finding = format_finding_counters_markdown(
             &super::FindingCounters {
                 critical: 1,
                 ..super::FindingCounters::default()
             },
             false,
         );
-        let verification = format_verification_summary_markdown(
+        let verification = format_verification_counters_markdown(
             &super::VerificationCounters {
                 fixed: 1,
                 ..super::VerificationCounters::default()
@@ -374,8 +385,10 @@ mod tests {
         );
 
         assert!(finding.contains("| Critical | 1 |"));
+        assert!(finding.contains("| Severity | Count |\n|---|---:|"));
         assert!(!finding.contains("🔴"));
         assert!(verification.contains("| Fixed | 1 |"));
+        assert!(verification.contains("| Status | Count |\n|---|---:|"));
         assert!(!verification.contains("✅"));
     }
 

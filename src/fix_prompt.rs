@@ -805,7 +805,7 @@ mod tests {
         let output = format_findings_summary(&summary);
 
         assert!(output.contains("Change since previous review:"));
-        assert!(output.contains("Previous run: run-old"));
+        assert!(output.contains("Previous published run: run-old"));
         assert!(output.contains("⚠️ Still detected: 1"));
     }
 
@@ -904,14 +904,16 @@ mod tests {
             "INSERT INTO review_runs (
                 id, provider, project_path, mr_iid, mr_url, mr_title, source_branch,
                 target_branch, head_sha, model_provider, model_name, local_only, status,
-                started_at, completed_at, raw_diff_stored, raw_llm_stored
+                started_at, completed_at, summary_note_id, summary_publish_action,
+                raw_diff_stored, raw_llm_stored
             ) VALUES (?1, 'gitlab', 'group/repo', 59, ?2, 'RAW_DIFF_SENTINEL', 'source',
                 'target', 'head', 'gemini_cli', 'gemini-2.5-pro', 0, 'completed',
-                ?3, ?3, 0, 0)",
+                ?3, ?3, ?4, 'created', 0, 0)",
             params![
                 run.id,
                 "https://gitlab.company.local/group/repo/-/merge_requests/59",
-                run.completed_at
+                run.completed_at,
+                10_000 + run.completed_at.parse::<i64>().unwrap_or_default()
             ],
         )
         .unwrap();
