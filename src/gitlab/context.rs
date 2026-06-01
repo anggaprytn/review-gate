@@ -7,8 +7,9 @@ use crate::{
     redaction::redact_secrets,
     review::anchors::{AnchorBuilder, AnchoredDiffContext},
 };
+use serde::Serialize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MergeRequestContext {
     pub mr_url: GitLabMrUrl,
     pub metadata: MergeRequestMetadata,
@@ -20,7 +21,7 @@ pub struct MergeRequestContext {
     pub partial: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct NormalizedDiffFile {
     pub old_path: String,
     pub new_path: String,
@@ -31,7 +32,7 @@ pub struct NormalizedDiffFile {
     pub deleted_file: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct DiffStats {
     pub changed_file_count: usize,
     pub generated_file_count: usize,

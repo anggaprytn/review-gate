@@ -1,7 +1,7 @@
 use crate::review::inline::GitLabInlinePosition;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MergeRequestMetadata {
     pub id: u64,
     pub iid: u64,
@@ -20,13 +20,13 @@ pub struct MergeRequestMetadata {
     pub diff_refs: Option<DiffRefs>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitLabUser {
     pub username: Option<String>,
     pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitLabNote {
     pub id: u64,
     #[serde(default)]
@@ -38,7 +38,7 @@ pub struct GitLabNote {
     pub author: Option<GitLabUser>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitLabDiscussion {
     pub id: String,
     pub individual_note: Option<bool>,
@@ -46,7 +46,7 @@ pub struct GitLabDiscussion {
     pub notes: Vec<GitLabDiscussionNote>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitLabDiscussionNote {
     pub id: u64,
     #[serde(default)]
@@ -60,7 +60,7 @@ pub struct GitLabDiscussionNote {
     pub updated_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitLabNotePosition {
     pub position_type: Option<String>,
     pub base_sha: Option<String>,
@@ -104,14 +104,14 @@ pub struct PublishResult {
     pub duplicate_count: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DiffRefs {
     pub base_sha: Option<String>,
     pub start_sha: Option<String>,
     pub head_sha: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MergeRequestDiff {
     pub old_path: String,
     pub new_path: String,

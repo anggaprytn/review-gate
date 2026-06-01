@@ -1,5 +1,6 @@
 use crate::{
     config::{AppConfig, StorageConfig},
+    counters::{count_verification_status_strings, VerificationCounters},
     error::{Result, ReviewGateError},
     gitlab::{
         inline::inline_fingerprint_v2,
@@ -616,6 +617,50 @@ impl Storage {
             )
             .map_err(storage_error)?;
         Ok(())
+    }
+
+    pub fn latest_verification_counters(
+        &self,
+        project_path: &str,
+        mr_iid: u64,
+    ) -> Result<Option<VerificationCounters>> {
+        let latest_run_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id
+                 FROM verification_runs
+                 WHERE project_path = ?1 AND mr_iid = ?2 AND status = 'completed'
+                 ORDER BY completed_at DESC, rowid DESC
+                 LIMIT 1",
+                params![project_path, mr_iid as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+
+        let Some(latest_run_id) = latest_run_id else {
+            return Ok(None);
+        };
+
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT status
+                 FROM verification_results
+                 WHERE verification_run_id = ?1",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map([latest_run_id], |row| row.get::<_, String>(0))
+            .map_err(storage_error)?;
+        let mut statuses = Vec::new();
+        for row in rows {
+            statuses.push(row.map_err(storage_error)?);
+        }
+
+        Ok(Some(count_verification_status_strings(
+            statuses.iter().map(String::as_str),
+        )))
     }
 
     fn insert_published_comment(&mut self, comment: PublishedComment<'_>) -> Result<()> {
@@ -1327,6 +1372,65 @@ mod tests {
         );
         assert_eq!(count(&storage.conn, "verification_runs"), 2);
         assert_eq!(count(&storage.conn, "verification_results"), 2);
+    }
+
+    #[test]
+    fn latest_verification_counter_query_returns_newest_verification_run() {
+        let path =
+            temp_db_path("latest_verification_counter_query_returns_newest_verification_run");
+        let mut storage = Storage::open_path(&path).unwrap();
+        let persisted_review = storage
+            .persist_review_run(&context(), &config(path.clone()), &preview_with_findings())
+            .unwrap();
+        let previous = storage
+            .previous_findings_for_verification(&persisted_review.id, 30)
+            .unwrap();
+
+        storage
+            .persist_verification_run(
+                &context(),
+                &config(path.clone()),
+                Some(&persisted_review.id),
+                &VerificationOutcome {
+                    summary: "1 fixed.".to_string(),
+                    results: vec![VerificationResult {
+                        previous_finding: previous[0].clone(),
+                        status: VerificationStatus::Fixed,
+                        reason: "fixed".to_string(),
+                        evidence: None,
+                    }],
+                    parsed: true,
+                    parse_warning: None,
+                },
+            )
+            .unwrap();
+        storage
+            .persist_verification_run(
+                &context(),
+                &config(path),
+                Some(&persisted_review.id),
+                &VerificationOutcome {
+                    summary: "1 still open.".to_string(),
+                    results: vec![VerificationResult {
+                        previous_finding: previous[0].clone(),
+                        status: VerificationStatus::StillOpen,
+                        reason: "still open".to_string(),
+                        evidence: None,
+                    }],
+                    parsed: true,
+                    parse_warning: None,
+                },
+            )
+            .unwrap();
+
+        let counters = storage
+            .latest_verification_counters("group/repo", 59)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(counters.total, 1);
+        assert_eq!(counters.fixed, 0);
+        assert_eq!(counters.still_open, 1);
     }
 
     #[test]

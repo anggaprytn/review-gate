@@ -1,7 +1,8 @@
 use crate::error::{Result, ReviewGateError};
+use serde::{Deserialize, Serialize};
 use url::{form_urlencoded::byte_serialize, Url};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitLabMrUrl {
     pub base_url: String,
     pub project_path: String,

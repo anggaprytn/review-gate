@@ -1,14 +1,15 @@
 use crate::{gitlab::types::MergeRequestDiff, redaction::redact_secrets};
+use serde::Serialize;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum AnchorLineKind {
     Added,
     Removed,
     Context,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReviewLineAnchor {
     pub anchor_id: String,
     pub file_path: String,
@@ -20,7 +21,7 @@ pub struct ReviewLineAnchor {
     pub content_preview: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct AnchoredDiffContext {
     pub anchors: Vec<ReviewLineAnchor>,
     pub prompt_text: String,

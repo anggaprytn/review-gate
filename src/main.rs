@@ -1,9 +1,13 @@
 use clap::Parser;
 use reviewgate::cli::{
-    exit_code_for_result, Cli, Commands, FindingsArgs, FixPromptArgs, PlanArgs, ReviewArgs,
-    VerifyArgs,
+    exit_code_for_result, Cli, Commands, ContextArgs, FindingsArgs, FixPromptArgs, PlanArgs,
+    ReviewArgs, VerifyArgs,
 };
 use reviewgate::config::AppConfig;
+use reviewgate::counters::{
+    count_findings_from_analysis, count_verification_results, emoji_enabled,
+    format_finding_counters_terminal, format_verification_counters_terminal,
+};
 use reviewgate::doctor::{run_doctor, DoctorOptions};
 use reviewgate::error::Result;
 use reviewgate::fix_prompt::{
@@ -89,8 +93,40 @@ async fn run_command(cli: Cli) -> Result<()> {
             .await?;
             print!("{output}");
         }
+        Commands::Context(args) => run_context(args).await?,
     }
 
+    Ok(())
+}
+
+async fn run_context(args: ContextArgs) -> Result<()> {
+    let mr_url = resolve_mr_url(args.ci, args.mr_url.as_deref(), false)?;
+    let mr = GitLabMrUrl::parse(&mr_url)?;
+    let config = AppConfig::load()?;
+    let gitlab = GitLabClient::new_with_token_source(
+        mr.base_url.clone(),
+        config.gitlab_token.clone(),
+        config.gitlab_token_source,
+    )?;
+    let metadata = gitlab.fetch_merge_request(&mr).await?;
+    let diffs = gitlab.fetch_merge_request_diffs(&mr).await?;
+
+    let context = build_merge_request_context(
+        mr,
+        metadata,
+        diffs,
+        &config.review,
+        config.privacy.redact_secrets,
+    );
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&context)?);
+    } else {
+        print_mr_summary(&context);
+        print_diff_summary(&context);
+        print_file_summary(&context);
+        print_warnings(&context);
+    }
     Ok(())
 }
 
@@ -419,6 +455,7 @@ async fn run_large_review(
         .await?;
     } else {
         println!("{}", preview.markdown);
+        print_finding_counters(&preview);
         print_run_metadata(
             &config,
             &preview.metadata,
@@ -492,6 +529,7 @@ async fn publish_review_preview(
     }
 
     print_publish_result(&result, options.publish_inline, options.inline_dry_run);
+    print_finding_counters(&preview);
     if options.inline_dry_run {
         print_inline_dry_run_report(&preview, context, diffs, config);
     } else if options.publish_inline {
@@ -644,6 +682,7 @@ async fn print_preview(
     let preview = generate_preview(context, config, show_prompt).await?;
 
     println!("{}", preview.markdown);
+    print_finding_counters(&preview);
     print_run_metadata(
         config,
         &preview.metadata,
@@ -999,6 +1038,7 @@ async fn verify_merge_request(args: VerifyArgs, publish: bool) -> Result<()> {
     .await?;
 
     println!("{}", preview.markdown);
+    print_verification_counters(&preview);
     print_verification_run_metadata(&config, &preview);
 
     let persisted = storage.persist_verification_run(
@@ -1093,10 +1133,32 @@ fn print_persisted_review_run(storage: &Option<Storage>, persisted: Option<&Pers
     );
 }
 
+fn print_finding_counters(preview: &ReviewPreview) {
+    let Some(analysis) = preview.analysis.as_ref() else {
+        return;
+    };
+    println!();
+    print!(
+        "{}",
+        format_finding_counters_terminal(&count_findings_from_analysis(analysis), emoji_enabled())
+    );
+}
+
 fn print_storage_open_warning(outcome: &reviewgate::storage::StorageOpenOutcome) {
     if let Some(warning) = outcome.warning.as_deref() {
         eprintln!("warning: storage unavailable; review will continue without history: {warning}");
     }
+}
+
+fn print_verification_counters(preview: &VerificationPreview) {
+    println!();
+    print!(
+        "{}",
+        format_verification_counters_terminal(
+            &count_verification_results(&preview.outcome),
+            emoji_enabled()
+        )
+    );
 }
 
 fn print_verification_run_metadata(config: &AppConfig, preview: &VerificationPreview) {

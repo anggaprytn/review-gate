@@ -1,5 +1,6 @@
 use crate::{
     branding::REVIEWGATE_ATTRIBUTION,
+    counters::{count_verification_results, emoji_enabled, format_verification_summary_markdown},
     error::Result,
     gitlab::context::MergeRequestContext,
     llm::types::{LlmReviewResponse, LlmRunMetadata},
@@ -215,6 +216,11 @@ pub fn format_verification_markdown(
 ) -> String {
     let mut output = String::new();
     output.push_str("# ReviewGate Change Verification\n\n");
+    output.push_str(&format_verification_summary_markdown(
+        &count_verification_results(outcome),
+        emoji_enabled(),
+    ));
+    output.push('\n');
     output.push_str("## Summary\n\n");
     output.push_str(blank_fallback(
         &outcome.summary,
@@ -622,6 +628,9 @@ mod tests {
         );
 
         assert!(markdown.contains("# ReviewGate Change Verification"));
+        assert!(markdown.contains("## Verification Summary"));
+        assert!(markdown.contains("| ✅ Fixed | 1 |"));
+        assert!(markdown.contains("| ⚠️ Still open | 1 |"));
         assert!(markdown.contains("## ✅ Fixed"));
         assert!(markdown.contains("## ⚠️ Still Open"));
         assert!(markdown.contains("## ⏭️ Skipped"));

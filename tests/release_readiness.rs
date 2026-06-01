@@ -57,6 +57,7 @@ fn inline_output_keeps_attribution_and_hidden_marker() {
 
     assert!(body.contains(REVIEWGATE_ATTRIBUTION));
     assert!(body.contains("reviewgate:inline"));
+    assert!(!body.contains("## Finding Summary"));
 }
 
 #[test]
@@ -82,6 +83,7 @@ fn verification_output_keeps_attribution_and_hidden_marker() {
 
     assert!(body.contains(REVIEWGATE_ATTRIBUTION));
     assert!(body.contains("reviewgate:verification"));
+    assert!(body.contains("## Verification Summary"));
 }
 
 #[test]

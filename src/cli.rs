@@ -20,6 +20,19 @@ pub enum Commands {
     FixPrompt(FixPromptArgs),
     Findings(FindingsArgs),
     Doctor(DoctorArgs),
+    Context(ContextArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ContextArgs {
+    #[arg(required_unless_present = "ci", value_name = "MR_URL")]
+    pub mr_url: Option<String>,
+
+    #[arg(long, conflicts_with = "mr_url")]
+    pub ci: bool,
+
+    #[arg(long, default_value = "true")]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -168,6 +181,7 @@ impl Cli {
             Commands::Verify(args) => args.soft_fail,
             Commands::FixPrompt(_) | Commands::Findings(_) => false,
             Commands::Doctor(_) => false,
+            Commands::Context(_) => false,
         }
     }
 }
@@ -622,6 +636,7 @@ mod tests {
             Commands::FixPrompt(_) => panic!("expected review command"),
             Commands::Findings(_) => panic!("expected review command"),
             Commands::Doctor(_) => panic!("expected review command"),
+            Commands::Context(_) => panic!("expected review command"),
         }
     }
 
@@ -633,6 +648,7 @@ mod tests {
             Commands::FixPrompt(_) => panic!("expected plan command"),
             Commands::Findings(_) => panic!("expected plan command"),
             Commands::Doctor(_) => panic!("expected plan command"),
+            Commands::Context(_) => panic!("expected plan command"),
         }
     }
 

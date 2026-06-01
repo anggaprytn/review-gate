@@ -1,6 +1,7 @@
 pub mod branding;
 pub mod cli;
 pub mod config;
+pub mod counters;
 pub mod doctor;
 pub mod error;
 pub mod fix_prompt;

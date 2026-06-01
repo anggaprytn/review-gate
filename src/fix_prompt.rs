@@ -1,4 +1,8 @@
 use crate::{
+    counters::{
+        count_stored_findings, emoji_enabled, format_finding_counters_terminal,
+        format_verification_counters_terminal, FindingCounters, VerificationCounters,
+    },
     error::{Result, ReviewGateError},
     gitlab::url::GitLabMrUrl,
     storage::{LatestReviewRun, Storage, StoredReviewFinding},
@@ -45,6 +49,7 @@ pub struct GeneratedFixPrompt {
 pub struct FindingsSummary {
     pub run: LatestReviewRun,
     pub findings: Vec<StoredReviewFinding>,
+    pub latest_verification: Option<VerificationCounters>,
 }
 
 impl FixPromptFormat {
@@ -118,7 +123,12 @@ pub fn build_fix_prompt(
 pub fn latest_findings_summary(storage: &Storage, mr: &GitLabMrUrl) -> Result<FindingsSummary> {
     let run = select_run(storage, mr, None)?;
     let findings = storage.review_findings_for_run(&run.id)?;
-    Ok(FindingsSummary { run, findings })
+    let latest_verification = storage.latest_verification_counters(&mr.project_path, mr.mr_iid)?;
+    Ok(FindingsSummary {
+        run,
+        findings,
+        latest_verification,
+    })
 }
 
 pub fn write_prompt_output(path: &Path, prompt: &str, force: bool) -> Result<()> {
@@ -167,21 +177,19 @@ pub fn format_findings_summary(summary: &FindingsSummary) -> String {
     output.push_str("ReviewGate latest findings summary\n");
     output.push_str(&format!("Run ID: {}\n", summary.run.id));
     output.push_str(&format!("MR URL: {}\n", summary.run.mr_url));
-    output.push_str("Findings by severity:\n");
-    for severity in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "NOTE"] {
-        let count = summary
-            .findings
-            .iter()
-            .filter(|finding| finding.severity == severity)
-            .count();
-        output.push_str(&format!("- {severity}: {count}\n"));
+    output.push_str(&format_finding_counters_terminal(
+        &count_stored_findings(&summary.findings),
+        emoji_enabled(),
+    ));
+    output.push_str("Latest verification:\n");
+    if let Some(counters) = summary.latest_verification.as_ref() {
+        output.push_str(&format_verification_counter_lines(
+            counters,
+            emoji_enabled(),
+        ));
+    } else {
+        output.push_str("- none\n");
     }
-    let actionable_count = summary
-        .findings
-        .iter()
-        .filter(|finding| finding.actionable)
-        .count();
-    output.push_str(&format!("Actionable findings: {actionable_count}\n"));
     output.push_str("Findings:\n");
     if summary.findings.is_empty() {
         output.push_str("- none\n");
@@ -233,6 +241,10 @@ fn filtered_actionable_findings(
 
 fn render_fix_prompt(findings: &[StoredReviewFinding], format: FixPromptFormat) -> String {
     let mut prompt = String::new();
+    prompt.push_str(&render_fix_prompt_header(
+        &count_stored_findings(findings),
+        emoji_enabled(),
+    ));
     prompt.push_str("You are an AI coding agent.\n\n");
     prompt.push_str("Fix only the ReviewGate findings listed below.\n\n");
     prompt.push_str("Rules:\n");
@@ -293,6 +305,59 @@ fn render_fix_prompt(findings: &[StoredReviewFinding], format: FixPromptFormat) 
     prompt
 }
 
+fn render_fix_prompt_header(counters: &FindingCounters, emoji: bool) -> String {
+    let mut header = String::new();
+    header.push_str("ReviewGate fix prompt\n\n");
+    header.push_str(&format!("Findings included: {}\n", counters.total));
+    header.push_str(&format!(
+        "{}: {}\n",
+        severity_label("Critical", "🔴", emoji),
+        counters.critical
+    ));
+    header.push_str(&format!(
+        "{}: {}\n",
+        severity_label("High", "🟠", emoji),
+        counters.high
+    ));
+    header.push_str(&format!(
+        "{}: {}\n",
+        severity_label("Medium", "🟡", emoji),
+        counters.medium
+    ));
+    if counters.low > 0 {
+        header.push_str(&format!(
+            "{}: {}\n",
+            severity_label("Low", "🟢", emoji),
+            counters.low
+        ));
+    }
+    if counters.note > 0 {
+        header.push_str(&format!(
+            "{}: {}\n",
+            severity_label("Notes", "🔵", emoji),
+            counters.note
+        ));
+    }
+    header.push_str("\n---\n\n");
+    header
+}
+
+fn format_verification_counter_lines(counters: &VerificationCounters, emoji: bool) -> String {
+    format_verification_counters_terminal(counters, emoji)
+        .lines()
+        .skip(1)
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+fn severity_label(label: &str, icon: &str, emoji: bool) -> String {
+    if emoji {
+        format!("{icon} {label}")
+    } else {
+        label.to_string()
+    }
+}
+
 fn file_line_label(finding: &StoredReviewFinding) -> String {
     let file_path = finding.file_path.as_deref().unwrap_or("<unknown>");
     let line = finding.new_line.or(finding.old_line);
@@ -351,8 +416,8 @@ fn copy_with_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_fix_prompt, effective_min_severity, write_prompt_output, FixPromptFormat,
-        FixPromptOptions, FixPromptSeverity,
+        build_fix_prompt, effective_min_severity, format_findings_summary, latest_findings_summary,
+        write_prompt_output, FixPromptFormat, FixPromptOptions, FixPromptSeverity,
     };
     use crate::{gitlab::url::GitLabMrUrl, storage::Storage};
     use rusqlite::{params, Connection};
@@ -524,7 +589,12 @@ mod tests {
 
         let generated = build_fix_prompt(&storage, &mr, default_options()).unwrap();
 
-        assert!(generated.prompt.starts_with("You are an AI coding agent."));
+        assert!(generated.prompt.starts_with("ReviewGate fix prompt"));
+        assert!(generated.prompt.contains("Findings included: 1"));
+        assert!(generated.prompt.contains("🟠 High: 1"));
+        assert!(generated
+            .prompt
+            .contains("---\n\nYou are an AI coding agent."));
         assert!(generated.prompt.contains("- [HIGH] Timeout missing"));
         assert!(generated.prompt.contains("  File: src/example.rs:42"));
         assert!(generated.prompt.contains("  Category: correctness"));
@@ -652,6 +722,54 @@ mod tests {
             effective_min_severity(Some("HIGH"), true).unwrap(),
             FixPromptSeverity::High
         );
+    }
+
+    #[test]
+    fn findings_summary_output_includes_counters() {
+        let (storage, mr) = storage_with_single_run(vec![
+            finding("CRITICAL", "Critical", true),
+            finding("HIGH", "High", true),
+            finding("MEDIUM", "Medium", true),
+            finding("LOW", "Low", false),
+            finding("NOTE", "Note", false),
+        ]);
+
+        let summary = latest_findings_summary(&storage, &mr).unwrap();
+        let output = format_findings_summary(&summary);
+
+        assert!(output.contains("Open actionable findings: 3"));
+        assert!(output.contains("🔴 Critical: 1"));
+        assert!(output.contains("🟠 High: 1"));
+        assert!(output.contains("🟡 Medium: 1"));
+        assert!(output.contains("🟢 Low: 1"));
+        assert!(output.contains("🔵 Notes: 1"));
+        assert!(output.contains("Latest verification:"));
+    }
+
+    #[test]
+    fn fix_prompt_header_counters_respect_severity_filters() {
+        let (storage, mr) = storage_with_single_run(vec![
+            finding("CRITICAL", "Critical", true),
+            finding("HIGH", "High", true),
+            finding("MEDIUM", "Medium", true),
+            finding("LOW", "Low", true),
+            finding("NOTE", "Note", true),
+        ]);
+        let options = FixPromptOptions {
+            min_severity: FixPromptSeverity::High,
+            include_notes: false,
+            ..default_options()
+        };
+
+        let generated = build_fix_prompt(&storage, &mr, options).unwrap();
+
+        assert!(generated.prompt.contains("Findings included: 2"));
+        assert!(generated.prompt.contains("🔴 Critical: 1"));
+        assert!(generated.prompt.contains("🟠 High: 1"));
+        assert!(generated.prompt.contains("🟡 Medium: 0"));
+        assert!(!generated.prompt.contains("🟢 Low:"));
+        assert!(!generated.prompt.contains("🔵 Notes:"));
+        assert_eq!(titles(&generated), vec!["Critical", "High"]);
     }
 
     fn default_options() -> FixPromptOptions {

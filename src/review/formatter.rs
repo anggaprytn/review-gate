@@ -1,5 +1,6 @@
 use crate::{
     branding::REVIEWGATE_ATTRIBUTION,
+    counters::{count_findings_from_analysis, emoji_enabled, format_finding_summary_markdown},
     review::{
         parser::ReviewParseError,
         types::{ReviewAnalysis, ReviewFinding, Severity},
@@ -16,6 +17,11 @@ pub fn format_review_markdown_with_emoji(analysis: &ReviewAnalysis, emoji: bool)
     let mut output = String::new();
 
     output.push_str("# ReviewGate AI Code Review\n\n");
+    output.push_str(&format_finding_summary_markdown(
+        &count_findings_from_analysis(analysis),
+        emoji,
+    ));
+    output.push('\n');
     output.push_str("## Summary\n\n");
     output.push_str(blank_fallback(&analysis.summary, "No summary returned."));
     output.push_str("\n\n");
@@ -199,13 +205,6 @@ fn blank_fallback<'a>(value: &'a str, fallback: &'static str) -> &'a str {
     }
 }
 
-fn emoji_enabled() -> bool {
-    std::env::var("REVIEWGATE_EMOJI")
-        .ok()
-        .map(|value| !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
-        .unwrap_or(true)
-}
-
 fn scrub_confidence_from_raw_text(value: &str) -> String {
     let json_confidence = Regex::new(r#"(?m)^\s*"confidence"\s*:\s*"[^"]*",?\s*$"#)
         .expect("confidence scrub regex compiles");
@@ -283,6 +282,9 @@ mod tests {
         );
 
         assert!(markdown.contains("# ReviewGate AI Code Review"));
+        assert!(markdown.contains("## Finding Summary"));
+        assert!(markdown.contains("Open actionable findings: 1"));
+        assert!(markdown.contains("| 🟠 High | 1 |"));
         assert!(markdown.contains("## Overall Risk\n\n🟡 Medium"));
         assert!(markdown.contains("## 🔴 Critical\n\nNo critical findings."));
         assert!(markdown.contains("## 🟠 High"));
@@ -319,6 +321,7 @@ mod tests {
         );
 
         assert!(markdown.contains("## High"));
+        assert!(markdown.contains("| High | 1 |"));
         assert!(markdown.contains("### HIGH · Quick fix · src/payment/client.ts:42"));
         assert!(!markdown.contains("🟠"));
     }

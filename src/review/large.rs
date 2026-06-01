@@ -977,6 +977,7 @@ mod tests {
         let markdown = format_large_review_markdown(&analysis(vec![]), &report(3, 0));
 
         assert!(markdown.contains("## Large MR Review Plan"));
+        assert!(markdown.contains("## Finding Summary"));
         assert!(markdown.contains("Reviewed chunks: 3"));
         assert!(markdown.contains("Review mode: risk-prioritized partial review"));
     }
