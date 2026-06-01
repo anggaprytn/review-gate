@@ -806,7 +806,7 @@ mod tests {
 
         assert!(output.contains("Change since previous review:"));
         assert!(output.contains("Previous published run: run-old"));
-        assert!(output.contains("⚠️ Still detected: 1"));
+        assert!(output.contains("⚠️ Still detected again: 1"));
     }
 
     #[test]
@@ -828,7 +828,7 @@ mod tests {
 
         assert!(generated.prompt.contains("Change since previous review:"));
         assert!(generated.prompt.contains("🆕 New findings: 0"));
-        assert!(generated.prompt.contains("⚠️ Still detected: 1"));
+        assert!(generated.prompt.contains("⚠️ Still detected again: 1"));
         assert!(generated
             .prompt
             .contains("ReviewGate findings from latest SQLite run:"));

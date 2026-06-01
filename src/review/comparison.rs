@@ -24,8 +24,15 @@ pub enum FindingDeltaStatus {
     New,
     StillDetected,
     NotDetected,
+    PossiblyResolvedNeedsVerification,
     VerifiedFixed,
     NeedsVerification,
+}
+
+impl ReviewComparison {
+    pub fn possibly_resolved_needs_verification(&self) -> usize {
+        self.not_detected
+    }
 }
 
 pub fn compare_current_run_with_previous(
@@ -151,20 +158,28 @@ pub fn format_comparison_markdown(comparison: &ReviewComparison, emoji: bool) ->
     ));
     output.push_str(&format!(
         "| {} | {} |\n",
-        comparison_label(FindingDeltaStatus::NotDetected, emoji),
-        comparison.not_detected
+        comparison_label(FindingDeltaStatus::PossiblyResolvedNeedsVerification, emoji),
+        comparison.possibly_resolved_needs_verification()
     ));
     output.push_str(&format!(
         "| {} | {} |\n",
         comparison_label(FindingDeltaStatus::VerifiedFixed, emoji),
         comparison.verified_fixed
     ));
-    output.push_str(&format!(
-        "| {} | {} |\n",
-        comparison_label(FindingDeltaStatus::NeedsVerification, emoji),
-        comparison.needs_verification
-    ));
+    output.push_str(
+        "\nNote: \"Possibly resolved\" means the previous finding was not detected in this review. It is not counted as fixed until `reviewgate verify` confirms it.\n",
+    );
     output
+}
+
+pub fn format_review_status_markdown(comparison: &ReviewComparison) -> String {
+    format!(
+        "## Review Status\n\nCurrent open actionable findings: {}\nPrevious findings still detected: {}\nPossibly resolved, needs verification: {}\nVerified fixed: {}\n",
+        comparison.current_total_actionable,
+        comparison.still_detected,
+        comparison.possibly_resolved_needs_verification(),
+        comparison.verified_fixed
+    )
 }
 
 pub fn format_comparison_terminal(comparison: &ReviewComparison, emoji: bool) -> String {
@@ -188,18 +203,13 @@ pub fn format_comparison_terminal(comparison: &ReviewComparison, emoji: bool) ->
     ));
     output.push_str(&format!(
         "{}: {}\n",
-        comparison_label(FindingDeltaStatus::NotDetected, emoji),
-        comparison.not_detected
+        comparison_label(FindingDeltaStatus::PossiblyResolvedNeedsVerification, emoji),
+        comparison.possibly_resolved_needs_verification()
     ));
     output.push_str(&format!(
         "{}: {}\n",
         comparison_label(FindingDeltaStatus::VerifiedFixed, emoji),
         comparison.verified_fixed
-    ));
-    output.push_str(&format!(
-        "{}: {}\n",
-        comparison_label(FindingDeltaStatus::NeedsVerification, emoji),
-        comparison.needs_verification
     ));
     output
 }
@@ -217,8 +227,15 @@ pub fn insert_comparison_section_with_emoji(
     comparison: &ReviewComparison,
     emoji: bool,
 ) -> String {
-    let section = format_comparison_markdown(comparison, emoji);
+    let section = format!(
+        "{}\n{}",
+        format_review_status_markdown(comparison),
+        format_comparison_markdown(comparison, emoji)
+    );
     if markdown.contains("## Change Since Previous Review") {
+        return markdown.to_string();
+    }
+    if markdown.contains("## Review Status") {
         return markdown.to_string();
     }
     if let Some((before, after)) = markdown.split_once("\n## Summary\n\n") {
@@ -240,8 +257,11 @@ fn latest_status_map(statuses: &[StoredVerificationStatus]) -> HashMap<&str, Ver
 fn comparison_label(status: FindingDeltaStatus, emoji: bool) -> String {
     let (icon, label) = match status {
         FindingDeltaStatus::New => ("🆕", "New findings"),
-        FindingDeltaStatus::StillDetected => ("⚠️", "Still detected"),
+        FindingDeltaStatus::StillDetected => ("⚠️", "Still detected again"),
         FindingDeltaStatus::NotDetected => ("🟣", "Not detected in this review"),
+        FindingDeltaStatus::PossiblyResolvedNeedsVerification => {
+            ("🟣", "Possibly resolved, needs verification")
+        }
         FindingDeltaStatus::VerifiedFixed => ("✅", "Verified fixed"),
         FindingDeltaStatus::NeedsVerification => ("❓", "Needs verification"),
     };
@@ -380,7 +400,7 @@ fn normalize_title(value: &str) -> String {
 mod tests {
     use super::{
         compare_findings, format_comparison_markdown, format_comparison_terminal,
-        insert_comparison_section_with_emoji, ReviewComparison,
+        format_review_status_markdown, insert_comparison_section_with_emoji, ReviewComparison,
     };
     use crate::{
         storage::{LatestReviewRun, StoredPreviousFinding, StoredVerificationStatus},
@@ -505,9 +525,42 @@ mod tests {
         assert!(markdown.contains("Compared with previous published run: `previous-run`"));
         assert!(markdown.contains("| Status | Count |\n|---|---:|"));
         assert!(markdown.contains("| 🆕 New findings | 4 |"));
+        assert!(markdown.contains("| ⚠️ Still detected again | 12 |"));
+        assert!(markdown.contains("| 🟣 Possibly resolved, needs verification | 3 |"));
         assert!(markdown.contains("| ✅ Verified fixed | 2 |"));
+        assert!(!markdown.contains("| ❓ Needs verification |"));
+        assert!(
+            markdown.contains("It is not counted as fixed until `reviewgate verify` confirms it.")
+        );
         assert!(!markdown.contains('━'));
         assert!(!markdown.contains('─'));
+    }
+
+    #[test]
+    fn markdown_comparison_collapses_absent_unverified_findings_without_double_count_row() {
+        let mut comparison = comparison();
+        comparison.not_detected = 15;
+        comparison.needs_verification = 15;
+
+        let markdown = format_comparison_markdown(&comparison, true);
+
+        assert!(markdown.contains("| 🟣 Possibly resolved, needs verification | 15 |"));
+        assert!(!markdown.contains("| 🟣 Not detected in this review |"));
+        assert!(!markdown.contains("| ❓ Needs verification |"));
+        assert!(!markdown.contains("| 🟣 Possibly resolved, needs verification | 30 |"));
+    }
+
+    #[test]
+    fn markdown_comparison_keeps_verified_fixed_separate_from_possibly_resolved() {
+        let mut comparison = comparison();
+        comparison.not_detected = 15;
+        comparison.needs_verification = 15;
+        comparison.verified_fixed = 4;
+
+        let markdown = format_comparison_markdown(&comparison, true);
+
+        assert!(markdown.contains("| 🟣 Possibly resolved, needs verification | 15 |"));
+        assert!(markdown.contains("| ✅ Verified fixed | 4 |"));
     }
 
     #[test]
@@ -515,7 +568,8 @@ mod tests {
         let markdown = format_comparison_markdown(&comparison(), false);
 
         assert!(markdown.contains("| New findings | 4 |"));
-        assert!(markdown.contains("| Still detected | 12 |"));
+        assert!(markdown.contains("| Still detected again | 12 |"));
+        assert!(markdown.contains("| Possibly resolved, needs verification | 3 |"));
         assert!(!markdown.contains("🆕"));
     }
 
@@ -525,7 +579,20 @@ mod tests {
 
         assert!(output.contains("Change since previous review:"));
         assert!(output.contains("Previous published run: previous-run"));
-        assert!(output.contains("🟣 Not detected in this review: 3"));
+        assert!(output.contains("⚠️ Still detected again: 12"));
+        assert!(output.contains("🟣 Possibly resolved, needs verification: 3"));
+        assert!(!output.contains("Needs verification:"));
+    }
+
+    #[test]
+    fn review_status_headline_formats_progress_counts() {
+        let markdown = format_review_status_markdown(&comparison());
+
+        assert!(markdown.contains("## Review Status"));
+        assert!(markdown.contains("Current open actionable findings: 16"));
+        assert!(markdown.contains("Previous findings still detected: 12"));
+        assert!(markdown.contains("Possibly resolved, needs verification: 3"));
+        assert!(markdown.contains("Verified fixed: 2"));
     }
 
     #[test]
@@ -535,7 +602,9 @@ mod tests {
 
         let output = insert_comparison_section_with_emoji(markdown, &comparison(), false);
 
-        assert!(output.contains("## Finding Summary\n\nx\n\n## Change Since Previous Review"));
+        assert!(output.contains("## Finding Summary\n\nx\n\n## Review Status"));
+        assert!(output.contains("## Change Since Previous Review"));
+        assert!(output.contains("## Review Status"));
         assert!(output.contains("\n## Summary\n\nbody"));
     }
 
@@ -546,7 +615,8 @@ mod tests {
         let output = insert_comparison_section_with_emoji(markdown, &comparison(), false);
 
         assert!(output.contains("## Large MR Review Plan"));
-        assert!(output.contains("## Finding Summary\n\nx\n\n## Change Since Previous Review"));
+        assert!(output.contains("## Finding Summary\n\nx\n\n## Review Status"));
+        assert!(output.contains("## Change Since Previous Review"));
     }
 
     fn comparison() -> ReviewComparison {

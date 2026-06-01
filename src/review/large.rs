@@ -9,10 +9,14 @@ use crate::{
         engine::{estimate_prompt_tokens, ReviewPreview},
         formatter::format_review_markdown,
         parser::parse_review_analysis,
-        types::{OverallRisk, ReviewAnalysis, ReviewFinding},
+        types::{OverallRisk, ReviewAnalysis, ReviewFinding, Severity},
     },
 };
-use std::{collections::HashSet, env, future::Future};
+use std::{
+    collections::{BTreeMap, HashSet},
+    env,
+    future::Future,
+};
 
 pub const DEFAULT_LARGE_REVIEW_ENABLED: bool = true;
 pub const DEFAULT_LARGE_REVIEW_MAX_CHUNKS: usize = 6;
@@ -459,29 +463,28 @@ pub fn merge_chunk_analyses(
         findings.extend(analysis.findings);
     }
 
-    let mut summary = format!(
-        "Large MR partial review completed. Reviewed {} chunks covering {} risk-prioritized files. Skipped {} files{}.",
-        report.reviewed_chunks,
-        report.reviewed_files,
-        report.skipped_files,
-        skipped_reason_suffix(&report.skipped_reasons)
-    );
+    let findings = dedupe_findings(findings);
+
+    let mut summary = compact_large_review_summary(&findings, report);
     if report.failed_chunks > 0 {
         summary.push_str(&format!(
             "\n\n⚠️ {} of {} review chunks failed. Findings may be incomplete.",
             report.failed_chunks, report.total_chunks
         ));
     }
-    if !summaries.is_empty() {
-        summary.push_str("\n\nChunk summaries: ");
-        summary.push_str(&summaries.join(" "));
+    if findings.is_empty() && !summaries.is_empty() {
+        let compacted = compact_sentences(&summaries.join(" "), 3);
+        if !compacted.is_empty() {
+            summary.push_str("\n\n");
+            summary.push_str(&compacted.join(" "));
+        }
     }
 
     ReviewAnalysis {
         summary,
-        findings: dedupe_findings(findings),
-        test_coverage_note: join_optional_notes(test_notes),
-        privacy_note: join_optional_notes(privacy_notes),
+        findings,
+        test_coverage_note: compact_note_bullets(test_notes, 5),
+        privacy_note: compact_privacy_notes(privacy_notes),
         overall_risk,
     }
 }
@@ -713,12 +716,191 @@ fn overall_sort_key(risk: OverallRisk) -> u8 {
     }
 }
 
-fn join_optional_notes(notes: Vec<String>) -> Option<String> {
-    if notes.is_empty() {
+fn compact_large_review_summary(findings: &[ReviewFinding], report: &LargeReviewReport) -> String {
+    let mut summary = format!(
+        "ReviewGate reviewed {} risk-prioritized files across {} chunks.",
+        report.reviewed_files, report.reviewed_chunks
+    );
+    if report.skipped_files > 0 {
+        summary.push_str(&format!(
+            " Skipped {} files{}.",
+            report.skipped_files,
+            skipped_reason_suffix(&report.skipped_reasons)
+        ));
+    }
+
+    let bullets = top_finding_theme_bullets(findings, 5);
+    if bullets.is_empty() {
+        summary.push_str("\n\nNo critical, high, or medium actionable findings were detected in reviewed chunks.");
+    } else {
+        summary.push_str("\n\nMain risks found:\n");
+        for bullet in bullets {
+            summary.push_str("- ");
+            summary.push_str(&bullet);
+            summary.push('\n');
+        }
+        summary = summary.trim_end().to_string();
+    }
+
+    summary
+        .push_str("\n\nThis is a partial risk-prioritized review, not a full exhaustive review.");
+    summary
+}
+
+fn top_finding_theme_bullets(findings: &[ReviewFinding], limit: usize) -> Vec<String> {
+    let mut groups: BTreeMap<String, Vec<&ReviewFinding>> = BTreeMap::new();
+    for finding in findings.iter().filter(|finding| {
+        finding.actionable
+            && matches!(
+                finding.severity,
+                Severity::Critical | Severity::High | Severity::Medium
+            )
+    }) {
+        let key = finding
+            .risk_code
+            .map(|risk_code| risk_code.display_lower().to_string())
+            .unwrap_or_else(|| finding.category.display_lower().to_string());
+        groups.entry(key).or_default().push(finding);
+    }
+
+    let mut grouped = groups.into_values().collect::<Vec<_>>();
+    grouped.sort_by(|left, right| {
+        let left_best = left
+            .iter()
+            .map(|finding| finding.severity.sort_key())
+            .min()
+            .unwrap_or(u8::MAX);
+        let right_best = right
+            .iter()
+            .map(|finding| finding.severity.sort_key())
+            .min()
+            .unwrap_or(u8::MAX);
+        left_best
+            .cmp(&right_best)
+            .then_with(|| right.len().cmp(&left.len()))
+            .then_with(|| left[0].title.cmp(&right[0].title))
+    });
+
+    grouped
+        .into_iter()
+        .take(limit)
+        .filter_map(|group| {
+            group
+                .into_iter()
+                .min_by_key(|finding| finding.severity.sort_key())
+        })
+        .map(|finding| sentence_from_title(&finding.title))
+        .collect()
+}
+
+fn sentence_from_title(title: &str) -> String {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return "Untitled risk requires review.".to_string();
+    }
+    let mut sentence = trimmed
+        .trim_start_matches(|value: char| value == '-' || value.is_whitespace())
+        .trim()
+        .to_string();
+    if !matches!(sentence.chars().last(), Some('.') | Some('!') | Some('?')) {
+        sentence.push('.');
+    }
+    sentence
+}
+
+fn compact_note_bullets(notes: Vec<String>, limit: usize) -> Option<String> {
+    let sentences = compact_sentences(&notes.join(" "), limit);
+    if sentences.is_empty() {
         None
     } else {
-        Some(notes.join(" "))
+        Some(
+            sentences
+                .into_iter()
+                .map(|sentence| format!("- {sentence}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
     }
+}
+
+fn compact_privacy_notes(notes: Vec<String>) -> Option<String> {
+    if notes.is_empty() {
+        return None;
+    }
+    let sentences = compact_sentences(&notes.join(" "), 3);
+    if sentences.is_empty() {
+        return None;
+    }
+    let no_secret_count = sentences
+        .iter()
+        .filter(|sentence| is_no_secret_or_pii_sentence(sentence))
+        .count();
+    if no_secret_count > 1 || no_secret_count == sentences.len() {
+        return Some(
+            "No obvious new secret or PII exposure detected in reviewed chunks.".to_string(),
+        );
+    }
+    Some(sentences.join(" "))
+}
+
+fn compact_sentences(text: &str, limit: usize) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut sentences = Vec::new();
+    for sentence in split_sentences(text) {
+        let cleaned = strip_chunk_review_prefix(&sentence_from_title(&sentence));
+        let key = normalize_sentence_key(&cleaned);
+        if key.is_empty() || !seen.insert(key) {
+            continue;
+        }
+        sentences.push(cleaned);
+        if sentences.len() >= limit {
+            break;
+        }
+    }
+    sentences
+}
+
+fn split_sentences(text: &str) -> Vec<String> {
+    text.split(['\n', '.', '!', '?'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn strip_chunk_review_prefix(sentence: &str) -> String {
+    let lower = sentence.to_ascii_lowercase();
+    for prefix in [
+        "chunk review found ",
+        "chunk review finds ",
+        "chunk review identified ",
+        "chunk review introduces ",
+        "chunk found ",
+        "chunk finds ",
+        "chunk introduces ",
+    ] {
+        if lower.starts_with(prefix) {
+            let stripped = sentence[prefix.len()..].trim();
+            return sentence_from_title(stripped);
+        }
+    }
+    sentence.to_string()
+}
+
+fn normalize_sentence_key(sentence: &str) -> String {
+    sentence
+        .trim_matches(|value: char| !value.is_alphanumeric())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn is_no_secret_or_pii_sentence(sentence: &str) -> bool {
+    let lower = sentence.to_ascii_lowercase();
+    lower.contains("no obvious")
+        && (lower.contains("secret") || lower.contains("pii"))
+        && (lower.contains("exposure") || lower.contains("detected"))
 }
 
 fn merge_metadata(total: &mut LlmRunMetadata, next: &LlmRunMetadata) {
@@ -895,6 +1077,82 @@ mod tests {
         );
 
         assert_eq!(merged.findings.len(), 2);
+    }
+
+    #[test]
+    fn large_summary_compacts_chunk_summary_noise_into_finding_themes() {
+        let merged = merge_chunk_analyses(
+            vec![
+                analysis(vec![finding(
+                    "Security guard failure paths may leave sessions active",
+                    Severity::High,
+                    None,
+                )]),
+                analysis(vec![finding(
+                    "Upload cleanup paths can leak temp files",
+                    Severity::Medium,
+                    None,
+                )]),
+            ],
+            &report(9, 0),
+        );
+
+        assert!(merged
+            .summary
+            .contains("ReviewGate reviewed 2 risk-prioritized files across 9 chunks."));
+        assert!(merged.summary.contains("Main risks found:\n- "));
+        assert!(!merged.summary.contains("Chunk review"));
+        assert!(!merged.summary.contains("Chunk summaries:"));
+        assert!(
+            merged
+                .summary
+                .lines()
+                .filter(|line| line.starts_with("- "))
+                .count()
+                <= 5
+        );
+    }
+
+    #[test]
+    fn test_coverage_notes_are_deduped_and_limited() {
+        let mut first = analysis(vec![]);
+        first.test_coverage_note = Some(
+            "No visible tests cover upload cleanup. No visible tests cover upload cleanup."
+                .to_string(),
+        );
+        let mut second = analysis(vec![]);
+        second.test_coverage_note = Some(
+            "No visible tests cover authVersion refresh. No visible tests cover token migration."
+                .to_string(),
+        );
+
+        let merged = merge_chunk_analyses(vec![first, second], &report(2, 0));
+        let note = merged.test_coverage_note.unwrap();
+
+        assert_eq!(
+            note.matches("No visible tests cover upload cleanup.")
+                .count(),
+            1
+        );
+        assert!(note.lines().all(|line| line.starts_with("- ")));
+        assert!(note.lines().count() <= 5);
+    }
+
+    #[test]
+    fn privacy_notes_collapse_repeated_no_secret_detection() {
+        let mut first = analysis(vec![]);
+        first.privacy_note =
+            Some("No obvious secret or PII exposure detected in the sanitized diff.".to_string());
+        let mut second = analysis(vec![]);
+        second.privacy_note =
+            Some("No obvious secret or PII exposure detected in the sanitized diff.".to_string());
+
+        let merged = merge_chunk_analyses(vec![first, second], &report(2, 0));
+
+        assert_eq!(
+            merged.privacy_note.as_deref(),
+            Some("No obvious new secret or PII exposure detected in reviewed chunks.")
+        );
     }
 
     #[test]
