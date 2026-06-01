@@ -17,11 +17,20 @@ pub enum Commands {
 pub struct ReviewArgs {
     pub mr_url: String,
 
-    #[arg(long, conflicts_with = "preview")]
+    #[arg(long, conflicts_with_all = ["preview", "publish"])]
     pub dry_run: bool,
 
-    #[arg(long, conflicts_with = "dry_run")]
+    #[arg(long, conflicts_with_all = ["dry_run", "publish"])]
     pub preview: bool,
+
+    #[arg(long, conflicts_with_all = ["dry_run", "preview"])]
+    pub publish: bool,
+
+    #[arg(long, requires = "publish")]
+    pub force_new_note: bool,
+
+    #[arg(long, requires = "publish")]
+    pub internal_note: bool,
 
     #[arg(long, requires = "preview")]
     pub show_prompt: bool,
@@ -30,6 +39,10 @@ pub struct ReviewArgs {
 impl ReviewArgs {
     pub fn calls_llm(&self) -> bool {
         !self.dry_run
+    }
+
+    pub fn publishes(&self) -> bool {
+        self.publish
     }
 }
 
@@ -50,6 +63,7 @@ mod tests {
 
         let Commands::Review(args) = cli.command;
         assert!(!args.calls_llm());
+        assert!(!args.publishes());
     }
 
     #[test]
@@ -63,5 +77,33 @@ mod tests {
 
         let Commands::Review(args) = cli.command;
         assert!(args.calls_llm());
+        assert!(!args.publishes());
+    }
+
+    #[test]
+    fn publish_mode_calls_llm_and_publishes() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--publish",
+        ]);
+
+        let Commands::Review(args) = cli.command;
+        assert!(args.calls_llm());
+        assert!(args.publishes());
+    }
+
+    #[test]
+    fn force_new_note_requires_publish() {
+        let err = Cli::try_parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--force-new-note",
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 }

@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MergeRequestMetadata {
@@ -23,6 +23,44 @@ pub struct MergeRequestMetadata {
 pub struct GitLabUser {
     pub username: Option<String>,
     pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitLabNote {
+    pub id: u64,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub system: bool,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub author: Option<GitLabUser>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateMergeRequestNoteRequest {
+    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internal: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateMergeRequestNoteRequest {
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishAction {
+    Created,
+    Updated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishResult {
+    pub action: PublishAction,
+    pub note_id: Option<u64>,
+    pub web_url: Option<String>,
+    pub duplicate_count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,7 +112,11 @@ impl MergeRequestDiff {
 
 #[cfg(test)]
 mod tests {
-    use super::{MergeRequestDiff, MergeRequestMetadata};
+    use super::{
+        CreateMergeRequestNoteRequest, MergeRequestDiff, MergeRequestMetadata,
+        UpdateMergeRequestNoteRequest,
+    };
+    use serde_json::json;
 
     #[test]
     fn parses_merge_request_metadata_fixture() {
@@ -126,5 +168,39 @@ mod tests {
         assert!(diff.is_generated());
         assert!(diff.is_collapsed());
         assert!(!diff.is_too_large());
+    }
+
+    #[test]
+    fn serializes_create_note_request_body() {
+        let request = CreateMergeRequestNoteRequest {
+            body: "review markdown".to_string(),
+            internal: Some(false),
+        };
+
+        let body = serde_json::to_value(request).unwrap();
+
+        assert_eq!(
+            body,
+            json!({
+                "body": "review markdown",
+                "internal": false
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_update_note_request_body() {
+        let request = UpdateMergeRequestNoteRequest {
+            body: "updated review markdown".to_string(),
+        };
+
+        let body = serde_json::to_value(request).unwrap();
+
+        assert_eq!(
+            body,
+            json!({
+                "body": "updated review markdown"
+            })
+        );
     }
 }

@@ -1,7 +1,11 @@
 use crate::{
     error::{Result, ReviewGateError},
     gitlab::{
-        types::{MergeRequestDiff, MergeRequestMetadata},
+        publish::{select_publish_target, summary_marker},
+        types::{
+            CreateMergeRequestNoteRequest, GitLabNote, MergeRequestDiff, MergeRequestMetadata,
+            PublishAction, PublishResult, UpdateMergeRequestNoteRequest,
+        },
         url::GitLabMrUrl,
     },
 };
@@ -93,6 +97,95 @@ impl GitLabClient {
         Ok(diffs)
     }
 
+    pub async fn list_merge_request_notes(&self, mr: &GitLabMrUrl) -> Result<Vec<GitLabNote>> {
+        let mut page = 1;
+        let mut notes = Vec::new();
+
+        loop {
+            let url = notes_api_url(&self.base_url, mr, page, DEFAULT_PER_PAGE);
+            let (mut page_notes, pagination) = self.get_json_with_headers(&url, false).await?;
+            notes.append(&mut page_notes);
+
+            match pagination.next_page {
+                Some(next_page) => page = next_page,
+                None => break,
+            }
+        }
+
+        Ok(notes)
+    }
+
+    pub async fn create_merge_request_note(
+        &self,
+        mr: &GitLabMrUrl,
+        request: &CreateMergeRequestNoteRequest,
+    ) -> Result<GitLabNote> {
+        let url = create_note_api_url(&self.base_url, mr);
+        self.send_json(reqwest::Method::POST, &url, request).await
+    }
+
+    pub async fn update_merge_request_note(
+        &self,
+        mr: &GitLabMrUrl,
+        note_id: u64,
+        request: &UpdateMergeRequestNoteRequest,
+    ) -> Result<GitLabNote> {
+        let url = update_note_api_url(&self.base_url, mr, note_id);
+        self.send_json(reqwest::Method::PUT, &url, request).await
+    }
+
+    pub async fn publish_merge_request_summary(
+        &self,
+        mr: &GitLabMrUrl,
+        body: String,
+        force_new_note: bool,
+        internal_note: bool,
+    ) -> Result<PublishResult> {
+        let marker = summary_marker(&mr.project_path, mr.mr_iid);
+        let notes = if force_new_note {
+            Vec::new()
+        } else {
+            self.list_merge_request_notes(mr).await?
+        };
+        let target = select_publish_target(&notes, &marker, force_new_note);
+
+        match target.action {
+            PublishAction::Created => {
+                let note = self
+                    .create_merge_request_note(
+                        mr,
+                        &CreateMergeRequestNoteRequest {
+                            body,
+                            internal: Some(internal_note),
+                        },
+                    )
+                    .await?;
+                Ok(PublishResult {
+                    action: PublishAction::Created,
+                    note_id: Some(note.id),
+                    web_url: None,
+                    duplicate_count: target.duplicate_count,
+                })
+            }
+            PublishAction::Updated => {
+                let note_id = target.note_id.ok_or_else(|| {
+                    ReviewGateError::GitLabApi(
+                        "selected ReviewGate note did not include a note ID".to_string(),
+                    )
+                })?;
+                let note = self
+                    .update_merge_request_note(mr, note_id, &UpdateMergeRequestNoteRequest { body })
+                    .await?;
+                Ok(PublishResult {
+                    action: PublishAction::Updated,
+                    note_id: Some(note.id),
+                    web_url: None,
+                    duplicate_count: target.duplicate_count,
+                })
+            }
+        }
+    }
+
     async fn get_json<T>(&self, url: &str) -> Result<T>
     where
         T: serde::de::DeserializeOwned,
@@ -150,6 +243,32 @@ impl GitLabClient {
             allow_unidiff_fallback,
         ))
     }
+
+    async fn send_json<T, R>(&self, method: reqwest::Method, url: &str, body: &R) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+        R: serde::Serialize + ?Sized,
+    {
+        let response = self
+            .http
+            .request(method, url)
+            .header(PRIVATE_TOKEN_HEADER, &self.token)
+            .json(body)
+            .send()
+            .await
+            .map_err(map_gitlab_request_error)?;
+
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .json::<T>()
+                .await
+                .map_err(|err| ReviewGateError::MalformedGitLabResponse(err.to_string()));
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        Err(map_gitlab_status_error(status, body, false))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +318,33 @@ pub fn diffs_api_url(
     )
 }
 
+pub fn notes_api_url(base_url: &str, mr: &GitLabMrUrl, page: u32, per_page: u16) -> String {
+    let page_query = if page > 1 {
+        format!("&page={page}")
+    } else {
+        String::new()
+    };
+    format!(
+        "{}/api/v4/projects/{}/merge_requests/{}/notes?per_page={per_page}&sort=desc&order_by=updated_at{page_query}",
+        base_url.trim_end_matches('/'),
+        mr.encoded_project_path,
+        mr.mr_iid
+    )
+}
+
+pub fn create_note_api_url(base_url: &str, mr: &GitLabMrUrl) -> String {
+    format!(
+        "{}/api/v4/projects/{}/merge_requests/{}/notes",
+        base_url.trim_end_matches('/'),
+        mr.encoded_project_path,
+        mr.mr_iid
+    )
+}
+
+pub fn update_note_api_url(base_url: &str, mr: &GitLabMrUrl, note_id: u64) -> String {
+    format!("{}/{}", create_note_api_url(base_url, mr), note_id)
+}
+
 fn header_u32(headers: &HeaderMap, name: &str) -> Option<u32> {
     headers
         .get(name)
@@ -227,6 +373,10 @@ fn map_gitlab_status_error(
         StatusCode::FORBIDDEN => ReviewGateError::GitLabForbidden,
         StatusCode::NOT_FOUND => ReviewGateError::GitLabNotFound,
         StatusCode::TOO_MANY_REQUESTS => ReviewGateError::GitLabRateLimited,
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            ReviewGateError::GitLabValidation(clean_error_body(&body))
+        }
+        StatusCode::PAYLOAD_TOO_LARGE => ReviewGateError::PublishNoteBodyTooLarge,
         _ => ReviewGateError::GitLabApi(format!(
             "request failed with status {status}: {}",
             clean_error_body(&body)
@@ -271,7 +421,10 @@ fn map_gitlab_request_error(err: reqwest::Error) -> ReviewGateError {
 
 #[cfg(test)]
 mod tests {
-    use super::{diffs_api_url, metadata_api_url, unsupported_unidiff_response, Pagination};
+    use super::{
+        create_note_api_url, diffs_api_url, map_gitlab_status_error, metadata_api_url,
+        notes_api_url, unsupported_unidiff_response, update_note_api_url, Pagination,
+    };
     use crate::{error::ReviewGateError, gitlab::url::GitLabMrUrl};
     use reqwest::header::{HeaderMap, HeaderValue};
 
@@ -294,6 +447,18 @@ mod tests {
         );
         assert!(
             !diffs_api_url("https://gitlab.company.local", &mr, 1, 100, false).contains("/changes")
+        );
+        assert_eq!(
+            notes_api_url("https://gitlab.company.local", &mr, 2, 100),
+            "https://gitlab.company.local/api/v4/projects/group%2Frepo/merge_requests/59/notes?per_page=100&sort=desc&order_by=updated_at&page=2"
+        );
+        assert_eq!(
+            create_note_api_url("https://gitlab.company.local", &mr),
+            "https://gitlab.company.local/api/v4/projects/group%2Frepo/merge_requests/59/notes"
+        );
+        assert_eq!(
+            update_note_api_url("https://gitlab.company.local", &mr, 123),
+            "https://gitlab.company.local/api/v4/projects/group%2Frepo/merge_requests/59/notes/123"
         );
     }
 
@@ -353,5 +518,33 @@ mod tests {
 
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("secret-token"));
+    }
+
+    #[test]
+    fn maps_publish_status_errors_to_user_facing_errors() {
+        assert!(matches!(
+            map_gitlab_status_error(reqwest::StatusCode::UNAUTHORIZED, String::new(), false),
+            ReviewGateError::InvalidGitLabToken
+        ));
+        assert!(matches!(
+            map_gitlab_status_error(reqwest::StatusCode::FORBIDDEN, String::new(), false),
+            ReviewGateError::GitLabForbidden
+        ));
+        assert!(matches!(
+            map_gitlab_status_error(reqwest::StatusCode::NOT_FOUND, String::new(), false),
+            ReviewGateError::GitLabNotFound
+        ));
+        assert!(matches!(
+            map_gitlab_status_error(reqwest::StatusCode::TOO_MANY_REQUESTS, String::new(), false),
+            ReviewGateError::GitLabRateLimited
+        ));
+        assert!(matches!(
+            map_gitlab_status_error(
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                "body is too long".to_string(),
+                false
+            ),
+            ReviewGateError::GitLabValidation(_)
+        ));
     }
 }

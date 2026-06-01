@@ -85,6 +85,28 @@ To inspect model input while debugging, print the sanitized prompt before the Ol
 GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/merge_requests/59" --preview --show-prompt
 ```
 
+## GitLab Summary Publish
+
+Publish fetches real GitLab metadata and diffs, calls local Ollama, prints the normalized ReviewGate markdown, then creates or updates one top-level merge request note. Inline comments are not implemented yet.
+
+```bash
+GITLAB_TOKEN=xxx cargo run -- review "https://gitlab.company.local/group/repo/-/merge_requests/59" --publish
+```
+
+By default, ReviewGate adds a hidden marker like `<!-- reviewgate:summary project="group/repo" mr="59" -->`. On later publish runs, it lists existing MR notes and updates the existing non-system ReviewGate note instead of creating duplicates. Use `--force-new-note` only when you intentionally want another summary note:
+
+```bash
+cargo run -- review "$MR_URL" --publish --force-new-note
+```
+
+To create an internal GitLab note, use either `--internal-note` or `REVIEWGATE_GITLAB_INTERNAL_NOTE=true`:
+
+```bash
+cargo run -- review "$MR_URL" --publish --internal-note
+```
+
+For publishing, `GITLAB_TOKEN` needs write permission for MR notes. On GitLab personal, project, or group access tokens, use `api` scope unless your instance has a narrower custom policy that permits note creation and updates.
+
 ## Environment
 
 Copy `.env.example` to `.env` or export variables in your shell:
@@ -99,9 +121,11 @@ REVIEWGATE_MODEL=qwen2.5-coder:7b
 REVIEWGATE_LLM_TIMEOUT_SECONDS=180
 REVIEWGATE_MAX_CONTEXT_TOKENS=12000
 REVIEWGATE_TEMPERATURE=0.1
+REVIEWGATE_PUBLISH_MAX_NOTE_CHARS=60000
+REVIEWGATE_GITLAB_INTERNAL_NOTE=false
 ```
 
-`GITLAB_TOKEN` needs permission to read merge request metadata and diffs. For GitLab personal, project, or group access tokens, use `read_api` when available; some self-managed instances may require `api` depending on policy.
+`GITLAB_TOKEN` needs permission to read merge request metadata and diffs. For publish mode it also needs permission to create and update merge request notes, which usually means `api` scope.
 
 ## Diff Limits
 
@@ -116,6 +140,8 @@ If dry-run fails with a GitLab reachability or timeout error:
 - Check that DNS for the GitLab host resolves on VPN.
 - Confirm the MR URL base host is the same host your token can access.
 - Retry with a token that has `read_api` or `api` scope if you see 401 or 403.
+- If publish returns 403, the token likely lacks write permission for MR notes.
+- If ReviewGate says the GitLab base URL is unreachable, connect or reconnect the VPN and retry.
 
 ReviewGate never prints the token and does not include it in debug output.
 
@@ -126,9 +152,34 @@ ReviewGate never prints the token and does not include it in debug output.
 - `cannot reach GitLab base URL`: connect to VPN and confirm the MR URL opens from the same machine.
 - `GITLAB_TOKEN is required`: export a token with permission to read merge request metadata and diffs.
 - `Only Ollama provider is implemented in this version`: set `REVIEWGATE_LLM_PROVIDER=ollama`.
+- Existing ReviewGate note is updated by default: pass `--force-new-note` only when a new summary note is intentional.
+- Ollama must be running for both `--preview` and `--publish`.
+
+## Disposable E2E Test
+
+Use the prepared local repo without deleting it:
+
+```bash
+cd /Users/macbookprom1pro/Documents/Project/review-gate-test
+git status
+git remote -v
+```
+
+If the repo has no remote, set one of `REVIEWGATE_TEST_REMOTE_URL`, `GITLAB_TEST_REMOTE_URL`, or `REVIEWGATE_TEST_PROJECT_URL` before running the E2E flow. Create a branch such as `reviewgate/e2e-risky-change`, add harmless fake TypeScript or JavaScript code with reviewable risks, commit, push, and create or reuse a GitLab MR. Then run from this repository:
+
+```bash
+cargo run -- review "$MR_URL" --dry-run
+cargo run -- review "$MR_URL" --preview
+cargo run -- review "$MR_URL" --publish
+cargo run -- review "$MR_URL" --publish
+```
+
+The first publish should create one ReviewGate summary note. The second publish should update that same note, not create a duplicate. Inline comments remain disabled.
 
 ## Privacy
 
 Before diff text is printed with `--show-prompt` or sent to the configured model endpoint, ReviewGate redacts common secret patterns such as authorization headers, bearer tokens, passwords, API keys, cookies, database URLs, `.env`-style credentials, and multiline private keys.
 
 Local Ollama mode keeps the model call local to the configured `OLLAMA_BASE_URL`. The sanitized diff is sent only to that endpoint. ReviewGate does not publish GitLab comments in preview mode.
+
+Publish mode posts only normalized ReviewGate markdown with run metadata. It does not publish the raw prompt, raw diff, or raw Ollama response.

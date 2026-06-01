@@ -13,7 +13,9 @@ pub enum ReviewGateError {
     #[error("GitLab token is invalid or missing required scope")]
     InvalidGitLabToken,
 
-    #[error("GitLab token does not have permission to access this project or merge request")]
+    #[error(
+        "GitLab token does not have permission to access or write to this project or merge request"
+    )]
     GitLabForbidden,
 
     #[error("GitLab project or merge request was not found")]
@@ -36,6 +38,18 @@ pub enum ReviewGateError {
 
     #[error("GitLab API error: {0}")]
     GitLabApi(String),
+
+    #[error("GitLab validation error: {0}")]
+    GitLabValidation(String),
+
+    #[error("publish attempted with empty ReviewGate markdown")]
+    PublishEmptyMarkdown,
+
+    #[error("GitLab note body is too large after truncation. Increase REVIEWGATE_PUBLISH_MAX_NOTE_CHARS")]
+    PublishNoteBodyTooLarge,
+
+    #[error("model output could not be parsed into structured ReviewGate markdown, so publishing was skipped")]
+    PublishRequiresParsedReview,
 
     #[error("cannot reach Ollama at {0}. Start Ollama or configure another model provider")]
     OllamaUnreachable(String),

@@ -9,6 +9,7 @@ pub struct AppConfig {
     pub llm: LlmConfig,
     pub privacy: PrivacyConfig,
     pub review: ReviewConfig,
+    pub publish: PublishConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,12 @@ pub struct ReviewConfig {
     pub severity_threshold: String,
     pub max_diff_bytes: usize,
     pub max_files: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PublishConfig {
+    pub max_note_chars: usize,
+    pub internal_note: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -150,6 +157,13 @@ impl AppConfig {
                 .or_else(|| file_review.and_then(|review| review.max_files))
                 .unwrap_or(50),
         };
+        let publish = PublishConfig {
+            max_note_chars: env::var("REVIEWGATE_PUBLISH_MAX_NOTE_CHARS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(60_000),
+            internal_note: env_bool("REVIEWGATE_GITLAB_INTERNAL_NOTE").unwrap_or(false),
+        };
 
         Ok(Self {
             gitlab_token: env::var("GITLAB_TOKEN")
@@ -166,6 +180,7 @@ impl AppConfig {
             },
             privacy,
             review,
+            publish,
         })
     }
 
@@ -210,7 +225,7 @@ fn env_bool(name: &str) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, LlmConfig, PrivacyConfig, ReviewConfig};
+    use super::{AppConfig, LlmConfig, PrivacyConfig, PublishConfig, ReviewConfig};
     use crate::error::ReviewGateError;
 
     #[test]
@@ -256,6 +271,10 @@ mod tests {
                 severity_threshold: "medium".to_string(),
                 max_diff_bytes: 200_000,
                 max_files: 50,
+            },
+            publish: PublishConfig {
+                max_note_chars: 60_000,
+                internal_note: false,
             },
         }
     }

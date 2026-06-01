@@ -4,10 +4,14 @@ use reviewgate::config::AppConfig;
 use reviewgate::error::Result;
 use reviewgate::gitlab::client::GitLabClient;
 use reviewgate::gitlab::context::{build_merge_request_context, MergeRequestContext};
+use reviewgate::gitlab::publish::{build_summary_note_body, publish_summary_with};
+use reviewgate::gitlab::types::{PublishAction, PublishResult};
 use reviewgate::gitlab::url::GitLabMrUrl;
 use reviewgate::llm::ollama::OllamaClient;
 use reviewgate::llm::types::LlmRunMetadata;
-use reviewgate::review::engine::{build_sanitized_review_prompt, review_prompt_with_llm};
+use reviewgate::review::engine::{
+    build_sanitized_review_prompt, review_prompt_with_llm, ReviewPreview,
+};
 
 #[tokio::main]
 async fn main() {
@@ -46,11 +50,57 @@ async fn run() -> Result<()> {
 
             if args.dry_run {
                 print_dry_run_summary(&context);
+            } else if args.publish {
+                publish_review(
+                    &gitlab,
+                    &context,
+                    &config,
+                    args.force_new_note,
+                    args.internal_note,
+                )
+                .await?;
             } else {
                 print_preview(&context, &config, args.show_prompt).await?;
             }
         }
     }
+
+    Ok(())
+}
+
+async fn publish_review(
+    gitlab: &GitLabClient,
+    context: &MergeRequestContext,
+    config: &AppConfig,
+    force_new_note: bool,
+    internal_note_flag: bool,
+) -> Result<()> {
+    let preview = generate_preview(context, config, false).await?;
+    if !preview.parsed {
+        return Err(reviewgate::error::ReviewGateError::PublishRequiresParsedReview);
+    }
+
+    let body = build_summary_note_body(
+        &preview.markdown,
+        &context.mr_url.project_path,
+        context.metadata.iid,
+        &format!("{}/{}", config.llm.provider, config.llm.model),
+        config.privacy.local_only,
+        head_sha(context),
+        config.publish.max_note_chars,
+    )?;
+
+    println!("{body}");
+
+    let internal_note = internal_note_flag || config.publish.internal_note;
+    let result = publish_summary_with(body, |body| async move {
+        gitlab
+            .publish_merge_request_summary(&context.mr_url, body, force_new_note, internal_note)
+            .await
+    })
+    .await?;
+
+    print_publish_result(&result);
 
     Ok(())
 }
@@ -75,6 +125,24 @@ async fn print_preview(
     config: &AppConfig,
     show_prompt: bool,
 ) -> Result<()> {
+    let preview = generate_preview(context, config, show_prompt).await?;
+
+    println!("{}", preview.markdown);
+    print_run_metadata(
+        config,
+        &preview.metadata,
+        preview.prompt_token_estimate,
+        preview.parsed,
+    );
+
+    Ok(())
+}
+
+async fn generate_preview(
+    context: &MergeRequestContext,
+    config: &AppConfig,
+    show_prompt: bool,
+) -> Result<ReviewPreview> {
     let prompt = build_sanitized_review_prompt(context);
     if show_prompt {
         println!("ReviewGate sanitized prompt");
@@ -92,15 +160,7 @@ async fn print_preview(
         )
         .await?;
 
-    println!("{}", preview.markdown);
-    print_run_metadata(
-        config,
-        &preview.metadata,
-        preview.prompt_token_estimate,
-        preview.parsed,
-    );
-
-    Ok(())
+    Ok(preview)
 }
 
 fn print_mr_summary(context: &MergeRequestContext) {
@@ -245,6 +305,35 @@ fn print_run_metadata(
         if parsed { "parsed" } else { "fallback" }
     );
     println!("Publish: skipped");
+}
+
+fn print_publish_result(result: &PublishResult) {
+    println!();
+    println!("Publish result:");
+    println!(
+        "Action: {}",
+        match result.action {
+            PublishAction::Created => "created",
+            PublishAction::Updated => "updated",
+        }
+    );
+    match result.note_id {
+        Some(note_id) => println!("GitLab note ID: {note_id}"),
+        None => println!("GitLab note ID: unavailable"),
+    }
+    if let Some(web_url) = result.web_url.as_deref() {
+        println!("GitLab note URL: {web_url}");
+    }
+    println!(
+        "Duplicate ReviewGate notes found: {}",
+        result.duplicate_count
+    );
+    if result.duplicate_count > 1 {
+        println!(
+            "Warning: multiple ReviewGate summary notes were found; updated the most recently updated one"
+        );
+    }
+    println!("Inline comments: skipped");
 }
 
 fn format_ollama_duration(nanoseconds: u64) -> String {
