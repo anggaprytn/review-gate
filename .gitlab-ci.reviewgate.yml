@@ -1,0 +1,26 @@
+stages:
+  - review
+
+reviewgate:
+  stage: review
+  image: rust:1.82
+  before_script:
+    - cargo build --release
+  script:
+    - ./target/release/reviewgate review --ci --publish
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# Alternative local binary example:
+#
+# reviewgate:
+#   stage: review
+#   image: alpine:latest
+#   before_script:
+#     - apk add --no-cache curl ca-certificates
+#     - curl -L "$REVIEWGATE_BINARY_URL" -o /usr/local/bin/reviewgate
+#     - chmod +x /usr/local/bin/reviewgate
+#   script:
+#     - reviewgate review --ci --publish
+#   rules:
+#     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'

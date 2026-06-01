@@ -2,13 +2,14 @@ use crate::error::{Result, ReviewGateError};
 use crate::llm::types::LlmProvider;
 use serde::Deserialize;
 use std::{
-    env, fs,
+    env, fmt, fs,
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppConfig {
     pub gitlab_token: Option<String>,
+    pub gitlab_token_source: Option<GitLabTokenSource>,
     pub gitlab_base_url: Option<String>,
     pub llm: LlmConfig,
     pub privacy: PrivacyConfig,
@@ -16,6 +17,7 @@ pub struct AppConfig {
     pub inline: InlineConfig,
     pub publish: PublishConfig,
     pub storage: StorageConfig,
+    pub ci: CiConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +73,56 @@ pub struct StorageConfig {
     pub store_raw_diff: bool,
     pub store_raw_llm: bool,
     pub verify_max_previous_findings: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitLabTokenSource {
+    GitLabToken,
+    ReviewGateGitLabToken,
+    CiJobToken,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct GitLabTokenSelection {
+    pub token: String,
+    pub source: GitLabTokenSource,
+}
+
+impl fmt::Debug for GitLabTokenSelection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitLabTokenSelection")
+            .field("token", &"[REDACTED]")
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CiConfig {
+    pub allow_ci_job_token: bool,
+    pub history_required: bool,
+}
+
+impl fmt::Debug for AppConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AppConfig")
+            .field(
+                "gitlab_token",
+                &self.gitlab_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("gitlab_token_source", &self.gitlab_token_source)
+            .field("gitlab_base_url", &self.gitlab_base_url)
+            .field("llm", &self.llm)
+            .field("privacy", &self.privacy)
+            .field("review", &self.review)
+            .field("inline", &self.inline)
+            .field("publish", &self.publish)
+            .field("storage", &self.storage)
+            .field("ci", &self.ci)
+            .finish()
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -243,6 +295,10 @@ impl AppConfig {
                 .unwrap_or(60_000),
             internal_note: env_bool("REVIEWGATE_GITLAB_INTERNAL_NOTE").unwrap_or(false),
         };
+        let ci = CiConfig {
+            allow_ci_job_token: env_bool("REVIEWGATE_ALLOW_CI_JOB_TOKEN").unwrap_or(false),
+            history_required: env_bool("REVIEWGATE_CI_HISTORY_REQUIRED").unwrap_or(false),
+        };
         let storage = StorageConfig {
             enabled: env_bool("REVIEWGATE_STORAGE_ENABLED").unwrap_or(true),
             db_path: env::var("REVIEWGATE_DB_PATH")
@@ -256,11 +312,13 @@ impl AppConfig {
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(30),
         };
+        let gitlab_token = select_gitlab_token_from_env(ci.allow_ci_job_token)?;
 
         Ok(Self {
-            gitlab_token: env::var("GITLAB_TOKEN")
-                .ok()
-                .filter(|value| !value.is_empty()),
+            gitlab_token: gitlab_token
+                .as_ref()
+                .map(|selection| selection.token.clone()),
+            gitlab_token_source: gitlab_token.map(|selection| selection.source),
             gitlab_base_url,
             llm: LlmConfig {
                 provider,
@@ -281,6 +339,7 @@ impl AppConfig {
             inline,
             publish,
             storage,
+            ci,
         })
     }
 
@@ -359,11 +418,59 @@ fn env_bool(name: &str) -> Option<bool> {
         })
 }
 
+fn select_gitlab_token_from_env(allow_ci_job_token: bool) -> Result<Option<GitLabTokenSelection>> {
+    select_gitlab_token_from_values(
+        env::var("GITLAB_TOKEN").ok(),
+        env::var("REVIEWGATE_GITLAB_TOKEN").ok(),
+        env::var("CI_JOB_TOKEN").ok(),
+        allow_ci_job_token,
+    )
+}
+
+pub fn select_gitlab_token_from_values(
+    gitlab_token: Option<String>,
+    reviewgate_gitlab_token: Option<String>,
+    ci_job_token: Option<String>,
+    allow_ci_job_token: bool,
+) -> Result<Option<GitLabTokenSelection>> {
+    if let Some(token) = non_empty(gitlab_token) {
+        return Ok(Some(GitLabTokenSelection {
+            token,
+            source: GitLabTokenSource::GitLabToken,
+        }));
+    }
+
+    if let Some(token) = non_empty(reviewgate_gitlab_token) {
+        return Ok(Some(GitLabTokenSelection {
+            token,
+            source: GitLabTokenSource::ReviewGateGitLabToken,
+        }));
+    }
+
+    if let Some(token) = non_empty(ci_job_token) {
+        if allow_ci_job_token {
+            return Ok(Some(GitLabTokenSelection {
+                token,
+                source: GitLabTokenSource::CiJobToken,
+            }));
+        }
+        return Err(ReviewGateError::CiJobTokenNotAllowed);
+    }
+
+    Ok(None)
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, InlineConfig, LlmConfig, PrivacyConfig, PublishConfig, ReviewConfig,
-        StorageConfig,
+        select_gitlab_token_from_values, AppConfig, CiConfig, GitLabTokenSource, InlineConfig,
+        LlmConfig, PrivacyConfig, PublishConfig, ReviewConfig, StorageConfig,
     };
     use crate::error::ReviewGateError;
 
@@ -410,9 +517,73 @@ mod tests {
         assert!(err.to_string().contains("read-only"));
     }
 
+    #[test]
+    fn token_selection_prefers_gitlab_token() {
+        let selected = select_gitlab_token_from_values(
+            Some("gitlab".to_string()),
+            Some("reviewgate".to_string()),
+            Some("job".to_string()),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(selected.token, "gitlab");
+        assert_eq!(selected.source, GitLabTokenSource::GitLabToken);
+    }
+
+    #[test]
+    fn token_selection_uses_reviewgate_token_second() {
+        let selected = select_gitlab_token_from_values(
+            None,
+            Some("reviewgate".to_string()),
+            Some("job".to_string()),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(selected.token, "reviewgate");
+        assert_eq!(selected.source, GitLabTokenSource::ReviewGateGitLabToken);
+    }
+
+    #[test]
+    fn ci_job_token_is_rejected_by_default() {
+        let err = select_gitlab_token_from_values(None, None, Some("job".to_string()), false)
+            .unwrap_err();
+
+        assert!(matches!(err, ReviewGateError::CiJobTokenNotAllowed));
+        assert_eq!(
+            err.to_string(),
+            "CI_JOB_TOKEN detected but not allowed by ReviewGate. Set REVIEWGATE_ALLOW_CI_JOB_TOKEN=true if your GitLab instance permits MR note publishing with CI job tokens, or provide GITLAB_TOKEN."
+        );
+    }
+
+    #[test]
+    fn ci_job_token_is_allowed_when_enabled() {
+        let selected = select_gitlab_token_from_values(None, None, Some("job".to_string()), true)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected.token, "job");
+        assert_eq!(selected.source, GitLabTokenSource::CiJobToken);
+    }
+
+    #[test]
+    fn app_config_debug_redacts_gitlab_token() {
+        let mut config = config_with_provider("gemini_cli");
+        config.gitlab_token = Some("secret-token".to_string());
+
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("secret-token"));
+    }
+
     fn config_with_provider(provider: &str) -> AppConfig {
         AppConfig {
             gitlab_token: Some("token".to_string()),
+            gitlab_token_source: Some(GitLabTokenSource::GitLabToken),
             gitlab_base_url: None,
             llm: LlmConfig {
                 provider: provider.to_string(),
@@ -456,6 +627,10 @@ mod tests {
                 store_raw_diff: false,
                 store_raw_llm: false,
                 verify_max_previous_findings: 30,
+            },
+            ci: CiConfig {
+                allow_ci_job_token: false,
+                history_required: false,
             },
         }
     }

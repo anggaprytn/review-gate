@@ -1,4 +1,5 @@
 use crate::{
+    config::GitLabTokenSource,
     error::{Result, ReviewGateError},
     gitlab::{
         publish::{select_publish_target, summary_marker, verification_marker},
@@ -17,12 +18,14 @@ use reqwest::{
 use std::{fmt, time::Duration};
 
 const PRIVATE_TOKEN_HEADER: HeaderName = HeaderName::from_static("private-token");
+const JOB_TOKEN_HEADER: HeaderName = HeaderName::from_static("job-token");
 const DEFAULT_PER_PAGE: u16 = 100;
 
 #[derive(Clone)]
 pub struct GitLabClient {
     base_url: String,
     token: String,
+    token_header: HeaderName,
     http: reqwest::Client,
 }
 
@@ -32,18 +35,27 @@ impl fmt::Debug for GitLabClient {
             .debug_struct("GitLabClient")
             .field("base_url", &self.base_url)
             .field("token", &"[REDACTED]")
+            .field("token_header", &self.token_header)
             .finish_non_exhaustive()
     }
 }
 
 impl GitLabClient {
     pub fn new(base_url: String, token: Option<String>) -> Result<Self> {
+        Self::new_with_token_source(base_url, token, None)
+    }
+
+    pub fn new_with_token_source(
+        base_url: String,
+        token: Option<String>,
+        token_source: Option<GitLabTokenSource>,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent(format!("reviewgate/{}", env!("CARGO_PKG_VERSION")))
             .build()?;
 
-        Self::with_http(base_url, token, http)
+        Self::with_http_and_token_source(base_url, token, token_source, http)
     }
 
     pub fn with_http(
@@ -51,10 +63,20 @@ impl GitLabClient {
         token: Option<String>,
         http: reqwest::Client,
     ) -> Result<Self> {
+        Self::with_http_and_token_source(base_url, token, None, http)
+    }
+
+    pub fn with_http_and_token_source(
+        base_url: String,
+        token: Option<String>,
+        token_source: Option<GitLabTokenSource>,
+        http: reqwest::Client,
+    ) -> Result<Self> {
         let token = token.ok_or(ReviewGateError::MissingGitLabToken)?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             token,
+            token_header: token_header_for_source(token_source),
             http,
         })
     }
@@ -283,7 +305,7 @@ impl GitLabClient {
         let response = self
             .http
             .get(url)
-            .header(PRIVATE_TOKEN_HEADER, &self.token)
+            .header(self.token_header.clone(), &self.token)
             .send()
             .await
             .map_err(map_gitlab_request_error)?;
@@ -311,7 +333,7 @@ impl GitLabClient {
         let response = self
             .http
             .get(url)
-            .header(PRIVATE_TOKEN_HEADER, &self.token)
+            .header(self.token_header.clone(), &self.token)
             .send()
             .await
             .map_err(map_gitlab_request_error)?;
@@ -342,7 +364,7 @@ impl GitLabClient {
         let response = self
             .http
             .request(method, url)
-            .header(PRIVATE_TOKEN_HEADER, &self.token)
+            .header(self.token_header.clone(), &self.token)
             .json(body)
             .send()
             .await
@@ -372,7 +394,7 @@ impl GitLabClient {
         let response = self
             .http
             .request(method, url)
-            .header(PRIVATE_TOKEN_HEADER, &self.token)
+            .header(self.token_header.clone(), &self.token)
             .form(fields)
             .send()
             .await
@@ -486,6 +508,15 @@ pub fn create_discussion_api_url(base_url: &str, mr: &GitLabMrUrl) -> String {
         mr.encoded_project_path,
         mr.mr_iid
     )
+}
+
+fn token_header_for_source(source: Option<GitLabTokenSource>) -> HeaderName {
+    match source {
+        Some(GitLabTokenSource::CiJobToken) => JOB_TOKEN_HEADER,
+        Some(GitLabTokenSource::GitLabToken)
+        | Some(GitLabTokenSource::ReviewGateGitLabToken)
+        | None => PRIVATE_TOKEN_HEADER,
+    }
 }
 
 pub fn discussion_form_fields(
@@ -728,6 +759,18 @@ mod tests {
 
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("secret-token"));
+    }
+
+    #[test]
+    fn ci_job_token_uses_job_token_header() {
+        let client = super::GitLabClient::new_with_token_source(
+            "https://gitlab.company.local".to_string(),
+            Some("secret-token".to_string()),
+            Some(crate::config::GitLabTokenSource::CiJobToken),
+        )
+        .unwrap();
+
+        assert_eq!(client.token_header.as_str(), "job-token");
     }
 
     #[test]

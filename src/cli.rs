@@ -18,7 +18,14 @@ pub enum Commands {
 
 #[derive(Debug, Args)]
 pub struct ReviewArgs {
-    pub mr_url: String,
+    #[arg(required_unless_present = "ci", value_name = "MR_URL")]
+    pub mr_url: Option<String>,
+
+    #[arg(long, conflicts_with = "mr_url")]
+    pub ci: bool,
+
+    #[arg(long, requires = "ci")]
+    pub allow_non_mr_ci: bool,
 
     #[arg(long, conflicts_with_all = ["preview", "publish"])]
     pub dry_run: bool,
@@ -43,11 +50,21 @@ pub struct ReviewArgs {
 
     #[arg(long)]
     pub publish_inline: bool,
+
+    #[arg(long)]
+    pub soft_fail: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct VerifyArgs {
-    pub mr_url: String,
+    #[arg(required_unless_present = "ci", value_name = "MR_URL")]
+    pub mr_url: Option<String>,
+
+    #[arg(long, conflicts_with = "mr_url")]
+    pub ci: bool,
+
+    #[arg(long, requires = "ci")]
+    pub allow_non_mr_ci: bool,
 
     #[arg(long, conflicts_with = "publish")]
     pub preview: bool,
@@ -57,6 +74,18 @@ pub struct VerifyArgs {
 
     #[arg(long, requires = "publish")]
     pub force_new_note: bool,
+
+    #[arg(long)]
+    pub soft_fail: bool,
+}
+
+impl Cli {
+    pub fn soft_fail(&self) -> bool {
+        match &self.command {
+            Commands::Review(args) => args.soft_fail,
+            Commands::Verify(args) => args.soft_fail,
+        }
+    }
 }
 
 impl VerifyArgs {
@@ -88,11 +117,19 @@ impl ReviewArgs {
     }
 }
 
+pub fn exit_code_for_result(failed: bool, soft_fail: bool) -> i32 {
+    if failed && !soft_fail {
+        1
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Commands, ReviewArgs};
+    use super::{exit_code_for_result, Cli, Commands, ReviewArgs};
 
     #[test]
     fn dry_run_mode_does_not_call_llm() {
@@ -201,6 +238,29 @@ mod tests {
     }
 
     #[test]
+    fn publish_inline_without_publish_is_rejected_in_ci() {
+        let cli = Cli::parse_from(["reviewgate", "review", "--ci", "--publish-inline"]);
+
+        let args = review_args(cli.command);
+        let err = args.validate().unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::error::ReviewGateError::PublishInlineRequiresPublish
+        ));
+    }
+
+    #[test]
+    fn review_ci_defaults_to_preview_behavior() {
+        let cli = Cli::parse_from(["reviewgate", "review", "--ci"]);
+
+        let args = review_args(cli.command);
+        assert!(args.ci);
+        assert!(args.calls_llm());
+        assert!(!args.publishes());
+    }
+
+    #[test]
     fn inline_dry_run_prevents_inline_publish() {
         let cli = Cli::parse_from([
             "reviewgate",
@@ -231,6 +291,17 @@ mod tests {
     }
 
     #[test]
+    fn verify_ci_defaults_to_preview_behavior() {
+        let cli = Cli::parse_from(["reviewgate", "verify", "--ci"]);
+
+        let Commands::Verify(args) = cli.command else {
+            panic!("expected verify command");
+        };
+        assert!(args.ci);
+        assert!(!args.publishes());
+    }
+
+    #[test]
     fn verify_publish_mode_publishes() {
         let cli = Cli::parse_from([
             "reviewgate",
@@ -256,6 +327,13 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn soft_fail_maps_failure_to_success_exit_code() {
+        assert_eq!(exit_code_for_result(true, true), 0);
+        assert_eq!(exit_code_for_result(true, false), 1);
+        assert_eq!(exit_code_for_result(false, false), 0);
     }
 
     fn review_args(command: Commands) -> ReviewArgs {

@@ -1,7 +1,8 @@
 use clap::Parser;
-use reviewgate::cli::{Cli, Commands, VerifyArgs};
+use reviewgate::cli::{exit_code_for_result, Cli, Commands, ReviewArgs, VerifyArgs};
 use reviewgate::config::AppConfig;
 use reviewgate::error::Result;
+use reviewgate::gitlab::ci::{CiContextError, GitLabCiContext};
 use reviewgate::gitlab::client::GitLabClient;
 use reviewgate::gitlab::context::{build_merge_request_context, MergeRequestContext};
 use reviewgate::gitlab::inline::InlinePublishReport;
@@ -11,6 +12,7 @@ use reviewgate::gitlab::publish::{
 };
 use reviewgate::gitlab::types::{DiffRefs, PublishAction, PublishResult};
 use reviewgate::gitlab::url::GitLabMrUrl;
+use reviewgate::llm::types::LlmProvider;
 use reviewgate::llm::types::LlmRunMetadata;
 use reviewgate::llm::{
     auth_label, external_model_call_label, payload_label, provider_local_only, review_with_config,
@@ -28,13 +30,13 @@ use reviewgate::verify::{
 
 #[tokio::main]
 async fn main() {
-    if let Err(err) = run().await {
-        eprintln!("error: {err}");
-        std::process::exit(1);
+    let exit_code = run().await;
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
 }
 
-async fn run() -> Result<()> {
+async fn run() -> i32 {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -42,68 +44,20 @@ async fn run() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let soft_fail = cli.soft_fail();
 
-    match cli.command {
-        Commands::Review(args) => {
-            args.validate()?;
-            let publish_inline = args.publishes_inline()?;
-            let mr = GitLabMrUrl::parse(&args.mr_url)?;
-            let config = AppConfig::load()?;
-            if args.calls_llm() {
-                config.validate_for_preview()?;
-            }
-            let (mut storage, storage_open) = if args.calls_llm() {
-                Storage::open_best_effort(&config.storage)
-            } else {
-                (
-                    None,
-                    reviewgate::storage::StorageOpenOutcome {
-                        enabled: config.storage.enabled,
-                        db_path: config.storage.db_path.clone(),
-                        warning: None,
-                    },
-                )
-            };
-            print_storage_open_warning(&storage_open);
-            let gitlab = GitLabClient::new(mr.base_url.clone(), config.gitlab_token.clone())?;
-            let metadata = gitlab.fetch_merge_request(&mr).await?;
-            let diffs = gitlab.fetch_merge_request_diffs(&mr).await?;
-            let context = build_merge_request_context(
-                mr,
-                metadata,
-                diffs.clone(),
-                &config.review,
-                config.privacy.redact_secrets,
-            );
-            let inline_dry_run = args.inline_dry_run;
-
-            if args.dry_run {
-                print_dry_run_summary(&context);
-            } else if args.publish {
-                publish_review(
-                    &gitlab,
-                    &context,
-                    &diffs,
-                    &config,
-                    args.force_new_note,
-                    args.internal_note,
-                    publish_inline,
-                    inline_dry_run,
-                    &mut storage,
-                )
-                .await?;
-            } else {
-                print_preview(
-                    &context,
-                    &diffs,
-                    &config,
-                    args.show_prompt,
-                    inline_dry_run,
-                    &mut storage,
-                )
-                .await?;
-            }
+    match run_command(cli).await {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("error: {err}");
+            exit_code_for_result(true, soft_fail)
         }
+    }
+}
+
+async fn run_command(cli: Cli) -> Result<()> {
+    match cli.command {
+        Commands::Review(args) => run_review(args).await?,
         Commands::Verify(args) => {
             let publish = args.publishes();
             verify_merge_request(args, publish).await?;
@@ -111,6 +65,129 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_review(args: ReviewArgs) -> Result<()> {
+    args.validate()?;
+    let publish_inline = args.publishes_inline()?;
+    let mr_url = resolve_mr_url(args.ci, args.mr_url.as_deref(), args.allow_non_mr_ci)?;
+    let mr = GitLabMrUrl::parse(&mr_url)?;
+    let config = AppConfig::load()?;
+    if args.ci {
+        let ci_mode = if args.dry_run {
+            "dry-run, no LLM call or GitLab note publishing"
+        } else if args.publish {
+            "summary note publishing enabled"
+        } else {
+            "preview, no GitLab note publishing"
+        };
+        print_ci_guidance(&config, ci_mode);
+    }
+    if args.calls_llm() {
+        config.validate_for_preview()?;
+    }
+    let (mut storage, storage_open) = if args.calls_llm() {
+        Storage::open_best_effort(&config.storage)
+    } else {
+        (
+            None,
+            reviewgate::storage::StorageOpenOutcome {
+                enabled: config.storage.enabled,
+                db_path: config.storage.db_path.clone(),
+                warning: None,
+            },
+        )
+    };
+    print_storage_open_warning(&storage_open);
+    let gitlab = GitLabClient::new_with_token_source(
+        mr.base_url.clone(),
+        config.gitlab_token.clone(),
+        config.gitlab_token_source,
+    )?;
+    let metadata = gitlab.fetch_merge_request(&mr).await?;
+    let diffs = gitlab.fetch_merge_request_diffs(&mr).await?;
+    let context = build_merge_request_context(
+        mr,
+        metadata,
+        diffs.clone(),
+        &config.review,
+        config.privacy.redact_secrets,
+    );
+    let inline_dry_run = args.inline_dry_run;
+
+    if args.dry_run {
+        print_dry_run_summary(&context);
+    } else if args.publish {
+        publish_review(
+            &gitlab,
+            &context,
+            &diffs,
+            &config,
+            args.force_new_note,
+            args.internal_note,
+            publish_inline,
+            inline_dry_run,
+            &mut storage,
+        )
+        .await?;
+    } else {
+        print_preview(
+            &context,
+            &diffs,
+            &config,
+            args.show_prompt,
+            inline_dry_run,
+            &mut storage,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+fn resolve_mr_url(ci: bool, mr_url: Option<&str>, allow_non_mr_ci: bool) -> Result<String> {
+    if ci {
+        match GitLabCiContext::from_env(allow_non_mr_ci) {
+            Ok(context) => {
+                println!("ReviewGate CI mode");
+                println!("Inferred MR URL: {}", context.mr_url);
+                Ok(context.mr_url)
+            }
+            Err(reviewgate::error::ReviewGateError::CiContext(
+                CiContextError::NotMergeRequestPipeline { source },
+            )) => {
+                eprintln!(
+                    "Warning: GitLab CI pipeline source is '{source}', not 'merge_request_event'. ReviewGate CI mode fails closed unless --allow-non-mr-ci is passed."
+                );
+                Err(CiContextError::NotMergeRequestPipeline { source }.into())
+            }
+            Err(err) => Err(err),
+        }
+    } else {
+        Ok(mr_url
+            .expect("clap requires MR_URL when --ci is not present")
+            .to_string())
+    }
+}
+
+fn print_ci_guidance(config: &AppConfig, mode: &str) {
+    if matches!(
+        LlmProvider::parse(&config.llm.provider),
+        Ok(LlmProvider::GeminiCli | LlmProvider::CodexCli)
+    ) {
+        eprintln!(
+            "Warning: gemini_cli/codex_cli may require cached interactive auth. For CI, prefer ollama inside the network or a future direct API provider."
+        );
+    }
+
+    println!(
+        "CI storage: {} is local to this job unless persisted as an artifact or cache.",
+        config.storage.db_path.display()
+    );
+    println!(
+        "CI verification history: verify --ci requires previous ReviewGate history in the job workspace, cache, or artifact."
+    );
+    println!("CI mode: {mode}.");
 }
 
 async fn publish_review(
@@ -524,19 +601,35 @@ fn inline_summary_label(publish_inline: bool, inline_dry_run: bool) -> &'static 
 }
 
 async fn verify_merge_request(args: VerifyArgs, publish: bool) -> Result<()> {
-    let mr = GitLabMrUrl::parse(&args.mr_url)?;
+    let mr_url = resolve_mr_url(args.ci, args.mr_url.as_deref(), args.allow_non_mr_ci)?;
+    let mr = GitLabMrUrl::parse(&mr_url)?;
     let config = AppConfig::load()?;
+    if args.ci {
+        let ci_mode = if publish {
+            "verification summary note publishing enabled"
+        } else {
+            "verification preview, no GitLab note publishing"
+        };
+        print_ci_guidance(&config, ci_mode);
+    }
     config.validate_for_preview()?;
 
     let mut storage = match Storage::open(&config.storage)? {
         Some(storage) => storage,
         None => {
             println!("{}", no_previous_run_message());
+            if args.ci {
+                return Err(reviewgate::error::ReviewGateError::NoPreviousVerificationHistory);
+            }
             return Ok(());
         }
     };
 
-    let gitlab = GitLabClient::new(mr.base_url.clone(), config.gitlab_token.clone())?;
+    let gitlab = GitLabClient::new_with_token_source(
+        mr.base_url.clone(),
+        config.gitlab_token.clone(),
+        config.gitlab_token_source,
+    )?;
     let metadata = gitlab.fetch_merge_request(&mr).await?;
     let diffs = gitlab.fetch_merge_request_diffs(&mr).await?;
     let context = build_merge_request_context(
@@ -551,6 +644,9 @@ async fn verify_merge_request(args: VerifyArgs, publish: bool) -> Result<()> {
         storage.latest_completed_review_run(&context.mr_url.project_path, context.metadata.iid)?
     else {
         println!("{}", no_previous_run_message());
+        if args.ci {
+            return Err(reviewgate::error::ReviewGateError::NoPreviousVerificationHistory);
+        }
         return Ok(());
     };
 

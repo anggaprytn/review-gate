@@ -1,3 +1,4 @@
+pub mod ci;
 pub mod client;
 pub mod context;
 pub mod inline;

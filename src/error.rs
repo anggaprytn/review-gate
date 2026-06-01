@@ -10,6 +10,9 @@ pub enum ReviewGateError {
     #[error("GITLAB_TOKEN is required for GitLab API access")]
     MissingGitLabToken,
 
+    #[error("CI_JOB_TOKEN detected but not allowed by ReviewGate. Set REVIEWGATE_ALLOW_CI_JOB_TOKEN=true if your GitLab instance permits MR note publishing with CI job tokens, or provide GITLAB_TOKEN.")]
+    CiJobTokenNotAllowed,
+
     #[error("GitLab token is invalid or missing required scope")]
     InvalidGitLabToken,
 
@@ -56,6 +59,9 @@ pub enum ReviewGateError {
 
     #[error("--publish-inline requires --publish")]
     PublishInlineRequiresPublish,
+
+    #[error("No previous ReviewGate run found for this MR. Verification in CI requires review history in the job workspace, cache, or artifact. Run review first or persist REVIEWGATE_DB_PATH.")]
+    NoPreviousVerificationHistory,
 
     #[error("inline comment body is empty")]
     EmptyInlineCommentBody,
@@ -118,6 +124,9 @@ pub enum ReviewGateError {
 
     #[error("storage error: {0}")]
     Storage(String),
+
+    #[error(transparent)]
+    CiContext(#[from] crate::gitlab::ci::CiContextError),
 
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),

@@ -2,7 +2,7 @@
 
 ReviewGate is a CLI-first AI merge request reviewer for private GitLab teams. v0.1 focuses on GitLab self-managed instances behind VPN and local-first review workflows.
 
-ReviewGate does not include a dashboard, SaaS backend, GitHub support, Docker, GitLab Runner mode, Semgrep, LSP, new model providers, or a full AST engine in this step.
+ReviewGate does not include a dashboard, SaaS backend, GitHub support, Docker image, published packages, Semgrep, LSP, new model providers, or a full AST engine in this step.
 
 ## Real GitLab Dry Run
 
@@ -259,12 +259,111 @@ GITLAB_TOKEN=xxx cargo run -- review "$MR_URL" --publish --publish-inline --inli
 
 Dry-run wins: this updates the summary note, prints the inline mapping report, and posts zero inline discussions.
 
+## GitLab CI Mode
+
+GitLab Runner mode lets ReviewGate infer the merge request URL from CI variables:
+
+```bash
+reviewgate review --ci
+reviewgate review --ci --publish
+reviewgate review --ci --publish --publish-inline
+reviewgate verify --ci
+reviewgate verify --ci --publish
+```
+
+`review --ci` and `verify --ci` default to preview behavior unless `--publish` is passed. `--publish-inline` still requires `--publish`, including in CI.
+
+ReviewGate constructs the MR URL from:
+
+```txt
+{CI_PROJECT_URL}/-/merge_requests/{CI_MERGE_REQUEST_IID}
+```
+
+If `CI_PROJECT_URL` is missing, it falls back to:
+
+```txt
+{CI_SERVER_URL}/{CI_PROJECT_PATH}/-/merge_requests/{CI_MERGE_REQUEST_IID}
+```
+
+Required or preferred GitLab CI variables:
+
+- `CI_API_V4_URL`
+- `CI_PROJECT_PATH`
+- `CI_PROJECT_URL`
+- `CI_MERGE_REQUEST_IID`
+- `CI_PIPELINE_SOURCE`
+- `CI_COMMIT_SHA`
+- `CI_PROJECT_ID`
+
+`CI_MERGE_REQUEST_IID` is required. If `CI_PIPELINE_SOURCE` is present and is not `merge_request_event`, CI mode fails closed. Use `--allow-non-mr-ci` only when you are intentionally simulating CI and merge request variables are present.
+
+Token selection in CI uses this priority:
+
+1. `GITLAB_TOKEN`
+2. `REVIEWGATE_GITLAB_TOKEN`
+3. `CI_JOB_TOKEN`, only when `REVIEWGATE_ALLOW_CI_JOB_TOKEN=true`
+
+`CI_JOB_TOKEN` is rejected by default because not every GitLab instance permits MR note publishing with job tokens. ReviewGate never prints tokens, logs tokens, or writes tokens to SQLite.
+
+CLI providers may need cached interactive auth in CI:
+
+```txt
+Warning: gemini_cli/codex_cli may require cached interactive auth. For CI, prefer ollama inside the network or a future direct API provider.
+```
+
+Storage defaults to `.reviewgate/reviewgate.sqlite`. In CI this database is local to the job unless you persist it as an artifact or cache. `verify --ci` only works when previous ReviewGate history exists in the job workspace, cache, or artifact. Missing verification history is a non-zero error unless `--soft-fail` is passed.
+
+`--soft-fail` logs the error but exits with code 0 for early adoption:
+
+```bash
+reviewgate review --ci --publish --soft-fail
+reviewgate verify --ci --soft-fail
+```
+
+Sample `.gitlab-ci.reviewgate.yml` using the Rust image:
+
+```yaml
+stages:
+  - review
+
+reviewgate:
+  stage: review
+  image: rust:1.82
+  before_script:
+    - cargo build --release
+  script:
+    - ./target/release/reviewgate review --ci --publish
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+```
+
+Local binary example:
+
+```yaml
+reviewgate:
+  stage: review
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl ca-certificates
+    - curl -L "$REVIEWGATE_BINARY_URL" -o /usr/local/bin/reviewgate
+    - chmod +x /usr/local/bin/reviewgate
+  script:
+    - reviewgate review --ci --publish
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+```
+
+No Docker image or package publishing is provided yet.
+
 ## Environment
 
 Copy `.env.example` to `.env` or export variables in your shell:
 
 ```env
 GITLAB_TOKEN=
+REVIEWGATE_GITLAB_TOKEN=
+REVIEWGATE_ALLOW_CI_JOB_TOKEN=false
+REVIEWGATE_CI_HISTORY_REQUIRED=false
 REVIEWGATE_MAX_DIFF_BYTES=200000
 REVIEWGATE_MAX_FILES=50
 REVIEWGATE_INLINE_ENABLED=false
@@ -336,6 +435,9 @@ ReviewGate never prints the token and does not include it in debug output.
 - `Codex CLI request timed out`: increase `REVIEWGATE_CODEX_TIMEOUT_SECONDS` or use a faster model.
 - `cannot reach GitLab base URL`: connect to VPN and confirm the MR URL opens from the same machine.
 - `GITLAB_TOKEN is required`: export a token with permission to read merge request metadata and diffs.
+- `CI_MERGE_REQUEST_IID is missing`: `--ci` must run in a merge request pipeline or in a local simulation that exports MR variables.
+- `CI_JOB_TOKEN detected but not allowed`: set `REVIEWGATE_ALLOW_CI_JOB_TOKEN=true` only if your GitLab instance permits job-token MR note access, or provide `GITLAB_TOKEN`.
+- `No previous ReviewGate run found`: `verify --ci` needs `.reviewgate/reviewgate.sqlite` from a previous review job via workspace, cache, or artifact.
 - `unsupported LLM provider`: set `REVIEWGATE_LLM_PROVIDER=gemini_cli`, `codex_cli`, or `ollama`.
 - Existing ReviewGate summary note is updated by default: pass `--force-new-note` only when a new summary note is intentional.
 - `--publish-inline requires --publish`: add `--publish` or remove `--publish-inline`.

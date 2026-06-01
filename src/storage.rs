@@ -966,8 +966,8 @@ mod tests {
     use super::Storage;
     use crate::{
         config::{
-            AppConfig, InlineConfig, LlmConfig, PrivacyConfig, PublishConfig, ReviewConfig,
-            StorageConfig,
+            AppConfig, CiConfig, GitLabTokenSource, InlineConfig, LlmConfig, PrivacyConfig,
+            PublishConfig, ReviewConfig, StorageConfig,
         },
         gitlab::{
             inline::InlinePublishReport,
@@ -1252,6 +1252,7 @@ mod tests {
     fn config(path: PathBuf) -> AppConfig {
         AppConfig {
             gitlab_token: Some("token".to_string()),
+            gitlab_token_source: Some(GitLabTokenSource::GitLabToken),
             gitlab_base_url: None,
             llm: LlmConfig {
                 provider: "gemini_cli".to_string(),
@@ -1295,6 +1296,10 @@ mod tests {
                 store_raw_diff: false,
                 store_raw_llm: false,
                 verify_max_previous_findings: 30,
+            },
+            ci: CiConfig {
+                allow_ci_job_token: false,
+                history_required: false,
             },
         }
     }
