@@ -1298,6 +1298,8 @@ body
             suggested_fix: Some("Use a timeout.".to_string()),
             effort: Effort::Quick,
             actionable: true,
+            evidence_status: None,
+            evidence_reason: None,
         }
     }
 

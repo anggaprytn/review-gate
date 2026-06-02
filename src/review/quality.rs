@@ -617,6 +617,8 @@ mod tests {
             suggested_fix: suggested_fix.map(str::to_string),
             effort: Effort::Moderate,
             actionable: true,
+            evidence_status: None,
+            evidence_reason: None,
         }
     }
 }

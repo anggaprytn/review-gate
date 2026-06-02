@@ -1,6 +1,7 @@
 pub mod anchors;
 pub mod comparison;
 pub mod engine;
+pub mod evidence;
 pub mod formatter;
 pub mod inline;
 pub mod large;

@@ -400,6 +400,8 @@ fn finding() -> ReviewFinding {
         suggested_fix: Some("Add a request timeout.".to_string()),
         effort: Effort::Quick,
         actionable: true,
+        evidence_status: None,
+        evidence_reason: None,
     }
 }
 

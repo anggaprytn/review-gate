@@ -481,7 +481,7 @@ fn format_privacy_note(note: Option<&str>, mode: MarkdownRenderMode) -> String {
 
     let items = useful_note_items(note.unwrap_or_default(), 8, is_generic_privacy_item);
     if items.is_empty() {
-        return "No obvious new PII or secret exposure detected in reviewed chunks.".to_string();
+        return "No obvious new PII or secret exposure detected.".to_string();
     }
 
     let mut positives = Vec::new();
@@ -497,7 +497,7 @@ fn format_privacy_note(note: Option<&str>, mode: MarkdownRenderMode) -> String {
     }
 
     let mut output = if risks.is_empty() {
-        "No obvious new PII or secret exposure detected in reviewed chunks.".to_string()
+        "No obvious new PII or secret exposure detected.".to_string()
     } else {
         "Potential privacy risks were detected in reviewed chunks.".to_string()
     };
@@ -747,6 +747,8 @@ mod tests {
                     suggested_fix: Some("Use a request-scoped timeout.".to_string()),
                     effort: Effort::Quick,
                     actionable: true,
+                    evidence_status: None,
+                    evidence_reason: None,
                 }],
                 test_coverage_note: Some("No test covers timeout behavior.".to_string()),
                 privacy_note: Some("No obvious exposure detected.".to_string()),
@@ -787,6 +789,8 @@ mod tests {
                     suggested_fix: None,
                     effort: Effort::Quick,
                     actionable: true,
+                    evidence_status: None,
+                    evidence_reason: None,
                 }],
                 test_coverage_note: None,
                 privacy_note: None,
@@ -904,10 +908,7 @@ mod tests {
             &ReviewAnalysis {
                 summary: "summary".to_string(),
                 findings: vec![],
-                test_coverage_note: Some(
-                    "No tests are visible in this chunk. Device integrity flows need tests. Device integrity flows need tests. authTokenStorage has unit tests. It cannot be assessed."
-                        .to_string(),
-                ),
+                test_coverage_note: Some("No tests are visible in this chunk.".to_string()),
                 privacy_note: None,
                 overall_risk: OverallRisk::Low,
             },
@@ -999,7 +1000,7 @@ mod tests {
 
         assert_eq!(
             markdown
-                .matches("No obvious new PII or secret exposure detected in reviewed chunks.")
+                .matches("No obvious new PII or secret exposure detected.")
                 .count(),
             1
         );
@@ -1026,11 +1027,10 @@ mod tests {
         );
         let section = markdown_section(&markdown, "## Privacy");
 
-        assert!(section
-            .starts_with("No obvious new PII or secret exposure detected in reviewed chunks."));
+        assert!(section.starts_with("No obvious new PII or secret exposure detected."));
         assert_eq!(
             section
-                .matches("No obvious new PII or secret exposure detected in reviewed chunks.")
+                .matches("No obvious new PII or secret exposure detected.")
                 .count(),
             1
         );
@@ -1102,6 +1102,8 @@ mod tests {
             suggested_fix: None,
             effort: Effort::Moderate,
             actionable: true,
+            evidence_status: None,
+            evidence_reason: None,
         }
     }
 

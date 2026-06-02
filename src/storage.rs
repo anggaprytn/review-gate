@@ -1263,6 +1263,7 @@ mod tests {
         },
         review::{
             engine::ReviewPreview,
+            evidence::validate_review_analysis_evidence,
             inline::{InlinePublishResult, InlinePublishStatus},
             types::{
                 Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, RiskCode,
@@ -1339,6 +1340,54 @@ mod tests {
         assert_eq!(persisted.finding_ids.len(), 2);
         assert_eq!(count(&storage.conn, "review_runs"), 1);
         assert_eq!(count(&storage.conn, "review_findings"), 2);
+    }
+
+    #[test]
+    fn sqlite_storage_persists_post_validation_severity() {
+        let path = temp_db_path("sqlite_storage_persists_post_validation_severity");
+        let mut storage = Storage::open_path(&path).unwrap();
+        let context = context();
+        let analysis = validate_review_analysis_evidence(
+            ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![ReviewFinding {
+                    severity: Severity::High,
+                    category: ReviewCategory::Reliability,
+                    risk_code: Some(RiskCode::MissingTimeout),
+                    anchor_id: Some("A0001".to_string()),
+                    file_path: Some("src/paymentClient.ts".to_string()),
+                    line: Some(10),
+                    title: "HTTP request has no timeout".to_string(),
+                    body: "The request can hang indefinitely.".to_string(),
+                    suggested_fix: Some("Add a timeout.".to_string()),
+                    effort: Effort::Quick,
+                    actionable: true,
+                    evidence_status: None,
+                    evidence_reason: None,
+                }],
+                test_coverage_note: None,
+                privacy_note: None,
+                overall_risk: OverallRisk::High,
+            },
+            &context.anchored_diff,
+        );
+        let preview = ReviewPreview {
+            markdown: "# ReviewGate AI Code Review".to_string(),
+            metadata: crate::llm::types::LlmRunMetadata::default(),
+            prompt_token_estimate: 10,
+            parsed: true,
+            analysis: Some(analysis),
+        };
+
+        storage
+            .persist_review_run(&context, &config(path), &preview)
+            .unwrap();
+
+        let severity: String = storage
+            .conn
+            .query_row("SELECT severity FROM review_findings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(severity, "MEDIUM");
     }
 
     #[test]
@@ -2007,6 +2056,8 @@ mod tests {
                         suggested_fix: Some("fix".to_string()),
                         effort: Effort::Quick,
                         actionable: true,
+                        evidence_status: None,
+                        evidence_reason: None,
                     },
                     ReviewFinding {
                         severity: Severity::Note,
@@ -2020,6 +2071,8 @@ mod tests {
                         suggested_fix: None,
                         effort: Effort::Quick,
                         actionable: false,
+                        evidence_status: None,
+                        evidence_reason: None,
                     },
                 ],
                 test_coverage_note: None,

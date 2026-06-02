@@ -549,6 +549,23 @@ mod tests {
     }
 
     #[test]
+    fn fix_prompt_uses_post_validation_stored_severity() {
+        let (storage, mr) = storage_with_single_run(vec![
+            finding("HIGH", "Validated high", true),
+            finding("MEDIUM", "Downgraded timeout", true),
+        ]);
+        let options = FixPromptOptions {
+            min_severity: FixPromptSeverity::High,
+            ..default_options()
+        };
+
+        let generated = build_fix_prompt(&storage, &mr, options).unwrap();
+
+        assert_eq!(titles(&generated), vec!["Validated high"]);
+        assert!(!generated.prompt.contains("Downgraded timeout"));
+    }
+
+    #[test]
     fn actionable_filtering_excludes_non_actionable_findings() {
         let (storage, mr) = storage_with_single_run(vec![
             finding("HIGH", "Actionable", true),

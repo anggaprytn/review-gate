@@ -7,6 +7,7 @@ use crate::{
     review::{
         anchors::{AnchorLineKind, AnchoredDiffContext, ReviewLineAnchor},
         engine::{estimate_prompt_tokens, ReviewPreview},
+        evidence::validate_review_analysis_evidence,
         formatter::{format_review_markdown_for_mode, MarkdownRenderMode},
         parser::parse_review_analysis,
         quality::normalize_review_analysis,
@@ -64,6 +65,13 @@ pub struct LargeReviewReport {
     pub reviewed_files: usize,
     pub skipped_files: usize,
     pub skipped_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LargeReviewRunContext<'a> {
+    pub metadata: &'a MergeRequestMetadata,
+    pub selection: &'a LargeReviewSelection,
+    pub anchors: &'a AnchoredDiffContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,9 +375,8 @@ Anchored sanitized diff:
 }
 
 pub async fn review_large_chunks_with_llm<F, Fut>(
-    metadata: &MergeRequestMetadata,
+    context: LargeReviewRunContext<'_>,
     chunks: &[ReviewChunk],
-    selection: &LargeReviewSelection,
     mode: MarkdownRenderMode,
     show_prompt: bool,
     mut progress: impl FnMut(&ReviewChunk, usize),
@@ -387,7 +394,7 @@ where
 
     for chunk in chunks {
         progress(chunk, total_chunks);
-        let prompt = build_large_chunk_prompt(metadata, chunk, total_chunks);
+        let prompt = build_large_chunk_prompt(context.metadata, chunk, total_chunks);
         prompt_token_estimate += estimate_prompt_tokens(&prompt);
         if show_prompt {
             println!("ReviewGate sanitized chunk prompt {}", chunk.index);
@@ -401,7 +408,10 @@ where
             Ok(response) => {
                 merge_metadata(&mut metadata_total, &response.metadata);
                 match parse_review_analysis(&response.text) {
-                    Ok(analysis) => analyses.push(normalize_review_analysis(analysis)),
+                    Ok(analysis) => analyses.push(validate_review_analysis_evidence(
+                        normalize_review_analysis(analysis),
+                        context.anchors,
+                    )),
                     Err(err) => failures.push(ChunkFailure {
                         chunk_index: chunk.index,
                         message: err.to_string(),
@@ -428,11 +438,14 @@ where
         total_chunks,
         reviewed_chunks: analyses.len(),
         failed_chunks: failures.len(),
-        reviewed_files: selection.files.len(),
-        skipped_files: selection.skipped_files,
-        skipped_reasons: selection.skipped_reasons.clone(),
+        reviewed_files: context.selection.files.len(),
+        skipped_files: context.selection.skipped_files,
+        skipped_reasons: context.selection.skipped_reasons.clone(),
     };
-    let analysis = normalize_review_analysis(merge_chunk_analyses(analyses, &report));
+    let analysis = validate_review_analysis_evidence(
+        normalize_review_analysis(merge_chunk_analyses(analyses, &report)),
+        context.anchors,
+    );
     let markdown = format_large_review_markdown(&analysis, &report, mode);
 
     Ok(ReviewPreview {
@@ -846,9 +859,7 @@ fn compact_privacy_notes(notes: Vec<String>) -> Option<String> {
         .filter(|sentence| is_no_secret_or_pii_sentence(sentence))
         .count();
     if no_secret_count > 1 || no_secret_count == sentences.len() {
-        return Some(
-            "No obvious new PII or secret exposure detected in reviewed chunks.".to_string(),
-        );
+        return Some("No obvious new PII or secret exposure detected.".to_string());
     }
     Some(sentences.join(" "))
 }
@@ -1163,7 +1174,7 @@ mod tests {
 
         assert_eq!(
             merged.privacy_note.as_deref(),
-            Some("No obvious new PII or secret exposure detected in reviewed chunks.")
+            Some("No obvious new PII or secret exposure detected.")
         );
     }
 
@@ -1220,11 +1231,16 @@ mod tests {
             1,
             vec![planned("src/a.rs", FileRiskLevel::High, 20, None)],
         )];
+        let anchors = AnchoredDiffContext::default();
+        let metadata = metadata();
 
         let err = review_large_chunks_with_llm(
-            &metadata(),
+            LargeReviewRunContext {
+                metadata: &metadata,
+                selection: &selection,
+                anchors: &anchors,
+            },
             &chunks,
-            &selection,
             MarkdownRenderMode::Preview,
             false,
             |_, _| {},
@@ -1242,6 +1258,66 @@ mod tests {
             err,
             ReviewGateError::LargeReviewAllChunksFailed(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn large_review_merged_findings_are_validated_after_merge() {
+        let selection = LargeReviewSelection {
+            files: vec![planned("src/a.rs", FileRiskLevel::High, 20, None)],
+            skipped_files: 0,
+            skipped_reasons: Vec::new(),
+        };
+        let chunks = vec![chunk(
+            1,
+            vec![planned("src/a.rs", FileRiskLevel::High, 20, None)],
+        )];
+        let mut builder = AnchorBuilder::new();
+        builder.add_diff(&diff("src/a.rs"));
+        let anchors = builder.finish(false);
+        let metadata = metadata();
+
+        let preview = review_large_chunks_with_llm(
+            LargeReviewRunContext {
+                metadata: &metadata,
+                selection: &selection,
+                anchors: &anchors,
+            },
+            &chunks,
+            MarkdownRenderMode::Preview,
+            false,
+            |_, _| {},
+            |_| async {
+                Ok(LlmReviewResponse {
+                    text: r#"{
+                        "summary": "Route risk.",
+                        "overall_risk": "high",
+                        "findings": [{
+                            "severity": "HIGH",
+                            "category": "security",
+                            "risk_code": "auth_bypass",
+                            "anchor_id": "A0001",
+                            "file_path": "src/a.rs",
+                            "line": 1,
+                            "title": "Route lacks authorization",
+                            "body": "The changed route returns data without authorization.",
+                            "suggested_fix": "Add an authorization guard.",
+                            "effort": "quick",
+                            "actionable": true
+                        }],
+                        "test_coverage_note": null,
+                        "privacy_note": null
+                    }"#
+                    .to_string(),
+                    metadata: LlmRunMetadata::default(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        let analysis = preview.analysis.unwrap();
+        assert_eq!(analysis.findings[0].severity, Severity::Medium);
+        assert!(preview.markdown.contains("## 🟡 Medium"));
     }
 
     #[test]
@@ -1426,6 +1502,8 @@ mod tests {
             suggested_fix: suggested_fix.map(str::to_string),
             effort: Effort::Quick,
             actionable: true,
+            evidence_status: None,
+            evidence_reason: None,
         }
     }
 

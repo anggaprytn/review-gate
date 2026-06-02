@@ -37,13 +37,14 @@ use reviewgate::review::comparison::{
 use reviewgate::review::engine::{
     build_sanitized_review_prompt, review_prompt_with_llm_for_mode, ReviewPreview,
 };
-use reviewgate::review::formatter::MarkdownRenderMode;
+use reviewgate::review::evidence::validate_review_analysis_evidence;
+use reviewgate::review::formatter::{format_review_markdown_for_mode, MarkdownRenderMode};
 use reviewgate::review::inline::{
     format_inline_dry_run_report, resolve_inline_candidates_with_anchors,
 };
 use reviewgate::review::large::{
     build_large_review_plan, review_large_chunks_with_llm, selected_diffs_in_order,
-    validate_large_inline_mapping, LargeReviewOptions,
+    validate_large_inline_mapping, LargeReviewOptions, LargeReviewRunContext,
 };
 use reviewgate::review::mode::{
     build_auto_review_plan, decide_auto_review_mode, AutoLargeOptions, AutoReviewDecision,
@@ -426,9 +427,12 @@ async fn run_large_review(
         MarkdownRenderMode::Preview
     };
     let preview = review_large_chunks_with_llm(
-        &context.metadata,
+        LargeReviewRunContext {
+            metadata: &context.metadata,
+            selection: &large_plan.selection,
+            anchors: &context.anchored_diff,
+        },
         &large_plan.chunks,
-        &large_plan.selection,
         render_mode,
         args.show_prompt,
         |chunk, total| {
@@ -739,7 +743,25 @@ async fn generate_preview(
     })
     .await?;
 
-    Ok(preview)
+    Ok(validate_preview_evidence(
+        preview,
+        &context.anchored_diff,
+        mode,
+    ))
+}
+
+fn validate_preview_evidence(
+    mut preview: ReviewPreview,
+    anchors: &reviewgate::review::anchors::AnchoredDiffContext,
+    mode: MarkdownRenderMode,
+) -> ReviewPreview {
+    let Some(analysis) = preview.analysis.take() else {
+        return preview;
+    };
+    let analysis = validate_review_analysis_evidence(analysis, anchors);
+    preview.markdown = format_review_markdown_for_mode(&analysis, mode);
+    preview.analysis = Some(analysis);
+    preview
 }
 
 fn print_mr_summary(context: &MergeRequestContext) {

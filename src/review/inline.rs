@@ -694,8 +694,12 @@ mod tests {
         gitlab::types::{DiffRefs, MergeRequestDiff},
         review::{
             anchors::AnchorBuilder,
+            evidence::validate_review_analysis_evidence,
             quality::normalize_review_analysis,
-            types::{Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, Severity},
+            types::{
+                Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, RiskCode,
+                Severity,
+            },
         },
     };
 
@@ -1047,6 +1051,37 @@ mod tests {
     }
 
     #[test]
+    fn inline_candidates_use_post_validation_severity() {
+        let diff = diff("src/a.rs", "@@ -0,0 +1 @@\n+const enabled = true");
+        let anchors = anchored_context(&diff);
+        let mut timeout = finding(
+            Severity::High,
+            Effort::Quick,
+            true,
+            Some("src/a.rs"),
+            Some(1),
+        );
+        timeout.risk_code = Some(RiskCode::MissingTimeout);
+        timeout.anchor_id = Some("A0001".to_string());
+        timeout.title = "HTTP request has no timeout".to_string();
+        timeout.body = "The request can hang indefinitely.".to_string();
+        timeout.suggested_fix = Some("Add a timeout.".to_string());
+        let analysis = validate_review_analysis_evidence(analysis(vec![timeout]), &anchors);
+
+        let candidate = super::resolve_inline_candidates_with_anchors(
+            &analysis,
+            &[diff],
+            Some(&anchors),
+            Some(&diff_refs()),
+            &inline_config(8, 5),
+        )
+        .remove(0);
+
+        assert_eq!(analysis.findings[0].severity, Severity::Medium);
+        assert_eq!(candidate.severity, Severity::Medium);
+    }
+
+    #[test]
     fn max_high_limit_enforced() {
         let analysis = analysis(vec![
             finding(
@@ -1257,6 +1292,8 @@ mod tests {
             suggested_fix: None,
             effort,
             actionable,
+            evidence_status: None,
+            evidence_reason: None,
         }
     }
 

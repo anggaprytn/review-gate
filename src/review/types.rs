@@ -28,6 +28,10 @@ pub struct ReviewFinding {
     pub effort: Effort,
     #[serde(default)]
     pub actionable: bool,
+    #[serde(default)]
+    pub evidence_status: Option<EvidenceValidationStatus>,
+    #[serde(default)]
+    pub evidence_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -46,6 +50,16 @@ pub enum Severity {
     Medium,
     Low,
     Note,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EvidenceValidationStatus {
+    Validated,
+    WeakEvidence,
+    StaleContext,
+    NotInDiff,
+    PositiveChange,
+    NeedsManualConfirmation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -276,6 +290,19 @@ impl RiskCode {
     }
 }
 
+impl EvidenceValidationStatus {
+    pub fn display_lower(self) -> &'static str {
+        match self {
+            EvidenceValidationStatus::Validated => "validated",
+            EvidenceValidationStatus::WeakEvidence => "weak_evidence",
+            EvidenceValidationStatus::StaleContext => "stale_context",
+            EvidenceValidationStatus::NotInDiff => "not_in_diff",
+            EvidenceValidationStatus::PositiveChange => "positive_change",
+            EvidenceValidationStatus::NeedsManualConfirmation => "needs_manual_confirmation",
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for Severity {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -381,6 +408,26 @@ impl<'de> Deserialize<'de> for RiskCode {
     }
 }
 
+impl<'de> Deserialize<'de> for EvidenceValidationStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match normalize_enum_value(&value).as_str() {
+            "validated" => Ok(EvidenceValidationStatus::Validated),
+            "weak_evidence" => Ok(EvidenceValidationStatus::WeakEvidence),
+            "stale_context" => Ok(EvidenceValidationStatus::StaleContext),
+            "not_in_diff" => Ok(EvidenceValidationStatus::NotInDiff),
+            "positive_change" => Ok(EvidenceValidationStatus::PositiveChange),
+            "needs_manual_confirmation" => Ok(EvidenceValidationStatus::NeedsManualConfirmation),
+            _ => Err(de::Error::custom(format!(
+                "unknown evidence validation status '{value}'"
+            ))),
+        }
+    }
+}
+
 impl fmt::Display for ReviewCategory {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.display_lower())
@@ -393,13 +440,22 @@ impl fmt::Display for RiskCode {
     }
 }
 
+impl fmt::Display for EvidenceValidationStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.display_lower())
+    }
+}
+
 fn normalize_enum_value(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace([' ', '-'], "_")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Effort, OverallRisk, ReviewAnalysis, ReviewCategory, RiskCode, Severity};
+    use super::{
+        Effort, EvidenceValidationStatus, OverallRisk, ReviewAnalysis, ReviewCategory, RiskCode,
+        Severity,
+    };
 
     #[test]
     fn parses_review_json_into_typed_structs_with_flexible_enums() {
@@ -435,6 +491,7 @@ mod tests {
         assert_eq!(review.findings[0].risk_code, Some(RiskCode::MissingTimeout));
         assert_eq!(review.findings[0].anchor_id.as_deref(), Some("A0001"));
         assert_eq!(review.findings[0].effort, Effort::Quick);
+        assert_eq!(review.findings[0].evidence_status, None);
     }
 
     #[test]
@@ -493,6 +550,13 @@ mod tests {
             let parsed: RiskCode = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, RiskCode::MissingTimeout);
         }
+    }
+
+    #[test]
+    fn parses_evidence_validation_status_variants_flexibly() {
+        let parsed: EvidenceValidationStatus = serde_json::from_str(r#""weak-evidence""#).unwrap();
+
+        assert_eq!(parsed, EvidenceValidationStatus::WeakEvidence);
     }
 
     #[test]

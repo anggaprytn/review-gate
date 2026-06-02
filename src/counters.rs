@@ -268,8 +268,14 @@ mod tests {
         format_verification_counters_terminal,
     };
     use crate::{
-        review::types::{
-            Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, Severity,
+        gitlab::types::MergeRequestDiff,
+        review::{
+            anchors::AnchorBuilder,
+            evidence::validate_review_analysis_evidence,
+            types::{
+                Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, RiskCode,
+                Severity,
+            },
         },
         storage::{StoredPreviousFinding, StoredReviewFinding},
         verify::{VerificationResult, VerificationStatus},
@@ -318,6 +324,38 @@ mod tests {
         assert_eq!(counters.high, 1);
         assert_eq!(counters.note, 1);
         assert_eq!(counters.low, 1);
+    }
+
+    #[test]
+    fn finding_counters_use_post_validation_severity() {
+        let mut timeout = finding(Severity::High, true);
+        timeout.risk_code = Some(RiskCode::MissingTimeout);
+        timeout.anchor_id = Some("A0001".to_string());
+        timeout.title = "HTTP request has no timeout".to_string();
+        timeout.body = "The request can hang indefinitely.".to_string();
+        timeout.suggested_fix = Some("Add a timeout.".to_string());
+        let mut builder = AnchorBuilder::new();
+        builder.add_diff(&diff(
+            "src/example.rs",
+            "@@ -41,0 +42 @@\n+const enabled = true",
+        ));
+        let anchors = builder.finish(false);
+        let analysis = validate_review_analysis_evidence(
+            ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![timeout],
+                test_coverage_note: None,
+                privacy_note: None,
+                overall_risk: OverallRisk::High,
+            },
+            &anchors,
+        );
+
+        let counters = count_findings_from_analysis(&analysis);
+
+        assert_eq!(counters.high, 0);
+        assert_eq!(counters.medium, 1);
+        assert_eq!(counters.open_priority, 1);
     }
 
     #[test]
@@ -466,6 +504,8 @@ mod tests {
             suggested_fix: None,
             effort: Effort::Quick,
             actionable,
+            evidence_status: None,
+            evidence_reason: None,
         }
     }
 
@@ -483,6 +523,20 @@ mod tests {
             body: "body".to_string(),
             suggested_fix: None,
             actionable,
+        }
+    }
+
+    fn diff(path: &str, body: &str) -> MergeRequestDiff {
+        MergeRequestDiff {
+            old_path: path.to_string(),
+            new_path: path.to_string(),
+            diff: body.to_string(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            generated_file: None,
+            collapsed: None,
+            too_large: None,
         }
     }
 
