@@ -1,5 +1,5 @@
 use crate::{
-    review::types::{ReviewAnalysis, ReviewFinding, Severity},
+    review::types::{EvidenceValidationStatus, ReviewAnalysis, ReviewFinding, Severity},
     storage::StoredReviewFinding,
     verify::{VerificationOutcome, VerificationResult, VerificationStatus},
 };
@@ -33,6 +33,9 @@ pub fn count_findings_from_analysis(analysis: &ReviewAnalysis) -> FindingCounter
 pub fn count_review_findings(findings: &[ReviewFinding]) -> FindingCounters {
     let mut counters = FindingCounters::default();
     for finding in findings {
+        if suppressed_current_file_invalidated_finding(finding) {
+            continue;
+        }
         counters.total += 1;
         if finding.actionable {
             counters.actionable += 1;
@@ -46,6 +49,22 @@ pub fn count_review_findings(findings: &[ReviewFinding]) -> FindingCounters {
         increment_severity(&mut counters, finding.severity);
     }
     counters
+}
+
+fn suppressed_current_file_invalidated_finding(finding: &ReviewFinding) -> bool {
+    !finding.actionable
+        && matches!(
+            finding.evidence_status,
+            Some(
+                EvidenceValidationStatus::StaleContext
+                    | EvidenceValidationStatus::WeakEvidence
+                    | EvidenceValidationStatus::NeedsManualConfirmation
+            )
+        )
+        && finding
+            .evidence_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("current-file validation:"))
 }
 
 pub fn count_stored_findings(findings: &[StoredReviewFinding]) -> FindingCounters {

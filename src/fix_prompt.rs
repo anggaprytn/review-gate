@@ -612,6 +612,27 @@ mod tests {
     }
 
     #[test]
+    fn fix_prompt_excludes_invalidated_await_non_async_findings() {
+        let (storage, mr) = storage_with_single_run(vec![
+            finding("HIGH", "Actionable", true),
+            finding(
+                "NOTE",
+                "Syntax Error: await used in non-async function",
+                false,
+            ),
+        ]);
+        let options = FixPromptOptions {
+            include_notes: true,
+            ..default_options()
+        };
+
+        let generated = build_fix_prompt(&storage, &mr, options).unwrap();
+
+        assert_eq!(titles(&generated), vec!["Actionable"]);
+        assert!(!generated.prompt.contains("await used in non-async"));
+    }
+
+    #[test]
     fn low_and_note_are_excluded_by_default() {
         let (storage, mr) = storage_with_single_run(vec![
             finding("HIGH", "High", true),

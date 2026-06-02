@@ -11,7 +11,7 @@ use crate::{
 };
 use regex::Regex;
 use serde::Deserialize;
-use std::{collections::HashMap, future::Future};
+use std::{collections::HashMap, future::Future, sync::LazyLock};
 
 const SPECULATIVE_PHRASES: &[&str] = &[
     "out of scope",
@@ -40,6 +40,39 @@ const BUILD_BREAK_CLAIM_PHRASES: &[&str] = &[
     "malformed code",
     "merge conflict",
 ];
+
+const AWAIT_CONTEXT_SCAN_WINDOW: usize = 20;
+
+static AWAIT_EXPRESSION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bawait\b").expect("valid await expression regex"));
+static ASYNC_FUNCTION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\basync\s+function\b").expect("valid async function regex"));
+static ASYNC_ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:const|let|var)\s+[$A-Za-z_][$A-Za-z0-9_]*\s*=\s*async\b")
+        .expect("valid async assignment regex")
+});
+static ASYNC_ARROW_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\basync\s*\([^)]*\)\s*=>").expect("valid async arrow regex"));
+static ASYNC_METHOD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\basync\s*[$A-Za-z_][$A-Za-z0-9_]*\s*\(").expect("valid async method regex")
+});
+static CALL_ASYNC_CALLBACK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b[$A-Za-z_][$A-Za-z0-9_]*\s*\(\s*async\b").expect("valid async callback regex")
+});
+static NON_ASYNC_FUNCTION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\bfunction\s+[$A-Za-z_][$A-Za-z0-9_]*\s*\(")
+        .expect("valid non-async function regex")
+});
+static NON_ASYNC_ASSIGNMENT_ARROW_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?:const|let|var)\s+[$A-Za-z_][$A-Za-z0-9_]*\s*=\s*(?:\([^)]*\)|[$A-Za-z_][$A-Za-z0-9_]*)\s*=>",
+    )
+    .expect("valid non-async assignment arrow regex")
+});
+static NON_ASYNC_CALLBACK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b[$A-Za-z_][$A-Za-z0-9_]*\s*\(\s*(?:\([^)]*\)|[$A-Za-z_][$A-Za-z0-9_]*)\s*=>")
+        .expect("valid non-async callback regex")
+});
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CurrentFileValidationOptions {
@@ -263,8 +296,49 @@ fn deterministic_validation(
     if build_break_claim(&text) {
         return Some(validate_build_break_claim(&snippet_lower));
     }
+    if await_non_async_claim(&text) {
+        return Some(validate_await_non_async_claim(
+            content,
+            finding.line,
+            finding.severity,
+        ));
+    }
 
     None
+}
+
+fn validate_await_non_async_claim(
+    snippet: &str,
+    finding_line: Option<u32>,
+    original_severity: Severity,
+) -> CurrentFileResult {
+    let snippet_lines = parse_validation_snippet_lines(snippet);
+    let Some(await_index) = find_await_line_index(&snippet_lines, finding_line) else {
+        return CurrentFileResult::needs_manual(
+            Severity::Low,
+            "await/non-async claim lacks an await expression in the current file snippet",
+        );
+    };
+
+    match nearest_await_function_context(&snippet_lines, await_index) {
+        AwaitFunctionContext::Async => CurrentFileResult {
+            verdict: CurrentFileVerdict::Stale,
+            final_severity: Severity::Note,
+            actionable: false,
+            corrected_title: None,
+            corrected_body: None,
+            corrected_suggested_fix: None,
+            reason: "nearest enclosing function/callback for await is marked async".to_string(),
+        },
+        AwaitFunctionContext::NonAsync => CurrentFileResult::valid(
+            original_severity,
+            "current file snippet shows await inside a non-async function/callback",
+        ),
+        AwaitFunctionContext::Unknown => CurrentFileResult::needs_manual(
+            Severity::Low,
+            "current file snippet does not show the enclosing async/non-async function context",
+        ),
+    }
 }
 
 fn validate_variable_scope_claim(finding: &ReviewFinding, content: &str) -> CurrentFileResult {
@@ -757,6 +831,125 @@ fn finding_text(finding: &ReviewFinding) -> String {
     )
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnippetLine {
+    number: Option<u32>,
+    code: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AwaitFunctionContext {
+    Async,
+    NonAsync,
+    Unknown,
+}
+
+fn parse_validation_snippet_lines(snippet: &str) -> Vec<SnippetLine> {
+    let parsed = snippet
+        .lines()
+        .filter_map(|line| {
+            let (number, code) = line.split_once('|')?;
+            let number = number.trim().parse::<u32>().ok();
+            Some(SnippetLine {
+                number,
+                code: code.trim_start().to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if !parsed.is_empty() {
+        return parsed;
+    }
+
+    snippet
+        .lines()
+        .enumerate()
+        .map(|(index, code)| SnippetLine {
+            number: Some(index as u32 + 1),
+            code: code.to_string(),
+        })
+        .collect()
+}
+
+fn find_await_line_index(lines: &[SnippetLine], finding_line: Option<u32>) -> Option<usize> {
+    if let Some(finding_line) = finding_line {
+        if let Some(index) = lines
+            .iter()
+            .position(|line| line.number == Some(finding_line) && await_expression(&line.code))
+        {
+            return Some(index);
+        }
+    }
+
+    lines.iter().position(|line| await_expression(&line.code))
+}
+
+fn nearest_await_function_context(
+    lines: &[SnippetLine],
+    await_index: usize,
+) -> AwaitFunctionContext {
+    let start = await_index.saturating_sub(AWAIT_CONTEXT_SCAN_WINDOW);
+    for line in lines[start..=await_index].iter().rev() {
+        let code = line.code.trim();
+        if code.is_empty() {
+            continue;
+        }
+        if clear_previous_block_boundary(code) {
+            break;
+        }
+        if async_function_or_callback_opener(code) {
+            return AwaitFunctionContext::Async;
+        }
+        if non_async_function_or_callback_opener(code) {
+            return AwaitFunctionContext::NonAsync;
+        }
+    }
+
+    AwaitFunctionContext::Unknown
+}
+
+fn await_non_async_claim(text: &str) -> bool {
+    let normalized = text.replace(['-', '_'], " ");
+    (normalized.contains("await used in non async")
+        || normalized.contains("await used in a non async")
+        || normalized.contains("await in non async")
+        || (normalized.contains("await call") && normalized.contains("not async"))
+        || (normalized.contains("syntax error") && normalized.contains("await")))
+        && normalized.contains("await")
+}
+
+fn await_expression(code: &str) -> bool {
+    AWAIT_EXPRESSION_RE.is_match(code)
+}
+
+fn async_function_or_callback_opener(code: &str) -> bool {
+    let compact = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = compact.to_ascii_lowercase();
+    lower.contains("usecallback(async")
+        || lower.contains("usememo(async")
+        || ASYNC_FUNCTION_RE.is_match(&lower)
+        || ASYNC_ASSIGNMENT_RE.is_match(&compact)
+        || ASYNC_ARROW_RE.is_match(&lower)
+        || ASYNC_METHOD_RE.is_match(&compact)
+        || CALL_ASYNC_CALLBACK_RE.is_match(&compact)
+}
+
+fn non_async_function_or_callback_opener(code: &str) -> bool {
+    if async_function_or_callback_opener(code) {
+        return false;
+    }
+
+    let compact = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    NON_ASYNC_FUNCTION_RE.is_match(&compact)
+        || NON_ASYNC_ASSIGNMENT_ARROW_RE.is_match(&compact)
+        || NON_ASYNC_CALLBACK_RE.is_match(&compact)
+}
+
+fn clear_previous_block_boundary(code: &str) -> bool {
+    let trimmed = code.trim_start();
+    trimmed.starts_with('}') || trimmed.starts_with(");") || trimmed.starts_with("];")
+}
+
 fn speculative_signal(text: &str) -> bool {
     let padded = format!(" {text} ");
     SPECULATIVE_PHRASES
@@ -827,6 +1020,7 @@ mod tests {
         counters::count_findings_from_analysis,
         review::{
             anchors::AnchoredDiffContext,
+            formatter::{format_review_markdown_for_mode_with_emoji, MarkdownRenderMode},
             inline::{resolve_inline_candidates, InlineEligibilityReason},
             types::{Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, Severity},
         },
@@ -1014,6 +1208,221 @@ if (target.startsWith(root)) {
         .await;
 
         assert_eq!(analysis.findings[0].severity, Severity::High);
+    }
+
+    #[tokio::test]
+    async fn await_non_async_claim_invalidated_for_async_use_callback() {
+        let analysis = validate(vec![await_finding()])
+            .with_file(
+                "src/a.ts",
+                r#"
+const getToken = useCallback(async () => {
+  const token = await messaging().getToken()
+  return token
+})
+"#,
+            )
+            .run()
+            .await;
+
+        let finding = &analysis.findings[0];
+        assert_eq!(finding.severity, Severity::Note);
+        assert!(!finding.actionable);
+        assert_eq!(
+            finding.evidence_status,
+            Some(crate::review::types::EvidenceValidationStatus::StaleContext)
+        );
+        assert!(finding
+            .evidence_reason
+            .as_deref()
+            .unwrap()
+            .contains("nearest enclosing function/callback"));
+    }
+
+    #[tokio::test]
+    async fn await_non_async_claim_invalidated_for_async_arrow_assignment() {
+        let analysis = validate(vec![await_finding()])
+            .with_file(
+                "src/a.ts",
+                r#"
+const getToken = async () => {
+  const token = await messaging().getToken()
+  return token
+}
+"#,
+            )
+            .run()
+            .await;
+
+        assert_eq!(analysis.findings[0].severity, Severity::Note);
+        assert!(!analysis.findings[0].actionable);
+    }
+
+    #[tokio::test]
+    async fn await_non_async_claim_invalidated_for_async_function_declaration() {
+        let analysis = validate(vec![await_finding()])
+            .with_file(
+                "src/a.ts",
+                r#"
+async function getToken() {
+  const token = await messaging().getToken()
+  return token
+}
+"#,
+            )
+            .run()
+            .await;
+
+        assert_eq!(analysis.findings[0].severity, Severity::Note);
+        assert!(!analysis.findings[0].actionable);
+    }
+
+    #[tokio::test]
+    async fn await_non_async_claim_kept_for_non_async_use_callback() {
+        let analysis = validate(vec![await_finding()])
+            .with_file(
+                "src/a.ts",
+                r#"
+const getToken = useCallback(() => {
+  const token = await messaging().getToken()
+  return token
+})
+"#,
+            )
+            .run()
+            .await;
+
+        assert_eq!(analysis.findings[0].severity, Severity::High);
+        assert!(analysis.findings[0].actionable);
+    }
+
+    #[tokio::test]
+    async fn await_non_async_claim_kept_for_non_async_function_declaration() {
+        let analysis = validate(vec![await_finding()])
+            .with_file(
+                "src/a.ts",
+                r#"
+function getToken() {
+  const token = await messaging().getToken()
+  return token
+}
+"#,
+            )
+            .run()
+            .await;
+
+        assert_eq!(analysis.findings[0].severity, Severity::High);
+        assert!(analysis.findings[0].actionable);
+    }
+
+    #[tokio::test]
+    async fn await_non_async_claim_kept_for_non_async_arrow_assignment() {
+        let analysis = validate(vec![await_finding()])
+            .with_file(
+                "src/a.ts",
+                r#"
+const getToken = () => {
+  const token = await messaging().getToken()
+  return token
+}
+"#,
+            )
+            .run()
+            .await;
+
+        assert_eq!(analysis.findings[0].severity, Severity::High);
+        assert!(analysis.findings[0].actionable);
+    }
+
+    #[tokio::test]
+    async fn await_non_async_claim_invalidated_for_nested_async_function_in_effect() {
+        let analysis = validate(vec![await_finding()])
+            .with_file(
+                "src/a.ts",
+                r#"
+useEffect(() => {
+  async function load() {
+    await foo()
+  }
+  load()
+}, [])
+"#,
+            )
+            .run()
+            .await;
+
+        assert_eq!(analysis.findings[0].severity, Severity::Note);
+        assert!(!analysis.findings[0].actionable);
+    }
+
+    #[tokio::test]
+    async fn await_non_async_claim_with_uncertain_context_downgrades_to_low_manual_confirmation() {
+        let analysis = validate(vec![await_finding()])
+            .with_file("src/a.ts", "const token = await messaging().getToken()")
+            .run()
+            .await;
+
+        let finding = &analysis.findings[0];
+        assert_eq!(finding.severity, Severity::Low);
+        assert_eq!(
+            finding.evidence_status,
+            Some(crate::review::types::EvidenceValidationStatus::NeedsManualConfirmation)
+        );
+        assert!(finding
+            .evidence_reason
+            .as_deref()
+            .unwrap()
+            .contains("does not show the enclosing"));
+    }
+
+    #[tokio::test]
+    async fn invalidated_await_non_async_finding_is_excluded_from_counters_inline_and_publish_body()
+    {
+        let analysis = validate(vec![await_finding()])
+            .with_file(
+                "src/a.ts",
+                r#"
+const getToken = useCallback(async () => {
+  const token = await messaging().getToken()
+  return token
+})
+"#,
+            )
+            .run()
+            .await;
+
+        let counters = count_findings_from_analysis(&analysis);
+        assert_eq!(counters.total, 0);
+        assert_eq!(counters.open_priority, 0);
+        assert_eq!(counters.open_actionable, 0);
+
+        let candidates = resolve_inline_candidates(
+            &analysis,
+            &[],
+            None,
+            &crate::config::InlineConfig {
+                enabled: true,
+                dry_run: true,
+                dedupe: true,
+                max_inline_total: 10,
+                max_high_inline: 8,
+                max_medium_inline: 5,
+            },
+        );
+        assert_eq!(
+            candidates[0].reason,
+            InlineEligibilityReason::SeverityTooLow
+        );
+
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &analysis,
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        assert!(!markdown.contains("Syntax Error: await used in non-async function"));
+        assert!(!markdown.contains("await is inside a non-async callback"));
+        assert!(!markdown.contains("1 note"));
+        assert!(markdown.contains("Open priority findings: 0"));
     }
 
     #[tokio::test]
@@ -1216,5 +1625,14 @@ if (target.startsWith(root)) {
             evidence_status: None,
             evidence_reason: None,
         }
+    }
+
+    fn await_finding() -> ReviewFinding {
+        finding(
+            Severity::High,
+            ReviewCategory::Correctness,
+            "Syntax Error: await used in non-async function",
+            "The await is inside a non-async callback and will fail.",
+        )
     }
 }

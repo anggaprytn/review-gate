@@ -3,7 +3,7 @@ use crate::{
     counters::{count_findings_from_analysis, emoji_enabled, format_finding_counters_markdown},
     review::{
         parser::ReviewParseError,
-        types::{ReviewAnalysis, ReviewFinding, RiskCode, Severity},
+        types::{EvidenceValidationStatus, ReviewAnalysis, ReviewFinding, RiskCode, Severity},
     },
 };
 use regex::Regex;
@@ -36,6 +36,13 @@ pub fn format_review_markdown_for_mode_with_emoji(
     emoji: bool,
 ) -> String {
     let sorted_findings = sorted_findings(&analysis.findings);
+    let sorted_findings = match mode {
+        MarkdownRenderMode::Preview => sorted_findings,
+        MarkdownRenderMode::Publish => sorted_findings
+            .into_iter()
+            .filter(|finding| !suppressed_current_file_invalidated_finding(finding))
+            .collect(),
+    };
     let mut output = String::new();
 
     output.push_str("# ReviewGate AI Code Review\n\n");
@@ -401,7 +408,15 @@ fn compact_positive_notes(findings: &[&ReviewFinding], limit: usize) -> Vec<Stri
     let mut notes = Vec::new();
     for finding in findings.iter().copied().filter(|finding| {
         finding.severity == Severity::Note
-            && (!finding.actionable || finding.risk_code == Some(RiskCode::PositiveNote))
+            && finding.risk_code == Some(RiskCode::PositiveNote)
+            && !matches!(
+                finding.evidence_status,
+                Some(
+                    crate::review::types::EvidenceValidationStatus::StaleContext
+                        | crate::review::types::EvidenceValidationStatus::WeakEvidence
+                        | crate::review::types::EvidenceValidationStatus::NeedsManualConfirmation
+                )
+            )
     }) {
         let sentence = sentence_from_text(&finding.title);
         let key = normalize_sentence_key(&sentence);
@@ -414,6 +429,22 @@ fn compact_positive_notes(findings: &[&ReviewFinding], limit: usize) -> Vec<Stri
         }
     }
     notes
+}
+
+fn suppressed_current_file_invalidated_finding(finding: &ReviewFinding) -> bool {
+    !finding.actionable
+        && matches!(
+            finding.evidence_status,
+            Some(
+                EvidenceValidationStatus::StaleContext
+                    | EvidenceValidationStatus::WeakEvidence
+                    | EvidenceValidationStatus::NeedsManualConfirmation
+            )
+        )
+        && finding
+            .evidence_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("current-file validation:"))
 }
 
 fn format_test_coverage_note(note: Option<&str>, mode: MarkdownRenderMode) -> String {
