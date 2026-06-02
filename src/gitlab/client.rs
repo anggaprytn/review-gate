@@ -122,6 +122,48 @@ impl GitLabClient {
         Ok(diffs)
     }
 
+    pub async fn fetch_repository_file_raw_limited(
+        &self,
+        mr: &GitLabMrUrl,
+        file_path: &str,
+        ref_name: &str,
+        max_bytes: usize,
+    ) -> Result<String> {
+        let url = repository_file_raw_api_url(&self.base_url, mr, file_path, ref_name);
+        let response = self
+            .http
+            .get(url)
+            .header(self.token_header.clone(), &self.token)
+            .send()
+            .await
+            .map_err(map_gitlab_request_error)?;
+
+        let status = response.status();
+        if status != StatusCode::OK {
+            let body = response.text().await.unwrap_or_default();
+            return Err(map_gitlab_status_error(status, body, false));
+        }
+
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return Err(ReviewGateError::GitLabApi(format!(
+                "repository file exceeds REVIEWGATE_MAX_VALIDATION_FILE_BYTES={max_bytes}"
+            )));
+        }
+
+        let bytes = response.bytes().await?;
+        if bytes.len() > max_bytes {
+            return Err(ReviewGateError::GitLabApi(format!(
+                "repository file exceeds REVIEWGATE_MAX_VALIDATION_FILE_BYTES={max_bytes}"
+            )));
+        }
+
+        String::from_utf8(bytes.to_vec())
+            .map_err(|err| ReviewGateError::MalformedGitLabResponse(err.to_string()))
+    }
+
     pub async fn list_merge_request_notes(&self, mr: &GitLabMrUrl) -> Result<Vec<GitLabNote>> {
         let mut page = 1;
         let mut notes = Vec::new();
@@ -560,6 +602,21 @@ pub fn create_discussion_api_url(base_url: &str, mr: &GitLabMrUrl) -> String {
     )
 }
 
+pub fn repository_file_raw_api_url(
+    base_url: &str,
+    mr: &GitLabMrUrl,
+    file_path: &str,
+    ref_name: &str,
+) -> String {
+    format!(
+        "{}/api/v4/projects/{}/repository/files/{}/raw?ref={}",
+        base_url.trim_end_matches('/'),
+        mr.encoded_project_path,
+        percent_encode_path_segment(file_path),
+        percent_encode_query_value(ref_name)
+    )
+}
+
 fn token_header_for_source(source: Option<GitLabTokenSource>) -> HeaderName {
     match source {
         Some(GitLabTokenSource::CiJobToken) => JOB_TOKEN_HEADER,
@@ -567,6 +624,29 @@ fn token_header_for_source(source: Option<GitLabTokenSource>) -> HeaderName {
         | Some(GitLabTokenSource::ReviewGateGitLabToken)
         | None => PRIVATE_TOKEN_HEADER,
     }
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    percent_encode_bytes(value.as_bytes(), true)
+}
+
+fn percent_encode_query_value(value: &str) -> String {
+    percent_encode_bytes(value.as_bytes(), true)
+}
+
+fn percent_encode_bytes(bytes: &[u8], encode_slash: bool) -> String {
+    let mut encoded = String::new();
+    for byte in bytes {
+        let keep = byte.is_ascii_alphanumeric()
+            || matches!(*byte, b'-' | b'_' | b'.' | b'~')
+            || (!encode_slash && *byte == b'/');
+        if keep {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 pub fn discussion_form_fields(
@@ -678,7 +758,7 @@ mod tests {
     use super::{
         create_discussion_api_url, create_note_api_url, diffs_api_url, discussion_form_fields,
         discussions_api_url, map_gitlab_status_error, metadata_api_url, notes_api_url,
-        unsupported_unidiff_response, update_note_api_url, Pagination,
+        repository_file_raw_api_url, unsupported_unidiff_response, update_note_api_url, Pagination,
     };
     use crate::{
         error::ReviewGateError,
@@ -726,6 +806,15 @@ mod tests {
         assert_eq!(
             create_discussion_api_url("https://gitlab.company.local", &mr),
             "https://gitlab.company.local/api/v4/projects/group%2Frepo/merge_requests/59/discussions"
+        );
+        assert_eq!(
+            repository_file_raw_api_url(
+                "https://gitlab.company.local",
+                &mr,
+                "src/screens/Sample Food/index.tsx",
+                "feature/head sha"
+            ),
+            "https://gitlab.company.local/api/v4/projects/group%2Frepo/repository/files/src%2Fscreens%2FSample%20Food%2Findex.tsx/raw?ref=feature%2Fhead%20sha"
         );
     }
 

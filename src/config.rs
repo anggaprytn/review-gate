@@ -14,6 +14,7 @@ pub struct AppConfig {
     pub llm: LlmConfig,
     pub privacy: PrivacyConfig,
     pub review: ReviewConfig,
+    pub current_file_validation: CurrentFileValidationConfig,
     pub inline: InlineConfig,
     pub publish: PublishConfig,
     pub storage: StorageConfig,
@@ -48,6 +49,14 @@ pub struct ReviewConfig {
     pub severity_threshold: String,
     pub max_diff_bytes: usize,
     pub max_files: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CurrentFileValidationConfig {
+    pub enabled: bool,
+    pub validate_priority_with_model: bool,
+    pub max_file_bytes: usize,
+    pub context_lines: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +126,7 @@ impl fmt::Debug for AppConfig {
             .field("llm", &self.llm)
             .field("privacy", &self.privacy)
             .field("review", &self.review)
+            .field("current_file_validation", &self.current_file_validation)
             .field("inline", &self.inline)
             .field("publish", &self.publish)
             .field("storage", &self.storage)
@@ -271,6 +281,19 @@ impl AppConfig {
                 .or_else(|| file_review.and_then(|review| review.max_files))
                 .unwrap_or(50),
         };
+        let current_file_validation = CurrentFileValidationConfig {
+            enabled: env_bool("REVIEWGATE_CURRENT_FILE_VALIDATION").unwrap_or(true),
+            validate_priority_with_model: env_bool("REVIEWGATE_VALIDATE_PRIORITY_WITH_MODEL")
+                .unwrap_or(true),
+            max_file_bytes: env::var("REVIEWGATE_MAX_VALIDATION_FILE_BYTES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(80_000),
+            context_lines: env::var("REVIEWGATE_VALIDATION_CONTEXT_LINES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(40),
+        };
         let inline = InlineConfig {
             enabled: env_bool("REVIEWGATE_INLINE_ENABLED").unwrap_or(false),
             dry_run: env_bool("REVIEWGATE_INLINE_DRY_RUN").unwrap_or(true),
@@ -336,6 +359,7 @@ impl AppConfig {
             },
             privacy,
             review,
+            current_file_validation,
             inline,
             publish,
             storage,
@@ -469,8 +493,9 @@ fn non_empty(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        select_gitlab_token_from_values, AppConfig, CiConfig, GitLabTokenSource, InlineConfig,
-        LlmConfig, PrivacyConfig, PublishConfig, ReviewConfig, StorageConfig,
+        select_gitlab_token_from_values, AppConfig, CiConfig, CurrentFileValidationConfig,
+        GitLabTokenSource, InlineConfig, LlmConfig, PrivacyConfig, PublishConfig, ReviewConfig,
+        StorageConfig,
     };
     use crate::error::ReviewGateError;
 
@@ -608,6 +633,12 @@ mod tests {
                 severity_threshold: "medium".to_string(),
                 max_diff_bytes: 200_000,
                 max_files: 50,
+            },
+            current_file_validation: CurrentFileValidationConfig {
+                enabled: true,
+                validate_priority_with_model: true,
+                max_file_bytes: 80_000,
+                context_lines: 40,
             },
             inline: InlineConfig {
                 enabled: false,

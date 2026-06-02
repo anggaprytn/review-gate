@@ -1963,6 +1963,12 @@ mod tests {
                 max_diff_bytes: 200_000,
                 max_files: 50,
             },
+            current_file_validation: crate::config::CurrentFileValidationConfig {
+                enabled: true,
+                validate_priority_with_model: true,
+                max_file_bytes: 80_000,
+                context_lines: 40,
+            },
             inline: InlineConfig {
                 enabled: false,
                 dry_run: true,

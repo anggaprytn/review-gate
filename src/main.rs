@@ -35,6 +35,9 @@ use reviewgate::review::comparison::{
     compare_current_run_with_previous, format_comparison_terminal_default,
     insert_comparison_section, ReviewComparison,
 };
+use reviewgate::review::current_file::{
+    validate_review_analysis_current_file, CurrentFileValidationOptions,
+};
 use reviewgate::review::engine::{
     build_sanitized_review_prompt, review_prompt_with_llm_for_mode, ReviewPreview,
 };
@@ -52,6 +55,7 @@ use reviewgate::review::mode::{
     ReviewMode, SelectedReviewMode,
 };
 use reviewgate::review::qa::format_qa_checklist;
+use reviewgate::review::quality::normalize_review_analysis;
 use reviewgate::storage::{PersistedReviewRun, Storage};
 use reviewgate::verify::{
     no_previous_run_message, verification_prompt_with_llm, VerificationPreview,
@@ -312,9 +316,12 @@ async fn run_review(args: ReviewArgs) -> Result<()> {
             &context,
             &diffs,
             &config,
-            args.show_prompt,
-            inline_dry_run,
-            args.qa_preview,
+            &gitlab,
+            PreviewOptions {
+                show_prompt: args.show_prompt,
+                inline_dry_run,
+                qa_preview: args.qa_preview,
+            },
             &mut storage,
         )
         .await?;
@@ -376,6 +383,13 @@ struct PublishOptions {
     inline_dry_run: bool,
     large_review: bool,
     publish_qa: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreviewOptions {
+    show_prompt: bool,
+    inline_dry_run: bool,
+    qa_preview: bool,
 }
 
 async fn run_large_review(
@@ -478,6 +492,8 @@ async fn run_large_review(
         .await?;
     } else {
         let mut preview = preview;
+        preview =
+            validate_preview_current_file(preview, &context, &config, &gitlab, render_mode).await;
         let (persisted, comparison) =
             persist_review_run_and_apply_comparison(storage, &context, &config, &mut preview);
         println!("{}", preview.markdown);
@@ -526,6 +542,14 @@ async fn publish_review_preview(
         return Err(reviewgate::error::ReviewGateError::PublishRequiresParsedReview);
     }
     let mut preview = preview;
+    preview = validate_preview_current_file(
+        preview,
+        context,
+        config,
+        gitlab,
+        MarkdownRenderMode::Publish,
+    )
+    .await;
     let (persisted, comparison) =
         persist_review_run_and_apply_comparison(storage, context, config, &mut preview);
 
@@ -765,13 +789,25 @@ async fn print_preview(
     context: &MergeRequestContext,
     diffs: &[reviewgate::gitlab::types::MergeRequestDiff],
     config: &AppConfig,
-    show_prompt: bool,
-    inline_dry_run: bool,
-    qa_preview: bool,
+    gitlab: &GitLabClient,
+    options: PreviewOptions,
     storage: &mut Option<Storage>,
 ) -> Result<()> {
-    let mut preview =
-        generate_preview(context, config, show_prompt, MarkdownRenderMode::Preview).await?;
+    let mut preview = generate_preview(
+        context,
+        config,
+        options.show_prompt,
+        MarkdownRenderMode::Preview,
+    )
+    .await?;
+    preview = validate_preview_current_file(
+        preview,
+        context,
+        config,
+        gitlab,
+        MarkdownRenderMode::Preview,
+    )
+    .await;
     let (persisted, comparison) =
         persist_review_run_and_apply_comparison(storage, context, config, &mut preview);
 
@@ -784,10 +820,10 @@ async fn print_preview(
         preview.prompt_token_estimate,
         preview.parsed,
     );
-    if inline_dry_run {
+    if options.inline_dry_run {
         print_inline_dry_run_report(&preview, context, diffs, config);
     }
-    if qa_preview {
+    if options.qa_preview {
         print_qa_preview(&preview, diffs)?;
     }
     print_persisted_review_run(storage, persisted.as_ref());
@@ -832,6 +868,57 @@ fn validate_preview_evidence(
         return preview;
     };
     let analysis = validate_review_analysis_evidence(analysis, anchors);
+    preview.markdown = format_review_markdown_for_mode(&analysis, mode);
+    preview.analysis = Some(analysis);
+    preview
+}
+
+async fn validate_preview_current_file(
+    mut preview: ReviewPreview,
+    context: &MergeRequestContext,
+    config: &AppConfig,
+    gitlab: &GitLabClient,
+    mode: MarkdownRenderMode,
+) -> ReviewPreview {
+    let Some(analysis) = preview.analysis.take() else {
+        return preview;
+    };
+    let options = CurrentFileValidationOptions::from(&config.current_file_validation);
+    if !options.enabled {
+        preview.analysis = Some(analysis);
+        return preview;
+    }
+
+    let mr = context.mr_url.clone();
+    let head = head_sha(context).to_string();
+    let max_bytes = options.max_file_bytes;
+    let llm_config = config.llm.clone();
+    let analysis = validate_review_analysis_current_file(
+        analysis,
+        &context.anchored_diff,
+        options,
+        |file_path| {
+            let mr = mr.clone();
+            let head = head.clone();
+            async move {
+                gitlab
+                    .fetch_repository_file_raw_limited(&mr, &file_path, &head, max_bytes)
+                    .await
+                    .map_err(|err| err.to_string())
+            }
+        },
+        |prompt| {
+            let llm_config = llm_config.clone();
+            async move {
+                review_with_config(&llm_config, &prompt)
+                    .await
+                    .map(|response| response.text)
+                    .map_err(|err| err.to_string())
+            }
+        },
+    )
+    .await;
+    let analysis = normalize_review_analysis(analysis);
     preview.markdown = format_review_markdown_for_mode(&analysis, mode);
     preview.analysis = Some(analysis);
     preview

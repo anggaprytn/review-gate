@@ -1,5 +1,6 @@
 pub mod anchors;
 pub mod comparison;
+pub mod current_file;
 pub mod engine;
 pub mod evidence;
 pub mod formatter;
