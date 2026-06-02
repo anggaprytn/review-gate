@@ -19,8 +19,9 @@ use std::{
     collections::{BTreeMap, HashSet},
     env,
     future::Future,
-    time::Instant,
+    time::{Duration, Instant},
 };
+use tokio::time::sleep;
 
 pub const DEFAULT_LARGE_REVIEW_ENABLED: bool = true;
 pub const DEFAULT_LARGE_REVIEW_MAX_CHUNKS: usize = 6;
@@ -29,6 +30,9 @@ pub const DEFAULT_LARGE_REVIEW_MAX_DIFF_BYTES_PER_CHUNK: usize = 60_000;
 pub const DEFAULT_LARGE_REVIEW_INCLUDE_LOW: bool = false;
 pub const DEFAULT_LARGE_REVIEW_PARALLEL: bool = true;
 pub const DEFAULT_LARGE_REVIEW_PARALLELISM: usize = 1;
+pub const DEFAULT_LARGE_REVIEW_CHUNK_RETRIES: usize = 1;
+pub const DEFAULT_LARGE_REVIEW_RETRY_BACKOFF_MS: u64 = 1500;
+pub const DEFAULT_LARGE_REVIEW_RETRY_SERIAL: bool = true;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LargeReviewOptions {
@@ -39,6 +43,9 @@ pub struct LargeReviewOptions {
     pub include_low_risk: bool,
     pub parallel: bool,
     pub parallelism: usize,
+    pub chunk_retries: usize,
+    pub retry_backoff_ms: u64,
+    pub retry_serial: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -67,12 +74,16 @@ pub struct LargeReviewPlan {
 pub struct LargeReviewExecutionOptions {
     pub parallel: bool,
     pub parallelism: usize,
+    pub chunk_retries: usize,
+    pub retry_backoff_ms: u64,
+    pub retry_serial: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LargeReviewReport {
     pub total_chunks: usize,
     pub reviewed_chunks: usize,
+    pub retried_chunks: usize,
     pub failed_chunks: usize,
     pub reviewed_files: usize,
     pub skipped_files: usize,
@@ -102,8 +113,11 @@ pub enum ChunkReviewStatus {
 pub struct ChunkReviewResult {
     pub chunk_index: usize,
     pub status: ChunkReviewStatus,
+    pub attempts: usize,
+    pub retried: bool,
     pub analysis: Option<ReviewAnalysis>,
     pub error: Option<String>,
+    pub retryable: bool,
     pub duration_ms: Option<u128>,
     pub metadata: LlmRunMetadata,
     pub prompt_token_estimate: u64,
@@ -126,6 +140,27 @@ pub enum ChunkReviewProgress {
         duration_ms: Option<u128>,
         error: String,
     },
+    Retrying {
+        retryable_failures: usize,
+        attempt: usize,
+        max_attempts: usize,
+    },
+    RetryStarted {
+        chunk_index: usize,
+        total_chunks: usize,
+        serial: bool,
+    },
+    Retried {
+        chunk_index: usize,
+        total_chunks: usize,
+        duration_ms: Option<u128>,
+    },
+    RetryFailed {
+        chunk_index: usize,
+        total_chunks: usize,
+        retries: usize,
+        error: String,
+    },
 }
 
 impl Default for LargeReviewOptions {
@@ -138,6 +173,9 @@ impl Default for LargeReviewOptions {
             include_low_risk: DEFAULT_LARGE_REVIEW_INCLUDE_LOW,
             parallel: DEFAULT_LARGE_REVIEW_PARALLEL,
             parallelism: DEFAULT_LARGE_REVIEW_PARALLELISM,
+            chunk_retries: DEFAULT_LARGE_REVIEW_CHUNK_RETRIES,
+            retry_backoff_ms: DEFAULT_LARGE_REVIEW_RETRY_BACKOFF_MS,
+            retry_serial: DEFAULT_LARGE_REVIEW_RETRY_SERIAL,
         }
     }
 }
@@ -158,6 +196,27 @@ impl LargeReviewOptions {
         if let Some(warning) = parallelism_warning {
             eprintln!("{warning}");
         }
+        let (chunk_retries, retries_warning) = env_usize_allow_zero_with_warning(
+            "REVIEWGATE_LARGE_REVIEW_CHUNK_RETRIES",
+            DEFAULT_LARGE_REVIEW_CHUNK_RETRIES,
+        );
+        if let Some(warning) = retries_warning {
+            eprintln!("{warning}");
+        }
+        let (retry_backoff_ms, backoff_warning) = env_u64_allow_zero_with_warning(
+            "REVIEWGATE_LARGE_REVIEW_RETRY_BACKOFF_MS",
+            DEFAULT_LARGE_REVIEW_RETRY_BACKOFF_MS,
+        );
+        if let Some(warning) = backoff_warning {
+            eprintln!("{warning}");
+        }
+        let (retry_serial, retry_serial_warning) = env_bool_with_warning(
+            "REVIEWGATE_LARGE_REVIEW_RETRY_SERIAL",
+            DEFAULT_LARGE_REVIEW_RETRY_SERIAL,
+        );
+        if let Some(warning) = retry_serial_warning {
+            eprintln!("{warning}");
+        }
 
         Self {
             enabled: env_bool("REVIEWGATE_LARGE_REVIEW_ENABLED")
@@ -175,6 +234,9 @@ impl LargeReviewOptions {
                 .unwrap_or(DEFAULT_LARGE_REVIEW_INCLUDE_LOW),
             parallel,
             parallelism,
+            chunk_retries,
+            retry_backoff_ms,
+            retry_serial,
         }
     }
 }
@@ -184,6 +246,9 @@ impl From<LargeReviewOptions> for LargeReviewExecutionOptions {
         Self {
             parallel: options.parallel,
             parallelism: options.parallelism,
+            chunk_retries: options.chunk_retries,
+            retry_backoff_ms: options.retry_backoff_ms,
+            retry_serial: options.retry_serial,
         }
     }
 }
@@ -474,59 +539,56 @@ where
 {
     let total_chunks = chunks.len();
     let parallelism = execution.effective_parallelism(total_chunks);
-    let mut pending = chunks.iter().cloned();
-    let mut running = FuturesUnordered::new();
-    let mut results = Vec::new();
-
-    while running.len() < parallelism {
-        let Some(chunk) = pending.next() else {
-            break;
-        };
-        progress(ChunkReviewProgress::Started {
-            chunk_index: chunk.index,
+    let mut results = run_large_chunk_wave(
+        context,
+        chunks,
+        ChunkWaveOptions {
             total_chunks,
-        });
-        running.push(review_one_large_chunk(
-            context,
-            chunk,
-            total_chunks,
+            parallelism,
             show_prompt,
-            &call_llm,
-        ));
-    }
+        },
+        FirstPassProgress,
+        &mut progress,
+        &call_llm,
+    )
+    .await;
 
-    while let Some(result) = running.next().await {
-        match result.status {
-            ChunkReviewStatus::Completed => progress(ChunkReviewProgress::Completed {
-                chunk_index: result.chunk_index,
-                total_chunks,
-                duration_ms: result.duration_ms,
-            }),
-            ChunkReviewStatus::Failed => progress(ChunkReviewProgress::Failed {
-                chunk_index: result.chunk_index,
-                total_chunks,
-                duration_ms: result.duration_ms,
-                error: result
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "unknown error".to_string()),
-            }),
+    for retry_attempt in 1..=execution.chunk_retries {
+        let retryable_chunks = retryable_failed_chunks(chunks, &results);
+        if retryable_chunks.is_empty() {
+            break;
         }
-        results.push(result);
 
-        if let Some(chunk) = pending.next() {
-            progress(ChunkReviewProgress::Started {
-                chunk_index: chunk.index,
+        progress(ChunkReviewProgress::Retrying {
+            retryable_failures: retryable_chunks.len(),
+            attempt: retry_attempt,
+            max_attempts: execution.chunk_retries,
+        });
+        if execution.retry_backoff_ms > 0 {
+            sleep(Duration::from_millis(execution.retry_backoff_ms)).await;
+        }
+
+        let retry_parallelism = if execution.retry_serial {
+            1
+        } else {
+            execution.effective_parallelism(retryable_chunks.len())
+        };
+        let retry_results = run_large_chunk_wave(
+            context,
+            &retryable_chunks,
+            ChunkWaveOptions {
                 total_chunks,
-            });
-            running.push(review_one_large_chunk(
-                context,
-                chunk,
-                total_chunks,
+                parallelism: retry_parallelism,
                 show_prompt,
-                &call_llm,
-            ));
-        }
+            },
+            RetryProgress {
+                serial: execution.retry_serial,
+            },
+            &mut progress,
+            &call_llm,
+        )
+        .await;
+        replace_retry_results(&mut results, retry_results);
     }
 
     results.sort_by_key(|result| result.chunk_index);
@@ -534,9 +596,13 @@ where
     let mut failures = Vec::new();
     let mut metadata_total = LlmRunMetadata::default();
     let mut prompt_token_estimate = 0u64;
+    let mut retried_chunks = 0usize;
 
     for result in results {
         prompt_token_estimate += result.prompt_token_estimate;
+        if result.retried {
+            retried_chunks += 1;
+        }
         match result.status {
             ChunkReviewStatus::Completed => {
                 merge_metadata(&mut metadata_total, &result.metadata);
@@ -544,10 +610,21 @@ where
                     analyses.push(analysis);
                 }
             }
-            ChunkReviewStatus::Failed => failures.push(ChunkFailure {
-                chunk_index: result.chunk_index,
-                message: result.error.unwrap_or_else(|| "unknown error".to_string()),
-            }),
+            ChunkReviewStatus::Failed => {
+                let message = result.error.unwrap_or_else(|| "unknown error".to_string());
+                if result.retried {
+                    progress(ChunkReviewProgress::RetryFailed {
+                        chunk_index: result.chunk_index,
+                        total_chunks,
+                        retries: result.attempts.saturating_sub(1),
+                        error: message.clone(),
+                    });
+                }
+                failures.push(ChunkFailure {
+                    chunk_index: result.chunk_index,
+                    message,
+                });
+            }
         }
     }
 
@@ -563,6 +640,7 @@ where
     let report = LargeReviewReport {
         total_chunks,
         reviewed_chunks: analyses.len(),
+        retried_chunks,
         failed_chunks: failures.len(),
         reviewed_files: context.selection.files.len(),
         skipped_files: context.selection.skipped_files,
@@ -581,6 +659,210 @@ where
         parsed: true,
         analysis: Some(analysis),
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FirstPassProgress;
+
+#[derive(Debug, Clone, Copy)]
+struct RetryProgress {
+    serial: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChunkWaveOptions {
+    total_chunks: usize,
+    parallelism: usize,
+    show_prompt: bool,
+}
+
+trait ChunkWaveProgress {
+    fn started(self, chunk_index: usize, total_chunks: usize) -> ChunkReviewProgress;
+    fn completed(
+        self,
+        chunk_index: usize,
+        total_chunks: usize,
+        duration_ms: Option<u128>,
+    ) -> ChunkReviewProgress;
+    fn failed(
+        self,
+        chunk_index: usize,
+        total_chunks: usize,
+        duration_ms: Option<u128>,
+        error: String,
+    ) -> Option<ChunkReviewProgress>;
+}
+
+impl ChunkWaveProgress for FirstPassProgress {
+    fn started(self, chunk_index: usize, total_chunks: usize) -> ChunkReviewProgress {
+        ChunkReviewProgress::Started {
+            chunk_index,
+            total_chunks,
+        }
+    }
+
+    fn completed(
+        self,
+        chunk_index: usize,
+        total_chunks: usize,
+        duration_ms: Option<u128>,
+    ) -> ChunkReviewProgress {
+        ChunkReviewProgress::Completed {
+            chunk_index,
+            total_chunks,
+            duration_ms,
+        }
+    }
+
+    fn failed(
+        self,
+        chunk_index: usize,
+        total_chunks: usize,
+        duration_ms: Option<u128>,
+        error: String,
+    ) -> Option<ChunkReviewProgress> {
+        Some(ChunkReviewProgress::Failed {
+            chunk_index,
+            total_chunks,
+            duration_ms,
+            error,
+        })
+    }
+}
+
+impl ChunkWaveProgress for RetryProgress {
+    fn started(self, chunk_index: usize, total_chunks: usize) -> ChunkReviewProgress {
+        ChunkReviewProgress::RetryStarted {
+            chunk_index,
+            total_chunks,
+            serial: self.serial,
+        }
+    }
+
+    fn completed(
+        self,
+        chunk_index: usize,
+        total_chunks: usize,
+        duration_ms: Option<u128>,
+    ) -> ChunkReviewProgress {
+        ChunkReviewProgress::Retried {
+            chunk_index,
+            total_chunks,
+            duration_ms,
+        }
+    }
+
+    fn failed(
+        self,
+        _chunk_index: usize,
+        _total_chunks: usize,
+        _duration_ms: Option<u128>,
+        _error: String,
+    ) -> Option<ChunkReviewProgress> {
+        None
+    }
+}
+
+async fn run_large_chunk_wave<F, Fut, P>(
+    context: LargeReviewRunContext<'_>,
+    chunks: &[ReviewChunk],
+    options: ChunkWaveOptions,
+    progress_mode: P,
+    progress: &mut impl FnMut(ChunkReviewProgress),
+    call_llm: &F,
+) -> Vec<ChunkReviewResult>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<LlmReviewResponse>>,
+    P: ChunkWaveProgress + Copy,
+{
+    let mut pending = chunks.iter().cloned();
+    let mut running = FuturesUnordered::new();
+    let mut results = Vec::new();
+
+    while running.len() < options.parallelism {
+        let Some(chunk) = pending.next() else {
+            break;
+        };
+        progress(progress_mode.started(chunk.index, options.total_chunks));
+        running.push(review_one_large_chunk(
+            context,
+            chunk,
+            options.total_chunks,
+            options.show_prompt,
+            call_llm,
+        ));
+    }
+
+    while let Some(result) = running.next().await {
+        match result.status {
+            ChunkReviewStatus::Completed => progress(progress_mode.completed(
+                result.chunk_index,
+                options.total_chunks,
+                result.duration_ms,
+            )),
+            ChunkReviewStatus::Failed => {
+                if let Some(progress_event) = progress_mode.failed(
+                    result.chunk_index,
+                    options.total_chunks,
+                    result.duration_ms,
+                    result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "unknown error".to_string()),
+                ) {
+                    progress(progress_event);
+                }
+            }
+        }
+        results.push(result);
+
+        if let Some(chunk) = pending.next() {
+            progress(progress_mode.started(chunk.index, options.total_chunks));
+            running.push(review_one_large_chunk(
+                context,
+                chunk,
+                options.total_chunks,
+                options.show_prompt,
+                call_llm,
+            ));
+        }
+    }
+
+    results
+}
+
+fn retryable_failed_chunks(
+    chunks: &[ReviewChunk],
+    results: &[ChunkReviewResult],
+) -> Vec<ReviewChunk> {
+    let retryable_indexes = results
+        .iter()
+        .filter(|result| result.status == ChunkReviewStatus::Failed && result.retryable)
+        .map(|result| result.chunk_index)
+        .collect::<HashSet<_>>();
+
+    chunks
+        .iter()
+        .filter(|chunk| retryable_indexes.contains(&chunk.index))
+        .cloned()
+        .collect()
+}
+
+fn replace_retry_results(results: &mut [ChunkReviewResult], retry_results: Vec<ChunkReviewResult>) {
+    for mut retry_result in retry_results {
+        let Some(existing) = results
+            .iter_mut()
+            .find(|result| result.chunk_index == retry_result.chunk_index)
+        else {
+            continue;
+        };
+        retry_result.attempts = existing.attempts + 1;
+        retry_result.retried = true;
+        retry_result.prompt_token_estimate += existing.prompt_token_estimate;
+        retry_result.duration_ms = sum_duration(existing.duration_ms, retry_result.duration_ms);
+        *existing = retry_result;
+    }
 }
 
 async fn review_one_large_chunk<F, Fut>(
@@ -610,35 +892,138 @@ where
             Ok(analysis) => ChunkReviewResult {
                 chunk_index: chunk.index,
                 status: ChunkReviewStatus::Completed,
+                attempts: 1,
+                retried: false,
                 analysis: Some(validate_review_analysis_evidence(
                     normalize_review_analysis(analysis),
                     context.anchors,
                 )),
                 error: None,
+                retryable: false,
                 duration_ms: Some(started.elapsed().as_millis()),
                 metadata: response.metadata,
                 prompt_token_estimate,
             },
-            Err(err) => ChunkReviewResult {
-                chunk_index: chunk.index,
-                status: ChunkReviewStatus::Failed,
-                analysis: None,
-                error: Some(err.to_string()),
-                duration_ms: Some(started.elapsed().as_millis()),
-                metadata: LlmRunMetadata::default(),
+            Err(err) => failed_chunk_result(
+                chunk.index,
+                err.to_string(),
+                is_retryable_chunk_error_message(&err.to_string()),
+                started.elapsed().as_millis(),
                 prompt_token_estimate,
-            },
+            ),
         },
-        Err(err) => ChunkReviewResult {
-            chunk_index: chunk.index,
-            status: ChunkReviewStatus::Failed,
-            analysis: None,
-            error: Some(err.to_string()),
-            duration_ms: Some(started.elapsed().as_millis()),
-            metadata: LlmRunMetadata::default(),
+        Err(err) => failed_chunk_result(
+            chunk.index,
+            err.to_string(),
+            is_retryable_chunk_error(&err),
+            started.elapsed().as_millis(),
             prompt_token_estimate,
-        },
+        ),
     }
+}
+
+fn failed_chunk_result(
+    chunk_index: usize,
+    message: String,
+    retryable: bool,
+    duration_ms: u128,
+    prompt_token_estimate: u64,
+) -> ChunkReviewResult {
+    ChunkReviewResult {
+        chunk_index,
+        status: ChunkReviewStatus::Failed,
+        attempts: 1,
+        retried: false,
+        analysis: None,
+        error: Some(message),
+        retryable,
+        duration_ms: Some(duration_ms),
+        metadata: LlmRunMetadata::default(),
+        prompt_token_estimate,
+    }
+}
+
+pub fn is_retryable_chunk_error(error: &ReviewGateError) -> bool {
+    match error {
+        ReviewGateError::OllamaTimeout { .. }
+        | ReviewGateError::CodexTimeout { .. }
+        | ReviewGateError::GeminiTimeout { .. }
+        | ReviewGateError::EmptyModelResponse
+        | ReviewGateError::CodexEmptyResponse
+        | ReviewGateError::GeminiEmptyResponse
+        | ReviewGateError::InvalidOllamaResponse(_)
+        | ReviewGateError::GitLabRateLimited
+        | ReviewGateError::GitLabTimeout
+        | ReviewGateError::Json(_) => true,
+        ReviewGateError::OllamaApi(message)
+        | ReviewGateError::CodexCommandFailed(message)
+        | ReviewGateError::GeminiCommandFailed(message) => {
+            command_failure_message_is_retryable(message)
+        }
+        ReviewGateError::Reqwest(err) => {
+            err.is_timeout()
+                || err
+                    .status()
+                    .is_some_and(|status| status.as_u16() == 429 || status.is_server_error())
+        }
+        _ => false,
+    }
+}
+
+pub fn is_retryable_chunk_error_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    if non_retryable_error_message(&normalized) {
+        return false;
+    }
+    retryable_message_marker(&normalized)
+}
+
+fn command_failure_message_is_retryable(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    !non_retryable_error_message(&normalized) && retryable_command_failure_marker(&normalized)
+}
+
+fn retryable_message_marker(message: &str) -> bool {
+    message.contains("timeout")
+        || message.contains("timed out")
+        || message.contains("rate limit")
+        || message.contains("rate-limit")
+        || message.contains("temporarily unavailable")
+        || message.contains("temporary unavailable")
+        || message.contains("empty model response")
+        || message.contains("empty response")
+        || message.contains("malformed json")
+        || message.contains("json review object")
+        || retryable_command_failure_marker(message)
+}
+
+fn retryable_command_failure_marker(message: &str) -> bool {
+    (message.contains("command failed") || message.contains("provider command failed"))
+        && (message.contains("timeout")
+            || message.contains("timed out")
+            || message.contains("rate limit")
+            || message.contains("rate-limit")
+            || message.contains("temporarily unavailable")
+            || message.contains("temporary unavailable")
+            || message.contains("server error")
+            || message.contains("service unavailable")
+            || message.contains("try again")
+            || message.contains("429")
+            || message.contains("503"))
+}
+
+fn non_retryable_error_message(message: &str) -> bool {
+    message.contains("binary was not found")
+        || message.contains("is not authenticated")
+        || message.contains("gitlab_token is required")
+        || message.contains("gitlab token is invalid")
+        || message.contains("invalid gitlab token")
+        || message.contains("unsupported llm provider")
+        || message.contains("configuration error")
+        || message.contains("must not be empty")
+        || message.contains("no reviewable files")
+        || message.contains("invalid gitlab merge request url")
+        || message.contains("large mr review found no reviewable files")
 }
 
 pub fn merge_chunk_analyses(
@@ -725,6 +1110,9 @@ pub fn format_large_review_markdown(
         "## Large MR Review Plan\n\nPlanned chunks: {}\nReviewed chunks: {}\n",
         report.total_chunks, report.reviewed_chunks
     );
+    if report.retried_chunks > 0 {
+        section.push_str(&format!("Retried chunks: {}\n", report.retried_chunks));
+    }
     if report.failed_chunks > 0 {
         section.push_str(&format!("Failed chunks: {}\n", report.failed_chunks));
     }
@@ -1123,6 +1511,14 @@ fn sum_option(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     }
 }
 
+fn sum_duration(left: Option<u128>, right: Option<u128>) -> Option<u128> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
 fn env_usize(name: &str) -> Option<usize> {
     env::var(name).ok().and_then(|value| value.parse().ok())
 }
@@ -1141,6 +1537,36 @@ fn parse_env_usize_value_with_warning(
     };
     match value.trim().parse::<usize>() {
         Ok(value) if value >= 1 => (value, None),
+        _ => (
+            default,
+            Some(format!(
+                "Warning: invalid {name}={value:?}; using default {default}"
+            )),
+        ),
+    }
+}
+
+fn env_usize_allow_zero_with_warning(name: &str, default: usize) -> (usize, Option<String>) {
+    let Some(value) = env::var(name).ok() else {
+        return (default, None);
+    };
+    match value.trim().parse::<usize>() {
+        Ok(value) => (value, None),
+        _ => (
+            default,
+            Some(format!(
+                "Warning: invalid {name}={value:?}; using default {default}"
+            )),
+        ),
+    }
+}
+
+fn env_u64_allow_zero_with_warning(name: &str, default: u64) -> (u64, Option<String>) {
+    let Some(value) = env::var(name).ok() else {
+        return (default, None);
+    };
+    match value.trim().parse::<u64>() {
+        Ok(value) => (value, None),
         _ => (
             default,
             Some(format!(
@@ -1453,30 +1879,21 @@ mod tests {
 
     #[test]
     fn parallelism_is_capped_to_chunk_count() {
-        let execution = LargeReviewExecutionOptions {
-            parallel: true,
-            parallelism: 9,
-        };
+        let execution = execution(true, 9);
 
         assert_eq!(execution.effective_parallelism(3), 3);
     }
 
     #[test]
     fn parallelism_one_behaves_as_serial() {
-        let execution = LargeReviewExecutionOptions {
-            parallel: true,
-            parallelism: 1,
-        };
+        let execution = execution(true, 1);
 
         assert_eq!(execution.effective_parallelism(3), 1);
     }
 
     #[test]
     fn disabled_parallelism_behaves_as_serial() {
-        let execution = LargeReviewExecutionOptions {
-            parallel: false,
-            parallelism: 6,
-        };
+        let execution = execution(false, 6);
 
         assert_eq!(execution.effective_parallelism(3), 1);
     }
@@ -1516,6 +1933,46 @@ mod tests {
         assert!(warning.is_none());
     }
 
+    #[test]
+    fn retryable_chunk_error_classifier_accepts_transient_errors() {
+        assert!(is_retryable_chunk_error(&ReviewGateError::GeminiTimeout {
+            seconds: 240
+        }));
+        assert!(is_retryable_chunk_error_message(
+            "provider rate limit exceeded"
+        ));
+        assert!(is_retryable_chunk_error(
+            &ReviewGateError::EmptyModelResponse
+        ));
+        assert!(is_retryable_chunk_error_message(
+            "malformed JSON review output: expected value"
+        ));
+        assert!(is_retryable_chunk_error(
+            &ReviewGateError::CodexCommandFailed(
+                "provider command failed: temporarily unavailable".to_string()
+            )
+        ));
+    }
+
+    #[test]
+    fn retryable_chunk_error_classifier_rejects_config_and_auth_errors() {
+        assert!(!is_retryable_chunk_error(
+            &ReviewGateError::GeminiBinaryNotFound
+        ));
+        assert!(!is_retryable_chunk_error(
+            &ReviewGateError::CodexNotAuthenticated
+        ));
+        assert!(!is_retryable_chunk_error(
+            &ReviewGateError::InvalidGitLabToken
+        ));
+        assert!(!is_retryable_chunk_error(&ReviewGateError::Config(
+            "REVIEWGATE_MODEL must not be empty".to_string()
+        )));
+        assert!(!is_retryable_chunk_error(
+            &ReviewGateError::UnsupportedLlmProvider("openai".to_string())
+        ));
+    }
+
     #[tokio::test]
     async fn all_chunk_failures_error() {
         let selection = LargeReviewSelection {
@@ -1537,10 +1994,7 @@ mod tests {
                 anchors: &anchors,
             },
             &chunks,
-            LargeReviewExecutionOptions {
-                parallel: false,
-                parallelism: 1,
-            },
+            execution_with_retries(false, 1, 0, true),
             MarkdownRenderMode::Preview,
             false,
             |_| {},
@@ -1571,10 +2025,7 @@ mod tests {
                 anchors: &anchors,
             },
             &chunks,
-            LargeReviewExecutionOptions {
-                parallel: true,
-                parallelism: 3,
-            },
+            execution_with_retries(true, 3, 0, true),
             MarkdownRenderMode::Preview,
             false,
             |_| {},
@@ -1599,6 +2050,287 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_succeeds_and_chunk_becomes_completed() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let (selection, chunks, anchors, metadata) = run_fixture(3);
+        let chunk_two_calls = Arc::new(AtomicUsize::new(0));
+
+        let preview = review_large_chunks_with_llm(
+            LargeReviewRunContext {
+                metadata: &metadata,
+                selection: &selection,
+                anchors: &anchors,
+            },
+            &chunks,
+            execution_with_retries(true, 3, 1, true),
+            MarkdownRenderMode::Preview,
+            false,
+            |_| {},
+            {
+                let chunk_two_calls = Arc::clone(&chunk_two_calls);
+                move |prompt| {
+                    let chunk_two_calls = Arc::clone(&chunk_two_calls);
+                    async move {
+                        if prompt.contains("This is chunk 2 of 3")
+                            && chunk_two_calls.fetch_add(1, Ordering::SeqCst) == 0
+                        {
+                            return Err(ReviewGateError::GeminiTimeout { seconds: 240 });
+                        }
+                        Ok(LlmReviewResponse {
+                            text: chunk_json("Chunk passed", None),
+                            metadata: LlmRunMetadata::default(),
+                        })
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(preview.markdown.contains("Reviewed chunks: 3"));
+        assert!(preview.markdown.contains("Retried chunks: 1"));
+        assert!(!preview.markdown.contains("Failed chunks:"));
+        assert_eq!(chunk_two_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_json_is_retried_once() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let (selection, chunks, anchors, metadata) = run_fixture(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let preview = review_large_chunks_with_llm(
+            LargeReviewRunContext {
+                metadata: &metadata,
+                selection: &selection,
+                anchors: &anchors,
+            },
+            &chunks,
+            execution_with_retries(false, 1, 1, true),
+            MarkdownRenderMode::Preview,
+            false,
+            |_| {},
+            {
+                let calls = Arc::clone(&calls);
+                move |_| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        let call = calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(LlmReviewResponse {
+                            text: if call == 0 {
+                                "not json".to_string()
+                            } else {
+                                chunk_json("Chunk passed", None)
+                            },
+                            metadata: LlmRunMetadata::default(),
+                        })
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(preview.markdown.contains("Reviewed chunks: 1"));
+        assert!(preview.markdown.contains("Retried chunks: 1"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_fails_and_chunk_remains_failed() {
+        let (selection, chunks, anchors, metadata) = run_fixture(2);
+        let mut events = Vec::new();
+
+        let preview = review_large_chunks_with_llm(
+            LargeReviewRunContext {
+                metadata: &metadata,
+                selection: &selection,
+                anchors: &anchors,
+            },
+            &chunks,
+            execution_with_retries(true, 2, 1, true),
+            MarkdownRenderMode::Preview,
+            false,
+            |progress| events.push(progress),
+            |prompt| async move {
+                if prompt.contains("This is chunk 2 of 2") {
+                    return Err(ReviewGateError::GeminiTimeout { seconds: 240 });
+                }
+                Ok(LlmReviewResponse {
+                    text: chunk_json("Chunk passed", None),
+                    metadata: LlmRunMetadata::default(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(preview.markdown.contains("Reviewed chunks: 1"));
+        assert!(preview.markdown.contains("Retried chunks: 1"));
+        assert!(preview.markdown.contains("Failed chunks: 1"));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ChunkReviewProgress::RetryFailed {
+                    chunk_index: 2,
+                    retries: 1,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn retry_serial_mode_uses_concurrency_one_for_failed_chunks() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        };
+
+        let (selection, chunks, anchors, metadata) = run_fixture(3);
+        let attempts = Arc::new(Mutex::new(BTreeMap::<usize, usize>::new()));
+        let active_retry = Arc::new(AtomicUsize::new(0));
+        let max_active_retry = Arc::new(AtomicUsize::new(0));
+
+        let preview = review_large_chunks_with_llm(
+            LargeReviewRunContext {
+                metadata: &metadata,
+                selection: &selection,
+                anchors: &anchors,
+            },
+            &chunks,
+            execution_with_retries(true, 3, 1, true),
+            MarkdownRenderMode::Preview,
+            false,
+            |_| {},
+            {
+                let attempts = Arc::clone(&attempts);
+                let active_retry = Arc::clone(&active_retry);
+                let max_active_retry = Arc::clone(&max_active_retry);
+                move |prompt| {
+                    let attempts = Arc::clone(&attempts);
+                    let active_retry = Arc::clone(&active_retry);
+                    let max_active_retry = Arc::clone(&max_active_retry);
+                    async move {
+                        let chunk_index = prompt_chunk_index(&prompt);
+                        let attempt = {
+                            let mut attempts = attempts.lock().unwrap();
+                            let attempt = attempts.entry(chunk_index).or_insert(0);
+                            *attempt += 1;
+                            *attempt
+                        };
+                        if chunk_index >= 2 && attempt == 1 {
+                            return Err(ReviewGateError::GeminiTimeout { seconds: 240 });
+                        }
+                        if chunk_index >= 2 {
+                            let now = active_retry.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_active_retry.fetch_max(now, Ordering::SeqCst);
+                            for _ in 0..5 {
+                                tokio::task::yield_now().await;
+                            }
+                            active_retry.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        Ok(LlmReviewResponse {
+                            text: chunk_json("Chunk passed", None),
+                            metadata: LlmRunMetadata::default(),
+                        })
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(preview.markdown.contains("Retried chunks: 2"));
+        assert_eq!(max_active_retry.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_preserves_final_chunk_index_order() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let (selection, chunks, anchors, metadata) = run_fixture(2);
+        let chunk_one_calls = Arc::new(AtomicUsize::new(0));
+
+        let preview = review_large_chunks_with_llm(
+            LargeReviewRunContext {
+                metadata: &metadata,
+                selection: &selection,
+                anchors: &anchors,
+            },
+            &chunks,
+            execution_with_retries(true, 2, 1, true),
+            MarkdownRenderMode::Preview,
+            false,
+            |_| {},
+            {
+                let chunk_one_calls = Arc::clone(&chunk_one_calls);
+                move |prompt| {
+                    let chunk_one_calls = Arc::clone(&chunk_one_calls);
+                    async move {
+                        if prompt.contains("This is chunk 1 of 2")
+                            && chunk_one_calls.fetch_add(1, Ordering::SeqCst) == 0
+                        {
+                            return Err(ReviewGateError::GeminiTimeout { seconds: 240 });
+                        }
+                        let note = if prompt.contains("This is chunk 1 of 2") {
+                            Some("First chunk note.")
+                        } else {
+                            Some("Second chunk note.")
+                        };
+                        Ok(LlmReviewResponse {
+                            text: chunk_json("Chunk passed", note),
+                            metadata: LlmRunMetadata::default(),
+                        })
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        let note = preview.analysis.unwrap().test_coverage_note.unwrap();
+        assert!(note.find("First chunk note.").unwrap() < note.find("Second chunk note.").unwrap());
+    }
+
+    #[tokio::test]
+    async fn all_chunks_failed_after_retries_returns_error() {
+        let (selection, chunks, anchors, metadata) = run_fixture(2);
+
+        let err = review_large_chunks_with_llm(
+            LargeReviewRunContext {
+                metadata: &metadata,
+                selection: &selection,
+                anchors: &anchors,
+            },
+            &chunks,
+            execution_with_retries(true, 2, 1, true),
+            MarkdownRenderMode::Preview,
+            false,
+            |_| {},
+            |_| async { Err(ReviewGateError::GeminiTimeout { seconds: 240 }) },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ReviewGateError::LargeReviewAllChunksFailed(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn chunk_results_merge_in_chunk_index_order() {
         let (selection, chunks, anchors, metadata) = run_fixture(2);
 
@@ -1609,10 +2341,7 @@ mod tests {
                 anchors: &anchors,
             },
             &chunks,
-            LargeReviewExecutionOptions {
-                parallel: true,
-                parallelism: 2,
-            },
+            execution_with_retries(true, 2, 0, true),
             MarkdownRenderMode::Preview,
             false,
             |_| {},
@@ -1657,10 +2386,7 @@ mod tests {
                 anchors: &anchors,
             },
             &chunks,
-            LargeReviewExecutionOptions {
-                parallel: true,
-                parallelism: 2,
-            },
+            execution_with_retries(true, 2, 0, true),
             MarkdownRenderMode::Preview,
             false,
             |_| {},
@@ -1704,10 +2430,7 @@ mod tests {
                 anchors: &anchors,
             },
             &chunks,
-            LargeReviewExecutionOptions {
-                parallel: true,
-                parallelism: 1,
-            },
+            execution_with_retries(true, 1, 0, true),
             MarkdownRenderMode::Preview,
             false,
             |progress| events.push(progress),
@@ -1755,10 +2478,7 @@ mod tests {
                 anchors: &anchors,
             },
             &chunks,
-            LargeReviewExecutionOptions {
-                parallel: false,
-                parallelism: 1,
-            },
+            execution_with_retries(false, 1, 0, true),
             MarkdownRenderMode::Preview,
             false,
             |_| {},
@@ -1854,6 +2574,30 @@ mod tests {
         }
     }
 
+    fn execution(parallel: bool, parallelism: usize) -> LargeReviewExecutionOptions {
+        execution_with_retries(
+            parallel,
+            parallelism,
+            DEFAULT_LARGE_REVIEW_CHUNK_RETRIES,
+            true,
+        )
+    }
+
+    fn execution_with_retries(
+        parallel: bool,
+        parallelism: usize,
+        chunk_retries: usize,
+        retry_serial: bool,
+    ) -> LargeReviewExecutionOptions {
+        LargeReviewExecutionOptions {
+            parallel,
+            parallelism,
+            chunk_retries,
+            retry_backoff_ms: 0,
+            retry_serial,
+        }
+    }
+
     fn run_fixture(
         chunk_count: usize,
     ) -> (
@@ -1896,6 +2640,17 @@ mod tests {
                 .map(|note| format!(r#""{note}""#))
                 .unwrap_or_else(|| "null".to_string())
         )
+    }
+
+    fn prompt_chunk_index(prompt: &str) -> usize {
+        prompt
+            .lines()
+            .find_map(|line| {
+                let after_prefix = line.strip_prefix("This is chunk ")?;
+                let (index, _) = after_prefix.split_once(" of ")?;
+                index.parse::<usize>().ok()
+            })
+            .unwrap()
     }
 
     fn planned(
@@ -2031,6 +2786,7 @@ mod tests {
         LargeReviewReport {
             total_chunks,
             reviewed_chunks: total_chunks - failed_chunks,
+            retried_chunks: 0,
             failed_chunks,
             reviewed_files: 2,
             skipped_files: 3,

@@ -115,6 +115,12 @@ pub struct ReviewArgs {
     #[arg(long, value_name = "N", conflicts_with = "serial")]
     pub max_parallel: Option<usize>,
 
+    #[arg(long, value_name = "N", conflicts_with = "no_chunk_retry")]
+    pub chunk_retries: Option<usize>,
+
+    #[arg(long)]
+    pub no_chunk_retry: bool,
+
     #[arg(long, value_enum, value_name = "auto|single|large")]
     pub mode: Option<ReviewMode>,
 
@@ -537,6 +543,39 @@ mod tests {
         let args = review_args(cli.command);
         assert!(args.parallel);
         assert_eq!(args.max_parallel, Some(6));
+        args.validate().unwrap();
+    }
+
+    #[test]
+    fn large_chunk_retry_flags_parse() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--large",
+            "--chunk-retries",
+            "2",
+        ]);
+
+        let args = review_args(cli.command);
+        assert_eq!(args.chunk_retries, Some(2));
+        assert!(!args.no_chunk_retry);
+        args.validate().unwrap();
+    }
+
+    #[test]
+    fn large_no_chunk_retry_flag_parses() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--large",
+            "--no-chunk-retry",
+        ]);
+
+        let args = review_args(cli.command);
+        assert!(args.no_chunk_retry);
+        assert_eq!(args.chunk_retries, None);
         args.validate().unwrap();
     }
 

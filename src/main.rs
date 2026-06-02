@@ -416,6 +416,12 @@ async fn run_large_review(
         large_options.parallel = true;
         large_options.parallelism = max_parallel;
     }
+    if args.no_chunk_retry {
+        large_options.chunk_retries = 0;
+    }
+    if let Some(chunk_retries) = args.chunk_retries {
+        large_options.chunk_retries = chunk_retries;
+    }
 
     let mut plan_options = PlanOptions::from_env();
     plan_options.max_files = large_options.max_chunks * large_options.max_files_per_chunk;
@@ -495,6 +501,49 @@ async fn run_large_review(
                 ..
             } => {
                 println!("Chunk {chunk_index}/{total_chunks} failed: {error}");
+            }
+            ChunkReviewProgress::Retrying {
+                retryable_failures,
+                attempt,
+                max_attempts,
+            } => {
+                let label = if retryable_failures == 1 {
+                    "retryable failure"
+                } else {
+                    "retryable failures"
+                };
+                println!(
+                    "Retrying failed chunks: {retryable_failures} {label}, attempt {attempt}/{max_attempts}"
+                );
+            }
+            ChunkReviewProgress::RetryStarted {
+                chunk_index,
+                total_chunks,
+                serial,
+            } => {
+                if serial {
+                    println!("Retrying chunk {chunk_index}/{total_chunks} serially...");
+                } else {
+                    println!("Retrying chunk {chunk_index}/{total_chunks}...");
+                }
+            }
+            ChunkReviewProgress::Retried {
+                chunk_index,
+                total_chunks,
+                ..
+            } => {
+                println!("Chunk {chunk_index}/{total_chunks} completed on retry");
+            }
+            ChunkReviewProgress::RetryFailed {
+                chunk_index,
+                total_chunks,
+                retries,
+                ..
+            } => {
+                let label = if retries == 1 { "retry" } else { "retries" };
+                println!(
+                    "Chunk {chunk_index}/{total_chunks} failed after {retries} {label}. Findings may be incomplete."
+                );
             }
         },
         move |prompt| {
