@@ -359,6 +359,37 @@ mod tests {
     }
 
     #[test]
+    fn counters_exclude_unvalidated_build_break_from_high_and_priority() {
+        let mut build_break = finding(Severity::High, true);
+        build_break.anchor_id = Some("A0001".to_string());
+        build_break.title = "Invalid Kotlin syntax will break android build".to_string();
+        build_break.body = "The line contains `return @../../tmp false`.".to_string();
+        build_break.suggested_fix = Some("Use a valid Kotlin labeled return.".to_string());
+        build_break.file_path = Some("src/app.kt".to_string());
+        build_break.line = Some(1);
+        let mut builder = AnchorBuilder::new();
+        builder.add_diff(&diff("src/app.kt", "@@ -0,0 +1 @@\n+return enabled"));
+        let anchors = builder.finish(false);
+        let analysis = validate_review_analysis_evidence(
+            ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![build_break],
+                test_coverage_note: None,
+                privacy_note: None,
+                overall_risk: OverallRisk::High,
+            },
+            &anchors,
+        );
+
+        let counters = count_findings_from_analysis(&analysis);
+
+        assert_eq!(counters.high, 0);
+        assert_eq!(counters.open_priority, 0);
+        assert_eq!(counters.low, 1);
+        assert_eq!(counters.open_actionable, 0);
+    }
+
+    #[test]
     fn markdown_finding_summary_table_formats_expected_rows() {
         let markdown = format_finding_counters_markdown(
             &super::FindingCounters {

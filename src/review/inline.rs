@@ -1082,6 +1082,37 @@ mod tests {
     }
 
     #[test]
+    fn unvalidated_build_break_finding_is_not_inline_candidate() {
+        let diff = diff("src/app.kt", "@@ -0,0 +1 @@\n+return enabled");
+        let anchors = anchored_context(&diff);
+        let mut build_break = finding(
+            Severity::High,
+            Effort::Quick,
+            true,
+            Some("src/app.kt"),
+            Some(1),
+        );
+        build_break.anchor_id = Some("A0001".to_string());
+        build_break.title = "Invalid Kotlin syntax will break android build".to_string();
+        build_break.body = "The line contains `return @../../tmp false`.".to_string();
+        build_break.suggested_fix = Some("Use a valid Kotlin labeled return.".to_string());
+        let analysis = validate_review_analysis_evidence(analysis(vec![build_break]), &anchors);
+
+        let candidate = super::resolve_inline_candidates_with_anchors(
+            &analysis,
+            &[diff],
+            Some(&anchors),
+            Some(&diff_refs()),
+            &inline_config(8, 5),
+        )
+        .remove(0);
+
+        assert_eq!(analysis.findings[0].severity, Severity::Low);
+        assert!(!candidate.eligible);
+        assert_eq!(candidate.reason, InlineEligibilityReason::SeverityTooLow);
+    }
+
+    #[test]
     fn max_high_limit_enforced() {
         let analysis = analysis(vec![
             finding(

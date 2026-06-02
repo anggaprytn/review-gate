@@ -696,10 +696,16 @@ mod tests {
         format_malformed_review_markdown, format_review_markdown_for_mode_with_emoji,
         format_review_markdown_with_emoji, sorted_findings, MarkdownRenderMode,
     };
-    use crate::review::{
-        parser::ReviewParseError,
-        types::{
-            Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, RiskCode, Severity,
+    use crate::{
+        gitlab::types::MergeRequestDiff,
+        review::{
+            anchors::AnchorBuilder,
+            evidence::validate_review_analysis_evidence,
+            parser::ReviewParseError,
+            types::{
+                Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, RiskCode,
+                Severity,
+            },
         },
     };
 
@@ -873,6 +879,45 @@ mod tests {
 
         assert_eq!(markdown.matches("### LOW").count(), 1);
         assert_eq!(markdown.matches("### NOTE").count(), 1);
+    }
+
+    #[test]
+    fn published_markdown_does_not_show_unvalidated_high_build_break() {
+        let mut build_break = finding(
+            Severity::High,
+            "Invalid Kotlin syntax will break android build",
+        );
+        build_break.category = ReviewCategory::Correctness;
+        build_break.file_path = Some("src/app.kt".to_string());
+        build_break.line = Some(1);
+        build_break.anchor_id = Some("A0001".to_string());
+        build_break.body = "The line contains `return @../../tmp false`.".to_string();
+        build_break.suggested_fix = Some("Use a valid Kotlin labeled return.".to_string());
+        let mut builder = AnchorBuilder::new();
+        builder.add_diff(&diff("src/app.kt", "@@ -0,0 +1 @@\n+return enabled"));
+        let anchors = builder.finish(false);
+        let analysis = validate_review_analysis_evidence(
+            ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![build_break],
+                test_coverage_note: None,
+                privacy_note: None,
+                overall_risk: OverallRisk::High,
+            },
+            &anchors,
+        );
+
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &analysis,
+            MarkdownRenderMode::Publish,
+            false,
+        );
+
+        assert!(markdown.contains("| High | 0 |"));
+        assert!(markdown.contains("Open priority findings: 0"));
+        assert!(markdown.contains("## High\n\nNo high findings."));
+        assert!(!markdown.contains("### HIGH"));
+        assert!(!markdown.contains("Invalid Kotlin syntax will break android build"));
     }
 
     #[test]
@@ -1107,6 +1152,20 @@ mod tests {
             actionable: true,
             evidence_status: None,
             evidence_reason: None,
+        }
+    }
+
+    fn diff(path: &str, body: &str) -> MergeRequestDiff {
+        MergeRequestDiff {
+            old_path: path.to_string(),
+            new_path: path.to_string(),
+            diff: body.to_string(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            generated_file: None,
+            collapsed: None,
+            too_large: None,
         }
     }
 

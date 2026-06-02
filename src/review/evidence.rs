@@ -52,6 +52,33 @@ const STALE_CONTEXT_PHRASES: &[&str] = &[
     "prior implementation",
 ];
 
+const BUILD_BREAK_CLAIM_PHRASES: &[&str] = &[
+    "invalid syntax",
+    "invalid kotlin syntax",
+    "invalid typescript syntax",
+    "invalid javascript syntax",
+    "build failure",
+    "build fail",
+    "fail build",
+    "break build",
+    "break android build",
+    "compile failure",
+    "compilation failure",
+    "does not compile",
+    "won't compile",
+    "corrupted code",
+    "malformed kotlin",
+    "malformed typescript",
+    "malformed javascript",
+    "malformed code",
+    "merge artifact",
+    "merge conflict",
+    "build artifact in source",
+];
+
+const BUILD_BREAK_UNVALIDATED_REASON: &str =
+    "Build-break claim not validated: exact invalid syntax not found in current anchored diff.";
+
 const STOPWORDS: &[&str] = &[
     "about", "action", "added", "after", "against", "also", "because", "before", "being",
     "between", "body", "cannot", "change", "changed", "code", "could", "does", "finding", "from",
@@ -80,6 +107,7 @@ pub fn validate_finding_evidence(
         return finding;
     }
 
+    normalize_kotlin_any_suggested_fix(&mut finding, anchors);
     let result = validate_high_priority_finding(&finding, anchors);
     apply_validation_result(&mut finding, &result, anchors);
     finding.evidence_status = Some(result.status);
@@ -91,6 +119,9 @@ pub fn validate_high_priority_finding(
     finding: &ReviewFinding,
     anchors: &AnchoredDiffContext,
 ) -> EvidenceValidationResult {
+    let finding_text = finding_text(finding);
+    let finding_text_lower = finding_text.to_ascii_lowercase();
+
     if positive_change_signal(finding) {
         return result(
             EvidenceValidationStatus::PositiveChange,
@@ -103,7 +134,9 @@ pub fn validate_high_priority_finding(
         LocationEvidence::MissingAnchor { fallback_valid } => {
             return result(
                 EvidenceValidationStatus::NotInDiff,
-                if fallback_valid {
+                if build_break_claim(finding, &finding_text_lower) {
+                    BUILD_BREAK_UNVALIDATED_REASON
+                } else if fallback_valid {
                     "anchor_id is not present in the current anchored diff; file/line fallback exists"
                 } else {
                     "anchor_id is not present in the current anchored diff"
@@ -113,16 +146,32 @@ pub fn validate_high_priority_finding(
         LocationEvidence::MissingFileLine => {
             return result(
                 EvidenceValidationStatus::NotInDiff,
-                "finding does not map to a current changed or context line",
+                if build_break_claim(finding, &finding_text_lower) {
+                    BUILD_BREAK_UNVALIDATED_REASON
+                } else {
+                    "finding does not map to a current changed or context line"
+                },
             );
         }
     };
 
-    let finding_text = finding_text(finding);
-    let finding_text_lower = finding_text.to_ascii_lowercase();
     let evidence_text = nearby_evidence_text(anchors, location.anchor_index);
     let evidence_lower = evidence_text.to_ascii_lowercase();
-    let build_break = build_break_evidence(&evidence_lower);
+    let current_nearby_evidence =
+        current_nearby_evidence_text(anchors, location.anchor_index).to_ascii_lowercase();
+    let current_file_evidence =
+        current_file_evidence_text(anchors, location.anchor_index).to_ascii_lowercase();
+    let build_break = build_break_evidence(&current_nearby_evidence)
+        || build_break_evidence(&current_file_evidence);
+
+    if build_break_claim(finding, &finding_text_lower) {
+        return validate_build_break_claim(
+            &finding_text_lower,
+            &current_nearby_evidence,
+            &current_file_evidence,
+        );
+    }
+
     let risk_supported = risk_specific_evidence(finding, &finding_text_lower, &evidence_lower);
     let generic_supported = generic_keyword_overlap(&finding_text_lower, &evidence_lower);
     let strong_evidence = build_break || risk_supported;
@@ -164,6 +213,7 @@ fn apply_validation_result(
     result: &EvidenceValidationResult,
     anchors: &AnchoredDiffContext,
 ) {
+    let build_break_claim = build_break_claim(finding, &finding_text(finding).to_ascii_lowercase());
     match result.status {
         EvidenceValidationStatus::Validated => {
             if finding.severity == Severity::Critical
@@ -179,22 +229,34 @@ fn apply_validation_result(
             finding.risk_code = Some(RiskCode::PositiveNote);
         }
         EvidenceValidationStatus::NotInDiff => {
-            finding.severity = Severity::Medium;
-            finding.actionable = fallback_line_anchor(finding, anchors).is_some();
+            if build_break_claim {
+                drop_unvalidated_build_break(finding);
+            } else {
+                finding.severity = Severity::Medium;
+                finding.actionable = fallback_line_anchor(finding, anchors).is_some();
+            }
         }
         EvidenceValidationStatus::StaleContext => {
-            finding.severity = match finding.severity {
-                Severity::Critical | Severity::High => Severity::Medium,
-                severity => severity,
-            };
+            if build_break_claim {
+                drop_unvalidated_build_break(finding);
+            } else {
+                finding.severity = match finding.severity {
+                    Severity::Critical | Severity::High => Severity::Medium,
+                    severity => severity,
+                };
+            }
         }
         EvidenceValidationStatus::WeakEvidence
         | EvidenceValidationStatus::NeedsManualConfirmation => {
-            finding.severity = match finding.severity {
-                Severity::Critical if critical_risk_code(finding.risk_code) => Severity::High,
-                Severity::Critical | Severity::High => Severity::Medium,
-                severity => severity,
-            };
+            if build_break_claim {
+                drop_unvalidated_build_break(finding);
+            } else {
+                finding.severity = match finding.severity {
+                    Severity::Critical if critical_risk_code(finding.risk_code) => Severity::High,
+                    Severity::Critical | Severity::High => Severity::Medium,
+                    severity => severity,
+                };
+            }
         }
     }
 }
@@ -273,6 +335,45 @@ fn nearby_evidence_text(anchors: &AnchoredDiffContext, anchor_index: usize) -> S
         .join("\n")
 }
 
+fn current_nearby_evidence_text(anchors: &AnchoredDiffContext, anchor_index: usize) -> String {
+    let Some(anchor) = anchors.anchors.get(anchor_index) else {
+        return String::new();
+    };
+    let start = anchor_index.saturating_sub(NEARBY_ANCHOR_WINDOW);
+    let end = (anchor_index + NEARBY_ANCHOR_WINDOW + 1).min(anchors.anchors.len());
+
+    anchors.anchors[start..end]
+        .iter()
+        .filter(|nearby| {
+            nearby.new_line.is_some()
+                && (nearby.file_path == anchor.file_path
+                    || nearby.new_path == anchor.new_path
+                    || nearby.old_path == anchor.old_path)
+        })
+        .map(|nearby| nearby.content_preview.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn current_file_evidence_text(anchors: &AnchoredDiffContext, anchor_index: usize) -> String {
+    let Some(anchor) = anchors.anchors.get(anchor_index) else {
+        return String::new();
+    };
+
+    anchors
+        .anchors
+        .iter()
+        .filter(|candidate| {
+            candidate.new_line.is_some()
+                && (candidate.file_path == anchor.file_path
+                    || candidate.new_path == anchor.new_path
+                    || candidate.old_path == anchor.old_path)
+        })
+        .map(|candidate| candidate.content_preview.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn finding_text(finding: &ReviewFinding) -> String {
     format!(
         "{} {} {} {}",
@@ -314,6 +415,26 @@ fn stale_context_signal(text: &str) -> bool {
     STALE_CONTEXT_PHRASES
         .iter()
         .any(|phrase| text.contains(phrase))
+}
+
+fn validate_build_break_claim(
+    finding_text: &str,
+    nearby_evidence: &str,
+    file_evidence: &str,
+) -> EvidenceValidationResult {
+    if build_break_evidence(nearby_evidence) || build_break_evidence(file_evidence) {
+        return result(
+            EvidenceValidationStatus::Validated,
+            "current anchored diff contains exact compiler-breaking syntax evidence",
+        );
+    }
+
+    let status = if stale_context_signal(finding_text) {
+        EvidenceValidationStatus::StaleContext
+    } else {
+        EvidenceValidationStatus::WeakEvidence
+    };
+    result(status, BUILD_BREAK_UNVALIDATED_REASON)
 }
 
 fn risk_specific_evidence(finding: &ReviewFinding, finding_text: &str, evidence: &str) -> bool {
@@ -407,7 +528,20 @@ fn build_break_finding(finding: &ReviewFinding, anchors: &AnchoredDiffContext) -
     }) else {
         return false;
     };
-    build_break_evidence(&nearby_evidence_text(anchors, anchor_index).to_ascii_lowercase())
+    build_break_evidence(&current_nearby_evidence_text(anchors, anchor_index).to_ascii_lowercase())
+        || build_break_evidence(
+            &current_file_evidence_text(anchors, anchor_index).to_ascii_lowercase(),
+        )
+}
+
+fn build_break_claim(finding: &ReviewFinding, text: &str) -> bool {
+    let text = if text.is_empty() {
+        finding_text(finding).to_ascii_lowercase()
+    } else {
+        text.to_string()
+    };
+
+    contains_any(&text, BUILD_BREAK_CLAIM_PHRASES)
 }
 
 fn build_break_evidence(evidence: &str) -> bool {
@@ -418,15 +552,62 @@ fn build_break_evidence(evidence: &str) -> bool {
             "=======",
             ">>>>>>>",
             "return @",
+            "return@../../",
+            "return @../../",
+            "return @/",
+            "return@/",
+            " @../../",
             "=> @",
             "= @",
-            " @../../",
-            "syntax error",
-            "unterminated",
-            "unexpected token",
-            "invalid token",
+            "/users/",
+            "/home/",
+            "/var/folders/",
+            "target/debug",
+            "build/intermediates",
+            "<unknown>",
+            "undefined undefined",
+            "todo_remove_this",
         ],
     )
+}
+
+fn drop_unvalidated_build_break(finding: &mut ReviewFinding) {
+    finding.severity = Severity::Low;
+    finding.actionable = false;
+}
+
+fn normalize_kotlin_any_suggested_fix(finding: &mut ReviewFinding, anchors: &AnchoredDiffContext) {
+    let Some(suggested_fix) = finding.suggested_fix.as_deref() else {
+        return;
+    };
+    if !finding
+        .file_path
+        .as_deref()
+        .is_some_and(|path| path.ends_with(".kt") || path.ends_with(".kts"))
+    {
+        return;
+    }
+    let suggested_fix_lower = suggested_fix.to_ascii_lowercase();
+    if !contains_any(
+        &suggested_fix_lower,
+        &["return@line false", "line@{", "line@ {", "custom label"],
+    ) {
+        return;
+    }
+
+    let Some(anchor_index) = (match resolve_location(finding, anchors) {
+        LocationEvidence::Valid(location) => Some(location.anchor_index),
+        LocationEvidence::MissingAnchor { .. } | LocationEvidence::MissingFileLine => None,
+    }) else {
+        return;
+    };
+    let nearby = nearby_evidence_text(anchors, anchor_index).to_ascii_lowercase();
+    if !nearby.contains(".any") || contains_any(&nearby, &["line@{", "line@ {"]) {
+        return;
+    }
+
+    finding.suggested_fix =
+        Some("Use `return@any false` from inside the `.any { ... }` lambda.".to_string());
 }
 
 fn critical_build_break_allowed(finding: &ReviewFinding) -> bool {
@@ -699,7 +880,7 @@ fn result(status: EvidenceValidationStatus, reason: &str) -> EvidenceValidationR
 
 #[cfg(test)]
 mod tests {
-    use super::validate_review_analysis_evidence;
+    use super::{validate_review_analysis_evidence, BUILD_BREAK_UNVALIDATED_REASON};
     use crate::{
         gitlab::types::MergeRequestDiff,
         review::{
@@ -944,6 +1125,215 @@ mod tests {
     }
 
     #[test]
+    fn build_break_return_path_artifact_remains_high_with_exact_evidence() {
+        let analysis = validated(
+            vec![finding(
+                Severity::High,
+                ReviewCategory::Correctness,
+                None,
+                Some("A0001"),
+                Some("src/app.kt"),
+                Some(1),
+                "Invalid Kotlin syntax will break android build",
+                "The current line contains `return @../../tmp false`.",
+                "Use a valid Kotlin labeled return.",
+                true,
+            )],
+            "@@ -0,0 +1 @@\n+return @../../tmp false",
+        );
+
+        assert_eq!(analysis.findings[0].severity, Severity::High);
+        assert!(analysis.findings[0].actionable);
+        assert_eq!(
+            analysis.findings[0].evidence_status,
+            Some(EvidenceValidationStatus::Validated)
+        );
+    }
+
+    #[test]
+    fn build_break_model_only_claim_without_anchor_evidence_drops_from_priority() {
+        let analysis = validated(
+            vec![finding(
+                Severity::High,
+                ReviewCategory::Correctness,
+                None,
+                Some("A0001"),
+                Some("src/app.kt"),
+                Some(1),
+                "Invalid Kotlin syntax will break android build",
+                "The line contains `return @../../tmp false` and will fail the build.",
+                "Use a valid Kotlin labeled return.",
+                true,
+            )],
+            "@@ -0,0 +1 @@\n+return enabled",
+        );
+
+        assert_eq!(analysis.findings[0].severity, Severity::Low);
+        assert!(!analysis.findings[0].actionable);
+        assert_eq!(
+            analysis.findings[0].evidence_status,
+            Some(EvidenceValidationStatus::WeakEvidence)
+        );
+        assert_eq!(
+            analysis.findings[0].evidence_reason.as_deref(),
+            Some(BUILD_BREAK_UNVALIDATED_REASON)
+        );
+    }
+
+    #[test]
+    fn build_break_invalid_file_line_is_not_in_diff_and_drops_from_priority() {
+        let analysis = validated_with_diff_path(
+            vec![finding(
+                Severity::High,
+                ReviewCategory::Correctness,
+                None,
+                None,
+                Some("src/missing.kt"),
+                Some(99),
+                "Invalid Kotlin syntax will break android build",
+                "The line contains `return @../../tmp false`.",
+                "Use a valid Kotlin labeled return.",
+                true,
+            )],
+            "src/app.kt",
+            "@@ -0,0 +1 @@\n+return enabled",
+        );
+
+        assert_eq!(analysis.findings[0].severity, Severity::Low);
+        assert!(!analysis.findings[0].actionable);
+        assert_eq!(
+            analysis.findings[0].evidence_status,
+            Some(EvidenceValidationStatus::NotInDiff)
+        );
+        assert_eq!(
+            analysis.findings[0].evidence_reason.as_deref(),
+            Some(BUILD_BREAK_UNVALIDATED_REASON)
+        );
+    }
+
+    #[test]
+    fn build_break_stale_context_phrase_downgrades_without_exact_evidence() {
+        let analysis = validated(
+            vec![finding(
+                Severity::High,
+                ReviewCategory::Correctness,
+                None,
+                Some("A0001"),
+                Some("src/app.kt"),
+                Some(1),
+                "Invalid Kotlin syntax was previously present",
+                "Before this change the line contained `return @../../tmp false`.",
+                "Use a valid Kotlin labeled return.",
+                true,
+            )],
+            "@@ -0,0 +1 @@\n+return enabled",
+        );
+
+        assert_eq!(analysis.findings[0].severity, Severity::Low);
+        assert!(!analysis.findings[0].actionable);
+        assert_eq!(
+            analysis.findings[0].evidence_status,
+            Some(EvidenceValidationStatus::StaleContext)
+        );
+    }
+
+    #[test]
+    fn kotlin_any_suggested_fix_prefers_return_at_any() {
+        let analysis = validated(
+            vec![finding(
+                Severity::High,
+                ReviewCategory::Correctness,
+                None,
+                Some("A0002"),
+                Some("src/app.kt"),
+                Some(2),
+                "Invalid Kotlin syntax will break android build",
+                "The lambda return is malformed.",
+                "Wrap the lambda with `line@{ line -> return@line false }`.",
+                true,
+            )],
+            "@@ -0,0 +1,3 @@\n+val ok = lines.any { line ->\n+    return @../../tmp false\n+}",
+        );
+
+        assert_eq!(
+            analysis.findings[0].suggested_fix.as_deref(),
+            Some("Use `return@any false` from inside the `.any { ... }` lambda.")
+        );
+    }
+
+    #[test]
+    fn build_break_merge_conflict_marker_remains_high() {
+        let analysis = validated(
+            vec![finding(
+                Severity::High,
+                ReviewCategory::Correctness,
+                None,
+                Some("A0001"),
+                Some("src/app.ts"),
+                Some(1),
+                "Merge artifact will fail build",
+                "A merge conflict marker remains in source.",
+                "Resolve the conflict.",
+                true,
+            )],
+            "@@ -0,0 +1 @@\n+<<<<<<< HEAD",
+        );
+
+        assert_eq!(analysis.findings[0].severity, Severity::High);
+        assert_eq!(
+            analysis.findings[0].evidence_status,
+            Some(EvidenceValidationStatus::Validated)
+        );
+    }
+
+    #[test]
+    fn build_break_local_path_artifact_remains_high() {
+        let analysis = validated(
+            vec![finding(
+                Severity::High,
+                ReviewCategory::Correctness,
+                None,
+                Some("A0001"),
+                Some("src/app.ts"),
+                Some(1),
+                "Build artifact in source will fail build",
+                "A local build path was pasted into source code.",
+                "Replace the local path with a project-relative path.",
+                true,
+            )],
+            "@@ -0,0 +1 @@\n+const artifact = \"/Users/me/project/build/intermediates/classes.dex\"",
+        );
+
+        assert_eq!(analysis.findings[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn model_only_will_fail_build_text_is_not_evidence() {
+        let analysis = validated(
+            vec![finding(
+                Severity::High,
+                ReviewCategory::Correctness,
+                None,
+                Some("A0001"),
+                Some("src/app.ts"),
+                Some(1),
+                "This will fail build",
+                "The model says this will cause build failure.",
+                "Fix the build failure.",
+                true,
+            )],
+            "@@ -0,0 +1 @@\n+const enabled = true",
+        );
+
+        assert_eq!(analysis.findings[0].severity, Severity::Low);
+        assert!(!analysis.findings[0].actionable);
+        assert_eq!(
+            analysis.findings[0].evidence_status,
+            Some(EvidenceValidationStatus::WeakEvidence)
+        );
+    }
+
+    #[test]
     fn critical_build_break_downgrades_to_high_without_deploy_evidence() {
         let analysis = validated(
             vec![finding(
@@ -990,12 +1380,21 @@ mod tests {
     }
 
     fn validated(findings: Vec<ReviewFinding>, diff_body: &str) -> ReviewAnalysis {
-        let mut builder = AnchorBuilder::new();
         let path = findings
             .first()
             .and_then(|finding| finding.file_path.as_deref())
-            .unwrap_or("src/client.ts");
-        builder.add_diff(&diff(path, diff_body));
+            .unwrap_or("src/client.ts")
+            .to_string();
+        validated_with_diff_path(findings, &path, diff_body)
+    }
+
+    fn validated_with_diff_path(
+        findings: Vec<ReviewFinding>,
+        diff_path: &str,
+        diff_body: &str,
+    ) -> ReviewAnalysis {
+        let mut builder = AnchorBuilder::new();
+        builder.add_diff(&diff(diff_path, diff_body));
         let anchors = builder.finish(false);
         validate_review_analysis_evidence(analysis(findings), &anchors)
     }
