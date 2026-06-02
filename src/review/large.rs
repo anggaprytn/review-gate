@@ -14,10 +14,12 @@ use crate::{
         types::{OverallRisk, ReviewAnalysis, ReviewFinding, Severity},
     },
 };
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use std::{
     collections::{BTreeMap, HashSet},
     env,
     future::Future,
+    time::Instant,
 };
 
 pub const DEFAULT_LARGE_REVIEW_ENABLED: bool = true;
@@ -25,6 +27,8 @@ pub const DEFAULT_LARGE_REVIEW_MAX_CHUNKS: usize = 6;
 pub const DEFAULT_LARGE_REVIEW_MAX_FILES_PER_CHUNK: usize = 8;
 pub const DEFAULT_LARGE_REVIEW_MAX_DIFF_BYTES_PER_CHUNK: usize = 60_000;
 pub const DEFAULT_LARGE_REVIEW_INCLUDE_LOW: bool = false;
+pub const DEFAULT_LARGE_REVIEW_PARALLEL: bool = true;
+pub const DEFAULT_LARGE_REVIEW_PARALLELISM: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LargeReviewOptions {
@@ -33,6 +37,8 @@ pub struct LargeReviewOptions {
     pub max_files_per_chunk: usize,
     pub max_diff_bytes_per_chunk: usize,
     pub include_low_risk: bool,
+    pub parallel: bool,
+    pub parallelism: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +61,12 @@ pub struct LargeReviewSelection {
 pub struct LargeReviewPlan {
     pub selection: LargeReviewSelection,
     pub chunks: Vec<ReviewChunk>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LargeReviewExecutionOptions {
+    pub parallel: bool,
+    pub parallelism: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +92,42 @@ pub struct ChunkFailure {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkReviewStatus {
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChunkReviewResult {
+    pub chunk_index: usize,
+    pub status: ChunkReviewStatus,
+    pub analysis: Option<ReviewAnalysis>,
+    pub error: Option<String>,
+    pub duration_ms: Option<u128>,
+    pub metadata: LlmRunMetadata,
+    pub prompt_token_estimate: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkReviewProgress {
+    Started {
+        chunk_index: usize,
+        total_chunks: usize,
+    },
+    Completed {
+        chunk_index: usize,
+        total_chunks: usize,
+        duration_ms: Option<u128>,
+    },
+    Failed {
+        chunk_index: usize,
+        total_chunks: usize,
+        duration_ms: Option<u128>,
+        error: String,
+    },
+}
+
 impl Default for LargeReviewOptions {
     fn default() -> Self {
         Self {
@@ -88,12 +136,29 @@ impl Default for LargeReviewOptions {
             max_files_per_chunk: DEFAULT_LARGE_REVIEW_MAX_FILES_PER_CHUNK,
             max_diff_bytes_per_chunk: DEFAULT_LARGE_REVIEW_MAX_DIFF_BYTES_PER_CHUNK,
             include_low_risk: DEFAULT_LARGE_REVIEW_INCLUDE_LOW,
+            parallel: DEFAULT_LARGE_REVIEW_PARALLEL,
+            parallelism: DEFAULT_LARGE_REVIEW_PARALLELISM,
         }
     }
 }
 
 impl LargeReviewOptions {
     pub fn from_env() -> Self {
+        let (parallel, parallel_warning) = env_bool_with_warning(
+            "REVIEWGATE_LARGE_REVIEW_PARALLEL",
+            DEFAULT_LARGE_REVIEW_PARALLEL,
+        );
+        if let Some(warning) = parallel_warning {
+            eprintln!("{warning}");
+        }
+        let (parallelism, parallelism_warning) = env_usize_with_warning(
+            "REVIEWGATE_LARGE_REVIEW_PARALLELISM",
+            DEFAULT_LARGE_REVIEW_PARALLELISM,
+        );
+        if let Some(warning) = parallelism_warning {
+            eprintln!("{warning}");
+        }
+
         Self {
             enabled: env_bool("REVIEWGATE_LARGE_REVIEW_ENABLED")
                 .unwrap_or(DEFAULT_LARGE_REVIEW_ENABLED),
@@ -108,7 +173,27 @@ impl LargeReviewOptions {
                 .max(1),
             include_low_risk: env_bool("REVIEWGATE_LARGE_REVIEW_INCLUDE_LOW")
                 .unwrap_or(DEFAULT_LARGE_REVIEW_INCLUDE_LOW),
+            parallel,
+            parallelism,
         }
+    }
+}
+
+impl From<LargeReviewOptions> for LargeReviewExecutionOptions {
+    fn from(options: LargeReviewOptions) -> Self {
+        Self {
+            parallel: options.parallel,
+            parallelism: options.parallelism,
+        }
+    }
+}
+
+impl LargeReviewExecutionOptions {
+    pub fn effective_parallelism(self, chunk_count: usize) -> usize {
+        if chunk_count == 0 || !self.parallel {
+            return 1;
+        }
+        self.parallelism.max(1).min(chunk_count)
     }
 }
 
@@ -377,50 +462,91 @@ Anchored sanitized diff:
 pub async fn review_large_chunks_with_llm<F, Fut>(
     context: LargeReviewRunContext<'_>,
     chunks: &[ReviewChunk],
+    execution: LargeReviewExecutionOptions,
     mode: MarkdownRenderMode,
     show_prompt: bool,
-    mut progress: impl FnMut(&ReviewChunk, usize),
-    mut call_llm: F,
+    mut progress: impl FnMut(ChunkReviewProgress),
+    call_llm: F,
 ) -> Result<ReviewPreview>
 where
-    F: FnMut(String) -> Fut,
+    F: Fn(String) -> Fut,
     Fut: Future<Output = Result<LlmReviewResponse>>,
 {
     let total_chunks = chunks.len();
+    let parallelism = execution.effective_parallelism(total_chunks);
+    let mut pending = chunks.iter().cloned();
+    let mut running = FuturesUnordered::new();
+    let mut results = Vec::new();
+
+    while running.len() < parallelism {
+        let Some(chunk) = pending.next() else {
+            break;
+        };
+        progress(ChunkReviewProgress::Started {
+            chunk_index: chunk.index,
+            total_chunks,
+        });
+        running.push(review_one_large_chunk(
+            context,
+            chunk,
+            total_chunks,
+            show_prompt,
+            &call_llm,
+        ));
+    }
+
+    while let Some(result) = running.next().await {
+        match result.status {
+            ChunkReviewStatus::Completed => progress(ChunkReviewProgress::Completed {
+                chunk_index: result.chunk_index,
+                total_chunks,
+                duration_ms: result.duration_ms,
+            }),
+            ChunkReviewStatus::Failed => progress(ChunkReviewProgress::Failed {
+                chunk_index: result.chunk_index,
+                total_chunks,
+                duration_ms: result.duration_ms,
+                error: result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".to_string()),
+            }),
+        }
+        results.push(result);
+
+        if let Some(chunk) = pending.next() {
+            progress(ChunkReviewProgress::Started {
+                chunk_index: chunk.index,
+                total_chunks,
+            });
+            running.push(review_one_large_chunk(
+                context,
+                chunk,
+                total_chunks,
+                show_prompt,
+                &call_llm,
+            ));
+        }
+    }
+
+    results.sort_by_key(|result| result.chunk_index);
     let mut analyses = Vec::new();
     let mut failures = Vec::new();
     let mut metadata_total = LlmRunMetadata::default();
     let mut prompt_token_estimate = 0u64;
 
-    for chunk in chunks {
-        progress(chunk, total_chunks);
-        let prompt = build_large_chunk_prompt(context.metadata, chunk, total_chunks);
-        prompt_token_estimate += estimate_prompt_tokens(&prompt);
-        if show_prompt {
-            println!("ReviewGate sanitized chunk prompt {}", chunk.index);
-            println!("====================================");
-            println!("{prompt}");
-            println!("====================================");
-            println!();
-        }
-
-        match call_llm(prompt).await {
-            Ok(response) => {
-                merge_metadata(&mut metadata_total, &response.metadata);
-                match parse_review_analysis(&response.text) {
-                    Ok(analysis) => analyses.push(validate_review_analysis_evidence(
-                        normalize_review_analysis(analysis),
-                        context.anchors,
-                    )),
-                    Err(err) => failures.push(ChunkFailure {
-                        chunk_index: chunk.index,
-                        message: err.to_string(),
-                    }),
+    for result in results {
+        prompt_token_estimate += result.prompt_token_estimate;
+        match result.status {
+            ChunkReviewStatus::Completed => {
+                merge_metadata(&mut metadata_total, &result.metadata);
+                if let Some(analysis) = result.analysis {
+                    analyses.push(analysis);
                 }
             }
-            Err(err) => failures.push(ChunkFailure {
-                chunk_index: chunk.index,
-                message: err.to_string(),
+            ChunkReviewStatus::Failed => failures.push(ChunkFailure {
+                chunk_index: result.chunk_index,
+                message: result.error.unwrap_or_else(|| "unknown error".to_string()),
             }),
         }
     }
@@ -455,6 +581,64 @@ where
         parsed: true,
         analysis: Some(analysis),
     })
+}
+
+async fn review_one_large_chunk<F, Fut>(
+    context: LargeReviewRunContext<'_>,
+    chunk: ReviewChunk,
+    total_chunks: usize,
+    show_prompt: bool,
+    call_llm: &F,
+) -> ChunkReviewResult
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<LlmReviewResponse>>,
+{
+    let prompt = build_large_chunk_prompt(context.metadata, &chunk, total_chunks);
+    let prompt_token_estimate = estimate_prompt_tokens(&prompt);
+    if show_prompt {
+        println!("ReviewGate sanitized chunk prompt {}", chunk.index);
+        println!("====================================");
+        println!("{prompt}");
+        println!("====================================");
+        println!();
+    }
+
+    let started = Instant::now();
+    match call_llm(prompt).await {
+        Ok(response) => match parse_review_analysis(&response.text) {
+            Ok(analysis) => ChunkReviewResult {
+                chunk_index: chunk.index,
+                status: ChunkReviewStatus::Completed,
+                analysis: Some(validate_review_analysis_evidence(
+                    normalize_review_analysis(analysis),
+                    context.anchors,
+                )),
+                error: None,
+                duration_ms: Some(started.elapsed().as_millis()),
+                metadata: response.metadata,
+                prompt_token_estimate,
+            },
+            Err(err) => ChunkReviewResult {
+                chunk_index: chunk.index,
+                status: ChunkReviewStatus::Failed,
+                analysis: None,
+                error: Some(err.to_string()),
+                duration_ms: Some(started.elapsed().as_millis()),
+                metadata: LlmRunMetadata::default(),
+                prompt_token_estimate,
+            },
+        },
+        Err(err) => ChunkReviewResult {
+            chunk_index: chunk.index,
+            status: ChunkReviewStatus::Failed,
+            analysis: None,
+            error: Some(err.to_string()),
+            duration_ms: Some(started.elapsed().as_millis()),
+            metadata: LlmRunMetadata::default(),
+            prompt_token_estimate,
+        },
+    }
 }
 
 pub fn merge_chunk_analyses(
@@ -943,6 +1127,29 @@ fn env_usize(name: &str) -> Option<usize> {
     env::var(name).ok().and_then(|value| value.parse().ok())
 }
 
+fn env_usize_with_warning(name: &str, default: usize) -> (usize, Option<String>) {
+    parse_env_usize_value_with_warning(name, env::var(name).ok(), default)
+}
+
+fn parse_env_usize_value_with_warning(
+    name: &str,
+    value: Option<String>,
+    default: usize,
+) -> (usize, Option<String>) {
+    let Some(value) = value else {
+        return (default, None);
+    };
+    match value.trim().parse::<usize>() {
+        Ok(value) if value >= 1 => (value, None),
+        _ => (
+            default,
+            Some(format!(
+                "Warning: invalid {name}={value:?}; using default {default}"
+            )),
+        ),
+    }
+}
+
 fn env_bool(name: &str) -> Option<bool> {
     env::var(name)
         .ok()
@@ -951,6 +1158,30 @@ fn env_bool(name: &str) -> Option<bool> {
             "0" | "false" | "no" | "off" => Some(false),
             _ => None,
         })
+}
+
+fn env_bool_with_warning(name: &str, default: bool) -> (bool, Option<String>) {
+    parse_env_bool_value_with_warning(name, env::var(name).ok(), default)
+}
+
+fn parse_env_bool_value_with_warning(
+    name: &str,
+    value: Option<String>,
+    default: bool,
+) -> (bool, Option<String>) {
+    let Some(value) = value else {
+        return (default, None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => (true, None),
+        "0" | "false" | "no" | "off" => (false, None),
+        _ => (
+            default,
+            Some(format!(
+                "Warning: invalid {name}={value:?}; using default {default}"
+            )),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1220,6 +1451,71 @@ mod tests {
             .contains("This is a partial risk-prioritized review, not a full exhaustive review."));
     }
 
+    #[test]
+    fn parallelism_is_capped_to_chunk_count() {
+        let execution = LargeReviewExecutionOptions {
+            parallel: true,
+            parallelism: 9,
+        };
+
+        assert_eq!(execution.effective_parallelism(3), 3);
+    }
+
+    #[test]
+    fn parallelism_one_behaves_as_serial() {
+        let execution = LargeReviewExecutionOptions {
+            parallel: true,
+            parallelism: 1,
+        };
+
+        assert_eq!(execution.effective_parallelism(3), 1);
+    }
+
+    #[test]
+    fn disabled_parallelism_behaves_as_serial() {
+        let execution = LargeReviewExecutionOptions {
+            parallel: false,
+            parallelism: 6,
+        };
+
+        assert_eq!(execution.effective_parallelism(3), 1);
+    }
+
+    #[test]
+    fn env_parallelism_parser_accepts_valid_value() {
+        let (value, warning) = parse_env_usize_value_with_warning(
+            "REVIEWGATE_LARGE_REVIEW_PARALLELISM",
+            Some("6".to_string()),
+            3,
+        );
+        assert_eq!(value, 6);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn env_parallelism_parser_warns_on_invalid_value() {
+        let (value, warning) = parse_env_usize_value_with_warning(
+            "REVIEWGATE_LARGE_REVIEW_PARALLELISM",
+            Some("0".to_string()),
+            3,
+        );
+
+        assert_eq!(value, 3);
+        assert!(warning.unwrap().contains("using default 3"));
+    }
+
+    #[test]
+    fn env_parallel_parser_accepts_boolean_value() {
+        let (value, warning) = parse_env_bool_value_with_warning(
+            "REVIEWGATE_LARGE_REVIEW_PARALLEL",
+            Some("false".to_string()),
+            true,
+        );
+
+        assert!(!value);
+        assert!(warning.is_none());
+    }
+
     #[tokio::test]
     async fn all_chunk_failures_error() {
         let selection = LargeReviewSelection {
@@ -1241,9 +1537,13 @@ mod tests {
                 anchors: &anchors,
             },
             &chunks,
+            LargeReviewExecutionOptions {
+                parallel: false,
+                parallelism: 1,
+            },
             MarkdownRenderMode::Preview,
             false,
-            |_, _| {},
+            |_| {},
             |_| async {
                 Ok(LlmReviewResponse {
                     text: "not json".to_string(),
@@ -1257,6 +1557,178 @@ mod tests {
         assert!(matches!(
             err,
             ReviewGateError::LargeReviewAllChunksFailed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn one_failed_chunk_does_not_fail_whole_review() {
+        let (selection, chunks, anchors, metadata) = run_fixture(3);
+
+        let preview = review_large_chunks_with_llm(
+            LargeReviewRunContext {
+                metadata: &metadata,
+                selection: &selection,
+                anchors: &anchors,
+            },
+            &chunks,
+            LargeReviewExecutionOptions {
+                parallel: true,
+                parallelism: 3,
+            },
+            MarkdownRenderMode::Preview,
+            false,
+            |_| {},
+            |prompt| async move {
+                if prompt.contains("This is chunk 2 of 3") {
+                    return Ok(LlmReviewResponse {
+                        text: "not json".to_string(),
+                        metadata: LlmRunMetadata::default(),
+                    });
+                }
+                Ok(LlmReviewResponse {
+                    text: chunk_json("Chunk passed", None),
+                    metadata: LlmRunMetadata::default(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(preview.markdown.contains("Reviewed chunks: 2"));
+        assert!(preview.markdown.contains("Failed chunks: 1"));
+    }
+
+    #[tokio::test]
+    async fn chunk_results_merge_in_chunk_index_order() {
+        let (selection, chunks, anchors, metadata) = run_fixture(2);
+
+        let preview = review_large_chunks_with_llm(
+            LargeReviewRunContext {
+                metadata: &metadata,
+                selection: &selection,
+                anchors: &anchors,
+            },
+            &chunks,
+            LargeReviewExecutionOptions {
+                parallel: true,
+                parallelism: 2,
+            },
+            MarkdownRenderMode::Preview,
+            false,
+            |_| {},
+            |prompt| async move {
+                if prompt.contains("This is chunk 1 of 2") {
+                    for _ in 0..10 {
+                        tokio::task::yield_now().await;
+                    }
+                    return Ok(LlmReviewResponse {
+                        text: chunk_json("Chunk one", Some("First chunk note.")),
+                        metadata: LlmRunMetadata::default(),
+                    });
+                }
+                Ok(LlmReviewResponse {
+                    text: chunk_json("Chunk two", Some("Second chunk note.")),
+                    metadata: LlmRunMetadata::default(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        let note = preview.analysis.unwrap().test_coverage_note.unwrap();
+        assert!(note.find("First chunk note.").unwrap() < note.find("Second chunk note.").unwrap());
+    }
+
+    #[tokio::test]
+    async fn max_parallelism_is_respected_by_mock_reviewer() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let (selection, chunks, anchors, metadata) = run_fixture(5);
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        let preview = review_large_chunks_with_llm(
+            LargeReviewRunContext {
+                metadata: &metadata,
+                selection: &selection,
+                anchors: &anchors,
+            },
+            &chunks,
+            LargeReviewExecutionOptions {
+                parallel: true,
+                parallelism: 2,
+            },
+            MarkdownRenderMode::Preview,
+            false,
+            |_| {},
+            {
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                move |_| {
+                    let active = Arc::clone(&active);
+                    let max_active = Arc::clone(&max_active);
+                    async move {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(now, Ordering::SeqCst);
+                        for _ in 0..5 {
+                            tokio::task::yield_now().await;
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(LlmReviewResponse {
+                            text: chunk_json("Chunk passed", None),
+                            metadata: LlmRunMetadata::default(),
+                        })
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(preview.parsed);
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn progress_events_are_serial_when_parallelism_is_one() {
+        let (selection, chunks, anchors, metadata) = run_fixture(2);
+        let mut events = Vec::new();
+
+        review_large_chunks_with_llm(
+            LargeReviewRunContext {
+                metadata: &metadata,
+                selection: &selection,
+                anchors: &anchors,
+            },
+            &chunks,
+            LargeReviewExecutionOptions {
+                parallel: true,
+                parallelism: 1,
+            },
+            MarkdownRenderMode::Preview,
+            false,
+            |progress| events.push(progress),
+            |_| async {
+                Ok(LlmReviewResponse {
+                    text: chunk_json("Chunk passed", None),
+                    metadata: LlmRunMetadata::default(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ChunkReviewProgress::Started { chunk_index: 1, .. },
+                ChunkReviewProgress::Completed { chunk_index: 1, .. },
+                ChunkReviewProgress::Started { chunk_index: 2, .. },
+                ChunkReviewProgress::Completed { chunk_index: 2, .. },
+            ]
         ));
     }
 
@@ -1283,9 +1755,13 @@ mod tests {
                 anchors: &anchors,
             },
             &chunks,
+            LargeReviewExecutionOptions {
+                parallel: false,
+                parallelism: 1,
+            },
             MarkdownRenderMode::Preview,
             false,
-            |_, _| {},
+            |_| {},
             |_| async {
                 Ok(LlmReviewResponse {
                     text: r#"{
@@ -1376,6 +1852,50 @@ mod tests {
             max_diff_bytes_per_chunk: 60_000,
             ..LargeReviewOptions::default()
         }
+    }
+
+    fn run_fixture(
+        chunk_count: usize,
+    ) -> (
+        LargeReviewSelection,
+        Vec<ReviewChunk>,
+        AnchoredDiffContext,
+        MergeRequestMetadata,
+    ) {
+        let files = (1..=chunk_count)
+            .map(|index| planned(&format!("src/{index}.rs"), FileRiskLevel::High, 20, None))
+            .collect::<Vec<_>>();
+        let selection = LargeReviewSelection {
+            files: files.clone(),
+            skipped_files: 0,
+            skipped_reasons: Vec::new(),
+        };
+        let chunks = files
+            .into_iter()
+            .enumerate()
+            .map(|(offset, file)| chunk(offset + 1, vec![file]))
+            .collect();
+        (
+            selection,
+            chunks,
+            AnchoredDiffContext::default(),
+            metadata(),
+        )
+    }
+
+    fn chunk_json(summary: &str, test_note: Option<&str>) -> String {
+        format!(
+            r#"{{
+                "summary": "{summary}",
+                "overall_risk": "low",
+                "findings": [],
+                "test_coverage_note": {test_note},
+                "privacy_note": null
+            }}"#,
+            test_note = test_note
+                .map(|note| format!(r#""{note}""#))
+                .unwrap_or_else(|| "null".to_string())
+        )
     }
 
     fn planned(

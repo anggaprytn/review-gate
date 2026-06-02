@@ -390,9 +390,17 @@ fn suggested_fix_label(finding: &ReviewFinding, suggested_fix: &str) -> &'static
 
 fn is_broad_process_suggested_fix(value: &str) -> bool {
     let lower = value.trim().to_ascii_lowercase();
-    ["ensure", "consider", "audit", "review", "make sure"]
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
+    [
+        "ensure",
+        "consider",
+        "audit",
+        "review",
+        "make sure",
+        "explore",
+        "exploring",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
 }
 
 fn pluralize(count: usize, singular: &str, plural: &str) -> String {

@@ -11,7 +11,11 @@ use crate::{
 };
 use regex::Regex;
 use serde::Deserialize;
-use std::{collections::HashMap, future::Future, sync::LazyLock};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::LazyLock,
+};
 
 const SPECULATIVE_PHRASES: &[&str] = &[
     "out of scope",
@@ -39,6 +43,68 @@ const BUILD_BREAK_CLAIM_PHRASES: &[&str] = &[
     "won't compile",
     "malformed code",
     "merge conflict",
+];
+
+const MISSING_AWAIT_CLAIM_PHRASES: &[&str] = &[
+    "missing await",
+    "without await",
+    "not awaited",
+    "promise object",
+    "called without await",
+    "auth token retrieval not awaited",
+];
+
+const VAGUE_COMPLEXITY_PHRASES: &[&str] = &[
+    "complex logic",
+    "difficult to reason",
+    "could introduce",
+    "subtle race conditions",
+    "fragility",
+    "performance issues",
+    "consider simpler",
+    "exploring simpler patterns",
+];
+
+const CALL_NAME_STOP_WORDS: &[&str] = &[
+    "a",
+    "an",
+    "and",
+    "async",
+    "auth",
+    "authentication",
+    "await",
+    "be",
+    "bearer",
+    "body",
+    "call",
+    "called",
+    "can",
+    "causes",
+    "const",
+    "could",
+    "fail",
+    "fix",
+    "for",
+    "function",
+    "headers",
+    "if",
+    "in",
+    "is",
+    "it",
+    "may",
+    "missing",
+    "not",
+    "object",
+    "promise",
+    "return",
+    "retrieval",
+    "should",
+    "the",
+    "this",
+    "token",
+    "use",
+    "var",
+    "without",
 ];
 
 const AWAIT_CONTEXT_SCAN_WINDOW: usize = 20;
@@ -73,6 +139,8 @@ static NON_ASYNC_CALLBACK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b[$A-Za-z_][$A-Za-z0-9_]*\s*\(\s*(?:\([^)]*\)|[$A-Za-z_][$A-Za-z0-9_]*)\s*=>")
         .expect("valid non-async callback regex")
 });
+static IDENTIFIER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[$A-Za-z_][$A-Za-z0-9_]*\b").expect("valid identifier regex"));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CurrentFileValidationOptions {
@@ -242,13 +310,14 @@ fn candidate_file_paths(analysis: &ReviewAnalysis, anchors: &AnchoredDiffContext
 }
 
 fn should_validate_current_file(finding: &ReviewFinding) -> bool {
+    let text = finding_text(finding).to_ascii_lowercase();
     if matches!(finding.severity, Severity::Critical | Severity::High)
         || (finding.severity == Severity::Medium && priority_category(&finding.category))
     {
         return true;
     }
 
-    speculative_signal(&finding_text(finding).to_ascii_lowercase())
+    missing_await_claim(&text) || vague_complexity_claim(&text) || speculative_signal(&text)
 }
 
 fn should_model_validate(finding: &ReviewFinding) -> bool {
@@ -296,6 +365,12 @@ fn deterministic_validation(
     if build_break_claim(&text) {
         return Some(validate_build_break_claim(&snippet_lower));
     }
+    if missing_await_claim(&text) {
+        return Some(validate_missing_await_claim(content, finding));
+    }
+    if vague_complexity_claim(&text) {
+        return Some(refine_vague_complexity_finding(content, finding));
+    }
     if await_non_async_claim(&text) {
         return Some(validate_await_non_async_claim(
             content,
@@ -328,6 +403,8 @@ fn validate_await_non_async_claim(
             corrected_title: None,
             corrected_body: None,
             corrected_suggested_fix: None,
+            corrected_category: None,
+            corrected_risk_code: None,
             reason: "nearest enclosing function/callback for await is marked async".to_string(),
         },
         AwaitFunctionContext::NonAsync => CurrentFileResult::valid(
@@ -360,6 +437,8 @@ fn validate_variable_scope_claim(finding: &ReviewFinding, content: &str) -> Curr
                 corrected_suggested_fix: Some(
                     "Move temporary file creation inside a cleanup-guarded `try/finally`, or initialize cleanup state before any operation that can fail.".to_string(),
                 ),
+                corrected_category: None,
+                corrected_risk_code: None,
                 reason: "variable is declared before finally; related cleanup guard issue remains".to_string(),
             };
         }
@@ -371,6 +450,8 @@ fn validate_variable_scope_claim(finding: &ReviewFinding, content: &str) -> Curr
             corrected_title: None,
             corrected_body: None,
             corrected_suggested_fix: None,
+            corrected_category: None,
+            corrected_risk_code: None,
             reason: format!("`{variable}` is declared in an outer scope visible to finally"),
         };
     }
@@ -382,6 +463,8 @@ fn validate_variable_scope_claim(finding: &ReviewFinding, content: &str) -> Curr
         corrected_title: None,
         corrected_body: None,
         corrected_suggested_fix: None,
+        corrected_category: None,
+        corrected_risk_code: None,
         reason: format!("no outer declaration for `{variable}` is visible before finally"),
     }
 }
@@ -418,6 +501,8 @@ fn validate_symlink_toctou_claim(
             corrected_suggested_fix: Some(
                 "Keep canonical cache-root validation and consider non-following deletion APIs or extra checks only if untrusted cache entries are in scope.".to_string(),
             ),
+            corrected_category: None,
+            corrected_risk_code: None,
             reason: "canonical cache-root validation is visible; exploitability needs a stronger threat model".to_string(),
         };
     }
@@ -432,6 +517,8 @@ fn validate_symlink_toctou_claim(
         corrected_title: None,
         corrected_body: None,
         corrected_suggested_fix: None,
+        corrected_category: None,
+        corrected_risk_code: None,
         reason: "canonical cache-root validation is not visible in the current snippet".to_string(),
     }
 }
@@ -456,6 +543,8 @@ fn validate_debug_config_claim(snippet_lower: &str) -> CurrentFileResult {
         corrected_title: None,
         corrected_body: None,
         corrected_suggested_fix: None,
+        corrected_category: None,
+        corrected_risk_code: None,
         reason: "debug configuration is not proven to affect production/release builds".to_string(),
     }
 }
@@ -475,8 +564,123 @@ fn validate_build_break_claim(snippet_lower: &str) -> CurrentFileResult {
         corrected_title: None,
         corrected_body: None,
         corrected_suggested_fix: None,
+        corrected_category: None,
+        corrected_risk_code: None,
         reason: "build-break claim lacks exact invalid syntax evidence in the current file snippet"
             .to_string(),
+    }
+}
+
+fn validate_missing_await_claim(content: &str, finding: &ReviewFinding) -> CurrentFileResult {
+    let call_names = missing_await_call_names(content, finding);
+    if call_names.is_empty() {
+        return CurrentFileResult::needs_manual(
+            Severity::Low,
+            "missing-await claim did not identify a current-file call name to validate",
+        );
+    }
+
+    let mut found_call = false;
+    let mut found_awaited = false;
+    let mut found_conservative_context = false;
+
+    for name in &call_names {
+        for call in find_call_sites(content, name) {
+            found_call = true;
+            if call.awaited {
+                found_awaited = true;
+            } else if call.conservative_context {
+                found_conservative_context = true;
+            } else {
+                return CurrentFileResult::valid(
+                    finding.severity,
+                    &format!("current file shows `{name}(` called without await"),
+                );
+            }
+        }
+    }
+
+    if !found_call {
+        return CurrentFileResult {
+            verdict: CurrentFileVerdict::Stale,
+            final_severity: Severity::Note,
+            actionable: false,
+            corrected_title: None,
+            corrected_body: None,
+            corrected_suggested_fix: None,
+            corrected_category: None,
+            corrected_risk_code: None,
+            reason: format!(
+                "claimed call `{}` is not present in the current file",
+                call_names.join("`, `")
+            ),
+        };
+    }
+
+    if found_awaited && !found_conservative_context {
+        return CurrentFileResult {
+            verdict: CurrentFileVerdict::Stale,
+            final_severity: Severity::Note,
+            actionable: false,
+            corrected_title: None,
+            corrected_body: None,
+            corrected_suggested_fix: None,
+            corrected_category: None,
+            corrected_risk_code: None,
+            reason: "current file only shows the claimed async call behind await".to_string(),
+        };
+    }
+
+    CurrentFileResult::needs_manual(
+        Severity::Low,
+        "current file does not prove a direct non-awaited async call site",
+    )
+}
+
+fn refine_vague_complexity_finding(content: &str, finding: &ReviewFinding) -> CurrentFileResult {
+    if navigation_queue_poisoning_evidence(content) {
+        return CurrentFileResult {
+            verdict: CurrentFileVerdict::PartiallyValid,
+            final_severity: Severity::Medium,
+            actionable: true,
+            corrected_title: Some(
+                "Navigation reset queue can get stuck after max retries".to_string(),
+            ),
+            corrected_body: Some(
+                "When a pending reset exceeds the retry limit, the code only logs a warning and does not remove or mark the failed route as completed. That can leave the same pending item at the front of the queue and prevent later reset requests from being processed.".to_string(),
+            ),
+            corrected_suggested_fix: Some(
+                "On max retry, remove the failed pending reset from the queue or mark it failed before continuing with the next queued reset. Add a regression test for rapid queued resets and max-retry exhaustion.".to_string(),
+            ),
+            corrected_category: Some(ReviewCategory::Reliability),
+            corrected_risk_code: Some(RiskCode::WeakErrorHandling),
+            reason: "current file shows navigation reset queue/retry code with a max-retry warning branch that does not advance the queue".to_string(),
+        };
+    }
+
+    let suggested_fix = finding
+        .suggested_fix
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| is_broad_process_suggested_fix_text(value))
+        .map(str::to_string)
+        .or_else(|| {
+            Some(
+                "Consider a follow-up simplification only after a concrete failure mode is identified in current code.".to_string(),
+            )
+        });
+
+    CurrentFileResult {
+        verdict: CurrentFileVerdict::NeedsManualConfirmation,
+        final_severity: Severity::Low,
+        actionable: true,
+        corrected_title: None,
+        corrected_body: None,
+        corrected_suggested_fix: suggested_fix,
+        corrected_category: None,
+        corrected_risk_code: None,
+        reason: "vague complexity claim lacks a concrete current-file failure mode".to_string(),
     }
 }
 
@@ -592,6 +796,8 @@ struct CurrentFileResult {
     corrected_title: Option<String>,
     corrected_body: Option<String>,
     corrected_suggested_fix: Option<String>,
+    corrected_category: Option<ReviewCategory>,
+    corrected_risk_code: Option<RiskCode>,
     reason: String,
 }
 
@@ -604,6 +810,8 @@ impl CurrentFileResult {
             corrected_title: None,
             corrected_body: None,
             corrected_suggested_fix: None,
+            corrected_category: None,
+            corrected_risk_code: None,
             reason: reason.to_string(),
         }
     }
@@ -616,6 +824,8 @@ impl CurrentFileResult {
             corrected_title: None,
             corrected_body: None,
             corrected_suggested_fix: None,
+            corrected_category: None,
+            corrected_risk_code: None,
             reason: reason.to_string(),
         }
     }
@@ -642,6 +852,8 @@ fn parse_model_validation_response(value: &str) -> Option<CurrentFileResult> {
         corrected_title: parsed.corrected_title,
         corrected_body: parsed.corrected_body,
         corrected_suggested_fix: parsed.corrected_suggested_fix,
+        corrected_category: None,
+        corrected_risk_code: None,
         reason: parsed.reason,
     })
 }
@@ -693,6 +905,12 @@ fn apply_current_file_result(finding: &mut ReviewFinding, result: CurrentFileRes
             if result.corrected_suggested_fix.is_some() {
                 finding.suggested_fix = result.corrected_suggested_fix;
             }
+            if let Some(category) = result.corrected_category {
+                finding.category = category;
+            }
+            if let Some(risk_code) = result.corrected_risk_code {
+                finding.risk_code = Some(risk_code);
+            }
             finding.evidence_status = Some(EvidenceValidationStatus::Validated);
         }
         CurrentFileVerdict::Invalid | CurrentFileVerdict::Stale => {
@@ -708,6 +926,15 @@ fn apply_current_file_result(finding: &mut ReviewFinding, result: CurrentFileRes
         CurrentFileVerdict::NeedsManualConfirmation => {
             finding.severity = result.final_severity;
             finding.actionable = result.actionable && result.final_severity == Severity::Low;
+            if let Some(title) = result.corrected_title {
+                finding.title = title;
+            }
+            if let Some(body) = result.corrected_body {
+                finding.body = body;
+            }
+            if result.corrected_suggested_fix.is_some() {
+                finding.suggested_fix = result.corrected_suggested_fix;
+            }
             finding.evidence_status = Some(EvidenceValidationStatus::NeedsManualConfirmation);
         }
     }
@@ -831,6 +1058,197 @@ fn finding_text(finding: &ReviewFinding) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CallSite {
+    awaited: bool,
+    conservative_context: bool,
+}
+
+fn missing_await_call_names(content: &str, finding: &ReviewFinding) -> Vec<String> {
+    let text = finding_text(finding);
+    let mut names = HashSet::new();
+
+    for identifier in IDENTIFIER_RE.find_iter(&text).map(|found| found.as_str()) {
+        if missing_await_identifier_candidate(identifier) {
+            names.insert(identifier.to_string());
+        }
+    }
+
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("auth") && lower.contains("token") && content.contains("getAccessToken(") {
+        names.insert("getAccessToken".to_string());
+    }
+
+    let mut names = names.into_iter().collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn missing_await_identifier_candidate(identifier: &str) -> bool {
+    let lower = identifier.to_ascii_lowercase();
+    if CALL_NAME_STOP_WORDS.contains(&lower.as_str()) {
+        return false;
+    }
+    lower.starts_with("get")
+        || lower.starts_with("fetch")
+        || lower.starts_with("load")
+        || lower.starts_with("retrieve")
+        || lower.ends_with("token")
+        || identifier.chars().any(|ch| ch.is_ascii_uppercase())
+}
+
+fn find_call_sites(content: &str, name: &str) -> Vec<CallSite> {
+    content
+        .lines()
+        .enumerate()
+        .flat_map(|(line_index, line)| {
+            call_offsets(line, name)
+                .into_iter()
+                .map(move |offset| call_site(content, line_index, line, offset))
+        })
+        .collect()
+}
+
+fn call_offsets(line: &str, name: &str) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut search_start = 0;
+    while let Some(relative) = line[search_start..].find(name) {
+        let offset = search_start + relative;
+        let before = line[..offset].chars().next_back();
+        let after_name = &line[offset + name.len()..];
+        let has_call_paren = after_name.trim_start().starts_with('(');
+        let declaration_prefix = line[..offset]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let is_declaration = declaration_prefix.ends_with("function")
+            || declaration_prefix.ends_with("async function")
+            || declaration_prefix.ends_with("async");
+        let identifier_boundary_before = match before {
+            Some(ch) => !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'),
+            None => true,
+        };
+        if has_call_paren && identifier_boundary_before && !is_declaration {
+            offsets.push(offset);
+        }
+        search_start = offset + name.len();
+    }
+    offsets
+}
+
+fn call_site(content: &str, line_index: usize, line: &str, offset: usize) -> CallSite {
+    let prefix = &line[..offset];
+    let previous_line = line_index
+        .checked_sub(1)
+        .and_then(|index| content.lines().nth(index))
+        .unwrap_or_default();
+    let previous_tokens = format!("{previous_line}\n{prefix}");
+    let awaited = has_await_before_call(&previous_tokens);
+    let lower_line = line.to_ascii_lowercase();
+    let lower_prefix = prefix.to_ascii_lowercase();
+    let conservative_context = lower_line.contains("promise.all")
+        || lower_line.contains(".then(")
+        || lower_prefix.trim_start().starts_with("return")
+        || lower_prefix.ends_with("return ");
+
+    CallSite {
+        awaited,
+        conservative_context,
+    }
+}
+
+fn has_await_before_call(value: &str) -> bool {
+    let tail = value
+        .chars()
+        .rev()
+        .take(80)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    await_expression(&tail)
+}
+
+fn vague_complexity_claim(text: &str) -> bool {
+    contains_any(text, VAGUE_COMPLEXITY_PHRASES)
+}
+
+fn navigation_queue_poisoning_evidence(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    let compact = lower
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace() && *ch != '_' && *ch != '-')
+        .collect::<String>();
+
+    let has_navigation_reset = lower.contains("navigation")
+        || lower.contains("navigate")
+        || (lower.contains("reset") && lower.contains("route"));
+    let has_queue_or_pending = lower.contains("queue") || lower.contains("pending");
+    let has_retry = lower.contains("retry");
+    let has_max_retry = compact.contains("maxretry")
+        || compact.contains("retrylimit")
+        || lower.contains("max retry");
+    let has_warn = lower.contains("console.warn") || lower.contains(".warn(");
+    let has_early_return = lower.contains("return;");
+
+    has_navigation_reset
+        && has_queue_or_pending
+        && has_retry
+        && has_max_retry
+        && has_warn
+        && has_early_return
+        && max_retry_warn_branch_does_not_advance_queue(&lower)
+}
+
+fn max_retry_warn_branch_does_not_advance_queue(lower_content: &str) -> bool {
+    let lines = lower_content.lines().collect::<Vec<_>>();
+    lines.iter().enumerate().any(|(index, line)| {
+        if !line.contains("warn") {
+            return false;
+        }
+        let start = index.saturating_sub(4);
+        let end = (index + 6).min(lines.len().saturating_sub(1));
+        let window = lines[start..=end].join("\n");
+        let mentions_retry_limit = window.contains("retry")
+            && (window.contains("max") || window.contains("limit") || window.contains(">="));
+        let logs_and_returns = window.contains("warn") && window.contains("return");
+        let advances_queue = contains_any(
+            &window,
+            &[
+                ".shift(",
+                ".splice(",
+                ".pop(",
+                ".remove(",
+                "remove",
+                "delete",
+                "= null",
+                "= undefined",
+                "completed",
+                "status = 'failed'",
+                "status = \"failed\"",
+                "markfailed",
+            ],
+        );
+
+        mentions_retry_limit && logs_and_returns && !advances_queue
+    })
+}
+
+fn is_broad_process_suggested_fix_text(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    [
+        "ensure",
+        "consider",
+        "audit",
+        "review",
+        "make sure",
+        "explore",
+        "exploring",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SnippetLine {
     number: Option<u32>,
@@ -916,6 +1334,12 @@ fn await_non_async_claim(text: &str) -> bool {
         || (normalized.contains("await call") && normalized.contains("not async"))
         || (normalized.contains("syntax error") && normalized.contains("await")))
         && normalized.contains("await")
+}
+
+fn missing_await_claim(text: &str) -> bool {
+    contains_any(text, MISSING_AWAIT_CLAIM_PHRASES)
+        || ((text.contains("getaccesstoken") || (text.contains("auth") && text.contains("token")))
+            && text.contains("await"))
 }
 
 fn await_expression(code: &str) -> bool {
@@ -1022,7 +1446,10 @@ mod tests {
             anchors::AnchoredDiffContext,
             formatter::{format_review_markdown_for_mode_with_emoji, MarkdownRenderMode},
             inline::{resolve_inline_candidates, InlineEligibilityReason},
-            types::{Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, Severity},
+            types::{
+                Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, RiskCode,
+                Severity,
+            },
         },
     };
 
@@ -1426,6 +1853,234 @@ const getToken = useCallback(async () => {
     }
 
     #[tokio::test]
+    async fn missing_await_claim_invalidated_when_current_call_is_awaited() {
+        let analysis = validate(vec![missing_await_finding()])
+            .with_file("src/a.ts", "const accessToken = await getAccessToken();")
+            .run()
+            .await;
+
+        let finding = &analysis.findings[0];
+        assert_eq!(finding.severity, Severity::Note);
+        assert!(!finding.actionable);
+        assert_eq!(
+            finding.evidence_status,
+            Some(crate::review::types::EvidenceValidationStatus::StaleContext)
+        );
+        assert!(finding
+            .evidence_reason
+            .as_deref()
+            .unwrap()
+            .contains("behind await"));
+    }
+
+    #[tokio::test]
+    async fn missing_await_claim_kept_for_direct_non_awaited_assignment() {
+        let analysis = validate(vec![missing_await_finding()])
+            .with_file("src/a.ts", "const accessToken = getAccessToken();")
+            .run()
+            .await;
+
+        let finding = &analysis.findings[0];
+        assert_eq!(finding.severity, Severity::High);
+        assert!(finding.actionable);
+        assert_eq!(
+            finding.evidence_status,
+            Some(crate::review::types::EvidenceValidationStatus::Validated)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_await_claim_kept_for_non_awaited_header_assignment() {
+        let analysis = validate(vec![missing_await_finding()])
+            .with_file("src/a.ts", "headers.Authorization = getAccessToken();")
+            .run()
+            .await;
+
+        assert_eq!(analysis.findings[0].severity, Severity::High);
+        assert!(analysis.findings[0].actionable);
+    }
+
+    #[tokio::test]
+    async fn missing_await_claim_is_stale_when_call_not_in_current_file() {
+        let analysis = validate(vec![missing_await_finding()])
+            .with_file("src/a.ts", "const accessToken = await readAccessToken();")
+            .run()
+            .await;
+
+        let finding = &analysis.findings[0];
+        assert_eq!(finding.severity, Severity::Note);
+        assert!(!finding.actionable);
+        assert_eq!(
+            finding.evidence_status,
+            Some(crate::review::types::EvidenceValidationStatus::StaleContext)
+        );
+        assert!(finding
+            .evidence_reason
+            .as_deref()
+            .unwrap()
+            .contains("not present"));
+    }
+
+    #[tokio::test]
+    async fn invalidated_missing_await_is_excluded_from_counters_inline_and_publish_body() {
+        let analysis = validate(vec![missing_await_finding()])
+            .with_file("src/a.ts", "const accessToken = await getAccessToken();")
+            .run()
+            .await;
+
+        let counters = count_findings_from_analysis(&analysis);
+        assert_eq!(counters.total, 0);
+        assert_eq!(counters.open_priority, 0);
+
+        let candidates = resolve_inline_candidates(
+            &analysis,
+            &[],
+            None,
+            &crate::config::InlineConfig {
+                enabled: true,
+                dry_run: true,
+                dedupe: true,
+                max_inline_total: 10,
+                max_high_inline: 8,
+                max_medium_inline: 5,
+            },
+        );
+        assert_eq!(
+            candidates[0].reason,
+            InlineEligibilityReason::SeverityTooLow
+        );
+
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &analysis,
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        assert!(!markdown.contains("Missing await for getAccessToken"));
+        assert!(markdown.contains("Open priority findings: 0"));
+    }
+
+    #[tokio::test]
+    async fn generic_complex_logic_without_concrete_evidence_downgrades_to_low() {
+        let analysis = validate(vec![complexity_finding()])
+            .with_file(
+                "src/a.ts",
+                "function resetNavigation(route) { navigation.reset(route); }",
+            )
+            .run()
+            .await;
+
+        let finding = &analysis.findings[0];
+        assert_eq!(finding.severity, Severity::Low);
+        assert!(finding.actionable);
+        assert_eq!(
+            finding.evidence_status,
+            Some(crate::review::types::EvidenceValidationStatus::NeedsManualConfirmation)
+        );
+
+        let counters = count_findings_from_analysis(&analysis);
+        assert_eq!(counters.open_priority, 0);
+
+        let candidates = resolve_inline_candidates(
+            &analysis,
+            &[],
+            None,
+            &crate::config::InlineConfig {
+                enabled: true,
+                dry_run: true,
+                dedupe: true,
+                max_inline_total: 10,
+                max_high_inline: 8,
+                max_medium_inline: 5,
+            },
+        );
+        assert_eq!(
+            candidates[0].reason,
+            InlineEligibilityReason::SeverityTooLow
+        );
+    }
+
+    #[tokio::test]
+    async fn navigation_queue_max_retry_warn_only_branch_rewrites_to_queue_poisoning() {
+        let analysis = validate(vec![complexity_finding()])
+            .with_file(
+                "src/a.ts",
+                r#"
+const pendingResetQueue = []
+const maxResetRetries = 3
+
+function flushNavigationResetQueue() {
+  const pending = pendingResetQueue[0]
+  if (!pending) return
+  if (pending.retryCount >= maxResetRetries) {
+    console.warn('Navigation reset failed too many times', pending.route)
+    return;
+  }
+  pending.retryCount += 1
+  navigation.reset(pending.route)
+}
+"#,
+            )
+            .run()
+            .await;
+
+        let finding = &analysis.findings[0];
+        assert_eq!(
+            finding.title,
+            "Navigation reset queue can get stuck after max retries"
+        );
+        assert_eq!(finding.severity, Severity::Medium);
+        assert_eq!(&finding.category, &ReviewCategory::Reliability);
+        assert_eq!(finding.risk_code, Some(RiskCode::WeakErrorHandling));
+        assert!(finding.actionable);
+        assert!(finding.body.contains("same pending item"));
+        assert!(finding
+            .suggested_fix
+            .as_deref()
+            .unwrap()
+            .contains("remove the failed pending reset"));
+
+        let counters = count_findings_from_analysis(&analysis);
+        assert_eq!(counters.open_priority, 1);
+        assert_eq!(counters.medium, 1);
+
+        let candidates = resolve_inline_candidates(
+            &analysis,
+            &[],
+            None,
+            &crate::config::InlineConfig {
+                enabled: true,
+                dry_run: true,
+                dedupe: true,
+                max_inline_total: 10,
+                max_high_inline: 8,
+                max_medium_inline: 5,
+            },
+        );
+        assert_eq!(candidates[0].severity, Severity::Medium);
+    }
+
+    #[tokio::test]
+    async fn downgraded_broad_complexity_suggestion_renders_as_follow_up() {
+        let mut finding = complexity_finding();
+        finding.suggested_fix = Some("Exploring simpler patterns may help.".to_string());
+        let analysis = validate(vec![finding])
+            .with_file(
+                "src/a.ts",
+                "function resetNavigation(route) { navigation.reset(route); }",
+            )
+            .run()
+            .await;
+
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &analysis,
+            MarkdownRenderMode::Preview,
+            false,
+        );
+        assert!(markdown.contains("Suggested follow-up:\nExploring simpler patterns may help."));
+        assert!(!markdown.contains("Suggested fix:\nExploring simpler patterns may help."));
+    }
+
+    #[tokio::test]
     async fn invalid_finding_is_excluded_from_counters_and_inline_candidates() {
         let analysis = validate(vec![finding(
             Severity::High,
@@ -1633,6 +2288,24 @@ const getToken = useCallback(async () => {
             ReviewCategory::Correctness,
             "Syntax Error: await used in non-async function",
             "The await is inside a non-async callback and will fail.",
+        )
+    }
+
+    fn missing_await_finding() -> ReviewFinding {
+        finding(
+            Severity::High,
+            ReviewCategory::Correctness,
+            "Missing await for getAccessToken may cause authentication failures",
+            "getAccessToken is called without await, so the Authorization header can receive a Promise object.",
+        )
+    }
+
+    fn complexity_finding() -> ReviewFinding {
+        finding(
+            Severity::Medium,
+            ReviewCategory::Reliability,
+            "Complex navigation reset logic increases risk of instability",
+            "The complex logic is difficult to reason about and could introduce subtle race conditions.",
         )
     }
 }

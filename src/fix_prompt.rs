@@ -633,6 +633,29 @@ mod tests {
     }
 
     #[test]
+    fn fix_prompt_excludes_invalidated_missing_await_findings() {
+        let (storage, mr) = storage_with_single_run(vec![
+            finding("HIGH", "Actionable", true),
+            finding(
+                "NOTE",
+                "Missing await for getAccessToken may cause authentication failures",
+                false,
+            ),
+        ]);
+        let options = FixPromptOptions {
+            include_notes: true,
+            ..default_options()
+        };
+
+        let generated = build_fix_prompt(&storage, &mr, options).unwrap();
+
+        assert_eq!(titles(&generated), vec!["Actionable"]);
+        assert!(!generated
+            .prompt
+            .contains("Missing await for getAccessToken"));
+    }
+
+    #[test]
     fn low_and_note_are_excluded_by_default() {
         let (storage, mr) = storage_with_single_run(vec![
             finding("HIGH", "High", true),

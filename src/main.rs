@@ -48,7 +48,8 @@ use reviewgate::review::inline::{
 };
 use reviewgate::review::large::{
     build_large_review_plan, review_large_chunks_with_llm, selected_diffs_in_order,
-    validate_large_inline_mapping, LargeReviewOptions, LargeReviewRunContext,
+    validate_large_inline_mapping, ChunkReviewProgress, LargeReviewExecutionOptions,
+    LargeReviewOptions, LargeReviewRunContext,
 };
 use reviewgate::review::mode::{
     build_auto_review_plan, decide_auto_review_mode, AutoLargeOptions, AutoReviewDecision,
@@ -404,6 +405,17 @@ async fn run_large_review(
     let publish_inline = args.publishes_inline()?;
     let mut large_options = LargeReviewOptions::from_env();
     large_options.include_low_risk = large_options.include_low_risk || args.include_low_risk;
+    if args.parallel {
+        large_options.parallel = true;
+    }
+    if args.serial {
+        large_options.parallel = false;
+        large_options.parallelism = 1;
+    }
+    if let Some(max_parallel) = args.max_parallel {
+        large_options.parallel = true;
+        large_options.parallelism = max_parallel;
+    }
 
     let mut plan_options = PlanOptions::from_env();
     plan_options.max_files = large_options.max_chunks * large_options.max_files_per_chunk;
@@ -428,11 +440,15 @@ async fn run_large_review(
         args.include_low_risk,
     )?;
     let selected_diffs = selected_diffs_in_order(&diffs, &large_plan.selection.files);
+    let execution = LargeReviewExecutionOptions::from(large_options);
+    let effective_parallelism = execution.effective_parallelism(large_plan.chunks.len());
 
     print_large_review_plan(
         &large_plan,
         &config,
         review_mode_label(args.publish, publish_inline, args.dry_run),
+        execution.parallel,
+        effective_parallelism,
     );
 
     if args.dry_run {
@@ -447,6 +463,7 @@ async fn run_large_review(
     } else {
         MarkdownRenderMode::Preview
     };
+    println!("Reviewing chunks with parallelism {effective_parallelism}...");
     let preview = review_large_chunks_with_llm(
         LargeReviewRunContext {
             metadata: &context.metadata,
@@ -454,16 +471,31 @@ async fn run_large_review(
             anchors: &context.anchored_diff,
         },
         &large_plan.chunks,
+        execution,
         render_mode,
         args.show_prompt,
-        |chunk, total| {
-            println!(
-                "Reviewing chunk {}/{}: {} files, {}KB",
-                chunk.index,
-                total,
-                chunk.files.len(),
-                chunk.diff_bytes.div_ceil(1024)
-            );
+        |progress| match progress {
+            ChunkReviewProgress::Started {
+                chunk_index,
+                total_chunks,
+            } => {
+                println!("Chunk {chunk_index}/{total_chunks} started");
+            }
+            ChunkReviewProgress::Completed {
+                chunk_index,
+                total_chunks,
+                ..
+            } => {
+                println!("Chunk {chunk_index}/{total_chunks} completed");
+            }
+            ChunkReviewProgress::Failed {
+                chunk_index,
+                total_chunks,
+                error,
+                ..
+            } => {
+                println!("Chunk {chunk_index}/{total_chunks} failed: {error}");
+            }
         },
         move |prompt| {
             let llm_config = llm_config.clone();
@@ -732,11 +764,22 @@ fn print_large_review_plan(
     plan: &reviewgate::review::large::LargeReviewPlan,
     config: &AppConfig,
     mode: &str,
+    parallel: bool,
+    parallelism: usize,
 ) {
     println!("Large MR review");
     println!();
     println!("Reviewable files: {}", plan.selection.files.len());
     println!("Chunks: {}", plan.chunks.len());
+    println!(
+        "Parallel: {}",
+        if parallel && parallelism > 1 {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!("Parallelism: {parallelism}");
     println!("Skipped files: {}", plan.selection.skipped_files);
     println!("Provider: {}/{}", config.llm.provider, config.llm.model);
     println!("Mode: {mode}");

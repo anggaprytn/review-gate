@@ -106,6 +106,15 @@ pub struct ReviewArgs {
     #[arg(long)]
     pub large: bool,
 
+    #[arg(long, conflicts_with = "serial")]
+    pub parallel: bool,
+
+    #[arg(long, conflicts_with_all = ["parallel", "max_parallel"])]
+    pub serial: bool,
+
+    #[arg(long, value_name = "N", conflicts_with = "serial")]
+    pub max_parallel: Option<usize>,
+
     #[arg(long, value_enum, value_name = "auto|single|large")]
     pub mode: Option<ReviewMode>,
 
@@ -215,6 +224,11 @@ impl ReviewArgs {
         }
         if self.publish_qa && !self.publish {
             return Err(ReviewGateError::PublishQaRequiresPublish);
+        }
+        if self.max_parallel == Some(0) {
+            return Err(ReviewGateError::Config(
+                "--max-parallel must be >= 1".to_string(),
+            ));
         }
         self.effective_review_mode()?;
 
@@ -506,6 +520,56 @@ mod tests {
         assert!(args.ci);
         assert!(args.large);
         assert!(args.publishes());
+    }
+
+    #[test]
+    fn large_parallel_flags_parse() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--large",
+            "--parallel",
+            "--max-parallel",
+            "6",
+        ]);
+
+        let args = review_args(cli.command);
+        assert!(args.parallel);
+        assert_eq!(args.max_parallel, Some(6));
+        args.validate().unwrap();
+    }
+
+    #[test]
+    fn large_serial_conflicts_with_parallel() {
+        let err = Cli::try_parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--large",
+            "--serial",
+            "--parallel",
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn max_parallel_zero_is_rejected_cleanly() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--large",
+            "--max-parallel",
+            "0",
+        ]);
+
+        let args = review_args(cli.command);
+        let err = args.validate().unwrap_err();
+
+        assert!(err.to_string().contains("--max-parallel must be >= 1"));
     }
 
     #[test]

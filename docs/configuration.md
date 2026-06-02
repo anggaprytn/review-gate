@@ -40,6 +40,15 @@ REVIEWGATE_TEMPERATURE=0.1
 
 `reviewgate review` defaults to `--mode auto`. Auto mode runs a lightweight plan first and switches to large-review chunking when the changed file count or total diff bytes meets the auto-large thresholds. `--large` remains supported as an alias for `--mode large`.
 
+## Large Review
+
+```bash
+REVIEWGATE_LARGE_REVIEW_PARALLEL=true
+REVIEWGATE_LARGE_REVIEW_PARALLELISM=3
+```
+
+Large-review chunk execution is bounded. `REVIEWGATE_LARGE_REVIEW_PARALLELISM` must be at least `1` and is capped to the number of chunks. CLI overrides are available with `--parallel`, `--serial`, and `--max-parallel N`.
+
 ## Publishing
 
 ```bash
