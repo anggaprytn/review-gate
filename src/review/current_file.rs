@@ -1187,7 +1187,9 @@ fn navigation_queue_poisoning_evidence(content: &str) -> bool {
     let has_retry = lower.contains("retry");
     let has_max_retry = compact.contains("maxretry")
         || compact.contains("retrylimit")
-        || lower.contains("max retry");
+        || lower.contains("max retry")
+        || (compact.contains("max")
+            && (compact.contains("retry") || compact.contains("retries")));
     let has_warn = lower.contains("console.warn") || lower.contains(".warn(");
     let has_early_return = lower.contains("return;");
 
