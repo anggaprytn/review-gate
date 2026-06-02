@@ -83,6 +83,12 @@ pub struct ReviewArgs {
     pub publish: bool,
 
     #[arg(long, requires = "publish")]
+    pub publish_qa: bool,
+
+    #[arg(long, requires = "preview")]
+    pub qa_preview: bool,
+
+    #[arg(long, requires = "publish")]
     pub force_new_note: bool,
 
     #[arg(long, requires = "publish")]
@@ -206,6 +212,9 @@ impl ReviewArgs {
     pub fn validate(&self) -> Result<()> {
         if self.publish_inline && !self.publish {
             return Err(ReviewGateError::PublishInlineRequiresPublish);
+        }
+        if self.publish_qa && !self.publish {
+            return Err(ReviewGateError::PublishQaRequiresPublish);
         }
         self.effective_review_mode()?;
 
@@ -566,6 +575,69 @@ mod tests {
         let args = review_args(cli.command);
 
         assert!(!args.publishes_inline().unwrap());
+    }
+
+    #[test]
+    fn publish_qa_requires_publish() {
+        let err = Cli::try_parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--publish-qa",
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn qa_preview_does_not_publish() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--preview",
+            "--qa-preview",
+        ]);
+
+        let args = review_args(cli.command);
+
+        assert!(args.preview);
+        assert!(args.qa_preview);
+        assert!(!args.publishes());
+        assert!(!args.publish_qa);
+    }
+
+    #[test]
+    fn normal_publish_remains_code_review_summary_only() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--publish",
+        ]);
+
+        let args = review_args(cli.command);
+
+        assert!(args.publishes());
+        assert!(!args.publish_qa);
+        assert!(!args.publish_inline);
+    }
+
+    #[test]
+    fn publish_can_include_separate_qa_checklist() {
+        let cli = Cli::parse_from([
+            "reviewgate",
+            "review",
+            "https://gitlab.company.local/group/repo/-/merge_requests/59",
+            "--publish",
+            "--publish-qa",
+        ]);
+
+        let args = review_args(cli.command);
+
+        assert!(args.publishes());
+        assert!(args.publish_qa);
     }
 
     #[test]

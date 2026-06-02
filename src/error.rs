@@ -60,6 +60,9 @@ pub enum ReviewGateError {
     #[error("--publish-inline requires --publish")]
     PublishInlineRequiresPublish,
 
+    #[error("--publish-qa requires --publish")]
+    PublishQaRequiresPublish,
+
     #[error("invalid review mode '{0}'. Use auto, single, or large")]
     InvalidReviewMode(String),
 

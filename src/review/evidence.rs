@@ -933,6 +933,7 @@ mod tests {
                 "Remove the corrupted token.",
                 true,
             )],
+            "@@ -0,0 +1 @@\n+return @",
         );
 
         assert_eq!(analysis.findings[0].severity, Severity::High);
@@ -957,6 +958,7 @@ mod tests {
                 "Remove the corrupted token.",
                 true,
             )],
+            "@@ -0,0 +1 @@\n+return @",
         );
 
         assert_eq!(analysis.findings[0].severity, Severity::High);
@@ -989,7 +991,11 @@ mod tests {
 
     fn validated(findings: Vec<ReviewFinding>, diff_body: &str) -> ReviewAnalysis {
         let mut builder = AnchorBuilder::new();
-        builder.add_diff(&diff("src/client.ts", diff_body));
+        let path = findings
+            .first()
+            .and_then(|finding| finding.file_path.as_deref())
+            .unwrap_or("src/client.ts");
+        builder.add_diff(&diff(path, diff_body));
         let anchors = builder.finish(false);
         validate_review_analysis_evidence(analysis(findings), &anchors)
     }

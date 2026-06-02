@@ -908,7 +908,10 @@ mod tests {
             &ReviewAnalysis {
                 summary: "summary".to_string(),
                 findings: vec![],
-                test_coverage_note: Some("No tests are visible in this chunk.".to_string()),
+                test_coverage_note: Some(
+                    "Device integrity flows need tests. No tests are visible in this chunk. authTokenStorage has unit tests. Device integrity flows need tests."
+                        .to_string(),
+                ),
                 privacy_note: None,
                 overall_risk: OverallRisk::Low,
             },

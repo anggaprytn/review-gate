@@ -8,5 +8,6 @@ pub mod large;
 pub mod mode;
 pub mod parser;
 pub mod prompt;
+pub mod qa;
 pub mod quality;
 pub mod types;

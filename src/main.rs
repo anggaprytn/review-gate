@@ -20,7 +20,8 @@ use reviewgate::gitlab::context::{build_merge_request_context, MergeRequestConte
 use reviewgate::gitlab::inline::InlinePublishReport;
 use reviewgate::gitlab::inline::{format_inline_publish_report, publish_inline_comments_with};
 use reviewgate::gitlab::publish::{
-    build_summary_note_body, build_verification_note_body, publish_summary_with,
+    build_qa_checklist_note_body, build_summary_note_body, build_verification_note_body,
+    publish_summary_with,
 };
 use reviewgate::gitlab::types::{DiffRefs, PublishAction, PublishResult};
 use reviewgate::gitlab::url::GitLabMrUrl;
@@ -50,6 +51,7 @@ use reviewgate::review::mode::{
     build_auto_review_plan, decide_auto_review_mode, AutoLargeOptions, AutoReviewDecision,
     ReviewMode, SelectedReviewMode,
 };
+use reviewgate::review::qa::format_qa_checklist;
 use reviewgate::storage::{PersistedReviewRun, Storage};
 use reviewgate::verify::{
     no_previous_run_message, verification_prompt_with_llm, VerificationPreview,
@@ -226,6 +228,8 @@ async fn run_review(args: ReviewArgs) -> Result<()> {
     if args.ci {
         let ci_mode = if args.dry_run {
             "dry-run, no LLM call or GitLab note publishing"
+        } else if args.publish && args.publish_qa {
+            "summary and QA checklist note publishing enabled"
         } else if args.publish {
             "summary note publishing enabled"
         } else {
@@ -298,6 +302,7 @@ async fn run_review(args: ReviewArgs) -> Result<()> {
                 publish_inline,
                 inline_dry_run,
                 large_review: false,
+                publish_qa: args.publish_qa,
             },
             &mut storage,
         )
@@ -309,6 +314,7 @@ async fn run_review(args: ReviewArgs) -> Result<()> {
             &config,
             args.show_prompt,
             inline_dry_run,
+            args.qa_preview,
             &mut storage,
         )
         .await?;
@@ -369,6 +375,7 @@ struct PublishOptions {
     publish_inline: bool,
     inline_dry_run: bool,
     large_review: bool,
+    publish_qa: bool,
 }
 
 async fn run_large_review(
@@ -463,6 +470,7 @@ async fn run_large_review(
                 publish_inline,
                 inline_dry_run: args.inline_dry_run,
                 large_review: true,
+                publish_qa: args.publish_qa,
             },
             storage,
             preview,
@@ -483,6 +491,9 @@ async fn run_large_review(
         );
         if args.inline_dry_run {
             print_inline_dry_run_report(&preview, &context, &selected_diffs, &config);
+        }
+        if args.qa_preview {
+            print_qa_preview(&preview, &selected_diffs)?;
         }
         print_persisted_review_run(storage, persisted.as_ref());
     }
@@ -551,6 +562,11 @@ async fn publish_review_preview(
     print_publish_result(&result, options.publish_inline, options.inline_dry_run);
     print_finding_counters(&preview);
     print_review_comparison(comparison.as_ref());
+    if options.publish_qa {
+        let qa_result =
+            publish_qa_checklist(gitlab, &preview, context, diffs, config, internal_note).await?;
+        print_qa_publish_result(&qa_result);
+    }
     if options.inline_dry_run {
         print_inline_dry_run_report(&preview, context, diffs, config);
     } else if options.publish_inline {
@@ -618,6 +634,59 @@ async fn publish_inline_review_comments(
     println!("{}", format_inline_publish_report(&report));
 
     Ok(report)
+}
+
+async fn publish_qa_checklist(
+    gitlab: &GitLabClient,
+    preview: &ReviewPreview,
+    context: &MergeRequestContext,
+    diffs: &[reviewgate::gitlab::types::MergeRequestDiff],
+    config: &AppConfig,
+    internal_note: bool,
+) -> Result<PublishResult> {
+    let Some(analysis) = preview.analysis.as_ref() else {
+        return Err(reviewgate::error::ReviewGateError::PublishRequiresParsedReview);
+    };
+    let qa_markdown = format_qa_checklist(analysis, &changed_file_paths(diffs));
+    let body = build_qa_checklist_note_body(
+        &qa_markdown,
+        &context.mr_url.project_path,
+        context.metadata.iid,
+        config.publish.max_note_chars,
+    )?;
+
+    publish_summary_with(body, |body| async move {
+        gitlab
+            .publish_merge_request_qa_checklist(&context.mr_url, body, internal_note)
+            .await
+    })
+    .await
+}
+
+fn print_qa_preview(
+    preview: &ReviewPreview,
+    diffs: &[reviewgate::gitlab::types::MergeRequestDiff],
+) -> Result<()> {
+    let Some(analysis) = preview.analysis.as_ref() else {
+        return Err(reviewgate::error::ReviewGateError::PublishRequiresParsedReview);
+    };
+
+    println!();
+    println!(
+        "{}",
+        format_qa_checklist(analysis, &changed_file_paths(diffs))
+    );
+    println!("QA checklist publish: skipped");
+    Ok(())
+}
+
+fn changed_file_paths(diffs: &[reviewgate::gitlab::types::MergeRequestDiff]) -> Vec<String> {
+    diffs
+        .iter()
+        .map(|diff| diff.new_path.trim())
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn print_dry_run_summary(context: &MergeRequestContext) {
@@ -698,6 +767,7 @@ async fn print_preview(
     config: &AppConfig,
     show_prompt: bool,
     inline_dry_run: bool,
+    qa_preview: bool,
     storage: &mut Option<Storage>,
 ) -> Result<()> {
     let mut preview =
@@ -716,6 +786,9 @@ async fn print_preview(
     );
     if inline_dry_run {
         print_inline_dry_run_report(&preview, context, diffs, config);
+    }
+    if qa_preview {
+        print_qa_preview(&preview, diffs)?;
     }
     print_persisted_review_run(storage, persisted.as_ref());
 
@@ -950,6 +1023,31 @@ fn print_publish_result(result: &PublishResult, publish_inline: bool, inline_dry
         "skipped"
     };
     println!("Inline comments: {inline_status}");
+}
+
+fn print_qa_publish_result(result: &PublishResult) {
+    println!();
+    println!("QA checklist publish result:");
+    println!(
+        "Action: {}",
+        match result.action {
+            PublishAction::Created => "created",
+            PublishAction::Updated => "updated",
+        }
+    );
+    match result.note_id {
+        Some(note_id) => println!("GitLab note ID: {note_id}"),
+        None => println!("GitLab note ID: unavailable"),
+    }
+    println!(
+        "Duplicate ReviewGate QA checklist notes found: {}",
+        result.duplicate_count
+    );
+    if result.duplicate_count > 1 {
+        println!(
+            "Warning: multiple ReviewGate QA checklist notes were found; updated the most recently updated one"
+        );
+    }
 }
 
 fn print_inline_dry_run_report(
