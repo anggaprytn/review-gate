@@ -119,11 +119,16 @@ pub fn format_review_markdown_for_mode_with_risk_gate(
     );
     output.push_str("\n## Test Coverage\n\n");
     output.push_str(&format_test_coverage_note(
+        analysis,
         analysis.test_coverage_note.as_deref(),
         mode,
     ));
     output.push_str("\n\n## Privacy\n\n");
-    output.push_str(&format_privacy_note(analysis.privacy_note.as_deref(), mode));
+    output.push_str(&format_privacy_note(
+        analysis,
+        analysis.privacy_note.as_deref(),
+        mode,
+    ));
     output.push_str("\n\n");
     output.push_str(REVIEWGATE_ATTRIBUTION);
     output.push('\n');
@@ -431,6 +436,9 @@ fn compact_positive_notes(findings: &[&ReviewFinding], limit: usize) -> Vec<Stri
     for finding in findings.iter().copied().filter(|finding| {
         finding.severity == Severity::Note
             && finding.risk_code == Some(RiskCode::PositiveNote)
+            && !finding.actionable
+            && positive_note_language(finding)
+            && !negative_positive_note_text(finding)
             && !matches!(
                 finding.evidence_status,
                 Some(
@@ -469,11 +477,26 @@ fn suppressed_current_file_invalidated_finding(finding: &ReviewFinding) -> bool 
             .is_some_and(|reason| reason.starts_with("current-file validation:"))
 }
 
-fn format_test_coverage_note(note: Option<&str>, mode: MarkdownRenderMode) -> String {
+fn format_test_coverage_note(
+    analysis: &ReviewAnalysis,
+    note: Option<&str>,
+    mode: MarkdownRenderMode,
+) -> String {
     if mode == MarkdownRenderMode::Preview {
         return note
             .map(|note| blank_fallback(note, "No specific test coverage note.").to_string())
             .unwrap_or_else(|| "No specific test coverage note.".to_string());
+    }
+
+    let concrete_gaps = concrete_coverage_gaps(&analysis.findings);
+    if !concrete_gaps.is_empty() {
+        let mut output = String::from("Coverage gaps:\n");
+        for gap in concrete_gaps {
+            output.push_str("- ");
+            output.push_str(&gap);
+            output.push('\n');
+        }
+        return output.trim_end().to_string();
     }
 
     let text = note.unwrap_or_default();
@@ -525,16 +548,25 @@ fn format_test_coverage_note(note: Option<&str>, mode: MarkdownRenderMode) -> St
     output.trim_end().to_string()
 }
 
-fn format_privacy_note(note: Option<&str>, mode: MarkdownRenderMode) -> String {
+fn format_privacy_note(
+    analysis: &ReviewAnalysis,
+    note: Option<&str>,
+    mode: MarkdownRenderMode,
+) -> String {
     if mode == MarkdownRenderMode::Preview {
         return note
             .map(|note| blank_fallback(note, "No specific privacy note.").to_string())
             .unwrap_or_else(|| "No specific privacy note.".to_string());
     }
 
+    let privacy_risk_detected = has_validated_privacy_risk_finding(&analysis.findings);
     let items = useful_note_items(note.unwrap_or_default(), 8, is_generic_privacy_item);
     if items.is_empty() {
-        return "No obvious new PII or secret exposure detected.".to_string();
+        return if privacy_risk_detected {
+            "Potential privacy risks were detected in reviewed chunks.".to_string()
+        } else {
+            "No obvious new PII or secret exposure detected in reviewed chunks.".to_string()
+        };
     }
 
     let mut positives = Vec::new();
@@ -549,10 +581,10 @@ fn format_privacy_note(note: Option<&str>, mode: MarkdownRenderMode) -> String {
         }
     }
 
-    let mut output = if risks.is_empty() {
-        "No obvious new PII or secret exposure detected.".to_string()
-    } else {
+    let mut output = if privacy_risk_detected || !risks.is_empty() {
         "Potential privacy risks were detected in reviewed chunks.".to_string()
+    } else {
+        "No obvious new PII or secret exposure detected in reviewed chunks.".to_string()
     };
     if !risks.is_empty() {
         output.push_str("\n\nPrivacy risks:\n");
@@ -638,6 +670,126 @@ fn normalize_sentence_key(sentence: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn positive_note_language(finding: &ReviewFinding) -> bool {
+    let text = finding_text(finding);
+    [
+        "added",
+        "covered",
+        "fixed",
+        "hardened",
+        "improved",
+        "parameterized",
+        "redacted",
+        "removed",
+        "sanitized",
+        "safe",
+        "secure",
+        "validated",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn negative_positive_note_text(finding: &ReviewFinding) -> bool {
+    contains_any_text(
+        &finding_text(finding),
+        &[
+            "secret",
+            "token",
+            "password",
+            "credential",
+            "authorization",
+            "cookie",
+            "pii",
+            "leak",
+            "logged",
+            "logging",
+            "sql injection",
+            "vulnerability",
+            "bypass",
+            "crash",
+            "fail",
+            "error",
+            "unsafe",
+        ],
+    )
+}
+
+fn concrete_coverage_gaps(findings: &[ReviewFinding]) -> Vec<String> {
+    let mut gaps = Vec::new();
+    let validated = findings
+        .iter()
+        .filter(|finding| validated_finding(finding))
+        .collect::<Vec<_>>();
+
+    if validated
+        .iter()
+        .any(|finding| finding.risk_code == Some(RiskCode::SqlInjection))
+    {
+        gaps.push(
+            "Add a test proving `findPaymentsByCustomer` uses parameterized queries.".to_string(),
+        );
+    }
+    if validated.iter().any(|finding| {
+        matches!(
+            finding.risk_code,
+            Some(RiskCode::SecretLeak | RiskCode::PiiOrSecretLogging)
+        ) && contains_any_text(
+            &finding_text(finding),
+            &["authorization", "header", "token", "password", "cookie"],
+        ) && contains_any_text(&finding_text(finding), &["log", "logged", "logging"])
+    }) {
+        gaps.push("Add a test ensuring Authorization headers are not logged.".to_string());
+    }
+    if validated.iter().any(|finding| {
+        finding.risk_code == Some(RiskCode::WeakErrorHandling)
+            && contains_any_text(
+                &format!(
+                    "{} {}",
+                    finding.file_path.as_deref().unwrap_or_default(),
+                    finding_text(finding)
+                ),
+                &["webhook", "json", "parse", "payload", "malformed"],
+            )
+    }) {
+        gaps.push("Add a test for malformed webhook JSON handling.".to_string());
+    }
+
+    gaps
+}
+
+fn has_validated_privacy_risk_finding(findings: &[ReviewFinding]) -> bool {
+    findings.iter().any(|finding| {
+        validated_finding(finding)
+            && matches!(
+                finding.risk_code,
+                Some(RiskCode::SecretLeak | RiskCode::PiiOrSecretLogging)
+            )
+    })
+}
+
+fn validated_finding(finding: &ReviewFinding) -> bool {
+    !matches!(
+        finding.evidence_status,
+        Some(
+            EvidenceValidationStatus::WeakEvidence
+                | EvidenceValidationStatus::StaleContext
+                | EvidenceValidationStatus::NeedsManualConfirmation
+                | EvidenceValidationStatus::PositiveChange
+        )
+    )
+}
+
+fn finding_text(finding: &ReviewFinding) -> String {
+    format!("{} {}", finding.title, finding.body).to_ascii_lowercase()
+}
+
+fn contains_any_text(value: &str, terms: &[&str]) -> bool {
+    terms
+        .iter()
+        .any(|term| value.contains(&term.to_ascii_lowercase()))
+}
+
 fn is_generic_test_coverage_item(item: &str) -> bool {
     let lower = item.to_ascii_lowercase();
     is_generic_no_tests_item(item)
@@ -690,6 +842,9 @@ fn is_no_secret_or_pii_item(item: &str) -> bool {
 
 fn is_positive_privacy_item(item: &str) -> bool {
     let lower = item.to_ascii_lowercase();
+    if is_negative_privacy_item(&lower) {
+        return false;
+    }
     [
         "redacted",
         "wiped",
@@ -704,6 +859,23 @@ fn is_positive_privacy_item(item: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn is_negative_privacy_item(item: &str) -> bool {
+    [
+        "logged",
+        "logging",
+        "leak",
+        "exposed",
+        "exposure",
+        "introduces",
+        "risk",
+        "raw payload",
+        "full payload",
+        "sensitive data",
+    ]
+    .iter()
+    .any(|needle| item.contains(needle))
 }
 
 fn is_generic_privacy_item(item: &str) -> bool {
@@ -1101,7 +1273,7 @@ mod tests {
 
         assert_eq!(
             markdown
-                .matches("No obvious new PII or secret exposure detected.")
+                .matches("No obvious new PII or secret exposure detected in reviewed chunks.")
                 .count(),
             1
         );
@@ -1128,10 +1300,11 @@ mod tests {
         );
         let section = markdown_section(&markdown, "## Privacy");
 
-        assert!(section.starts_with("No obvious new PII or secret exposure detected."));
+        assert!(section
+            .starts_with("No obvious new PII or secret exposure detected in reviewed chunks."));
         assert_eq!(
             section
-                .matches("No obvious new PII or secret exposure detected.")
+                .matches("No obvious new PII or secret exposure detected in reviewed chunks.")
                 .count(),
             1
         );
@@ -1139,6 +1312,116 @@ mod tests {
         assert!(!section.contains("excellent"));
         assert!(!section.contains("commendable"));
         assert_eq!(section.matches("\n- ").count(), 3);
+    }
+
+    #[test]
+    fn positive_notes_exclude_negative_security_text() {
+        let mut bad_note = finding(Severity::Note, "Secret access token is logged");
+        bad_note.risk_code = Some(RiskCode::PositiveNote);
+        bad_note.actionable = false;
+        let mut good_note = finding(Severity::Note, "Input validation coverage improved");
+        good_note.risk_code = Some(RiskCode::PositiveNote);
+        good_note.actionable = false;
+
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![bad_note, good_note],
+                test_coverage_note: None,
+                privacy_note: None,
+                overall_risk: OverallRisk::Low,
+            },
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        let section = markdown_section(&markdown, "## Low / Notes");
+
+        assert!(!section.contains("Secret access token is logged."));
+        assert!(section.contains("Input validation coverage improved."));
+    }
+
+    #[test]
+    fn privacy_status_follows_validated_secret_finding_and_excludes_negative_positives() {
+        let mut secret = finding(Severity::High, "Authorization header is logged");
+        secret.category = ReviewCategory::Security;
+        secret.risk_code = Some(RiskCode::SecretLeak);
+        secret.file_path = Some("src/paymentClient.ts".to_string());
+
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![secret],
+                test_coverage_note: None,
+                privacy_note: Some(
+                    "No obvious secret or PII exposure detected. This diff introduces multiple instances of logging sensitive data. Local session data is wiped."
+                        .to_string(),
+                ),
+                overall_risk: OverallRisk::High,
+            },
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        let section = markdown_section(&markdown, "## Privacy");
+
+        assert!(section.starts_with("Potential privacy risks were detected in reviewed chunks."));
+        assert!(section.contains("Privacy risks:"));
+        assert!(section.contains("logging sensitive data"));
+        assert!(section.contains("Privacy-positive changes:\n- Local session data is wiped."));
+        assert!(!section.contains("No obvious new PII or secret exposure detected"));
+    }
+
+    #[test]
+    fn privacy_status_reports_no_obvious_risk_without_privacy_findings() {
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![],
+                test_coverage_note: None,
+                privacy_note: None,
+                overall_risk: OverallRisk::Low,
+            },
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        let section = markdown_section(&markdown, "## Privacy");
+
+        assert!(section
+            .starts_with("No obvious new PII or secret exposure detected in reviewed chunks."));
+    }
+
+    #[test]
+    fn concrete_test_coverage_from_findings_replaces_generic_line() {
+        let mut sql = finding(Severity::Critical, "SQL injection in payment lookup");
+        sql.category = ReviewCategory::Security;
+        sql.risk_code = Some(RiskCode::SqlInjection);
+        sql.file_path = Some("src/paymentClient.ts".to_string());
+        let mut secret = finding(Severity::High, "Authorization header is logged");
+        secret.category = ReviewCategory::Security;
+        secret.risk_code = Some(RiskCode::SecretLeak);
+        secret.file_path = Some("src/paymentClient.ts".to_string());
+        let mut parse = finding(Severity::Medium, "JSON parse errors are suppressed");
+        parse.category = ReviewCategory::Reliability;
+        parse.risk_code = Some(RiskCode::WeakErrorHandling);
+        parse.file_path = Some("src/webhook.ts".to_string());
+
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![sql, secret, parse],
+                test_coverage_note: Some("Test coverage is insufficient.".to_string()),
+                privacy_note: None,
+                overall_risk: OverallRisk::Critical,
+            },
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        let section = markdown_section(&markdown, "## Test Coverage");
+
+        assert!(section
+            .contains("- Add a test proving `findPaymentsByCustomer` uses parameterized queries."));
+        assert!(section.contains("- Add a test ensuring Authorization headers are not logged."));
+        assert!(section.contains("- Add a test for malformed webhook JSON handling."));
+        assert!(!section.contains("Test coverage is insufficient."));
     }
 
     #[test]

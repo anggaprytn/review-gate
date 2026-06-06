@@ -30,9 +30,31 @@ pub struct MergeRiskAssessment {
     pub blast_radius: BlastRadius,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskEvidenceSource {
+    Finding,
+    ChangedFile,
+    PolicyRule,
+    Comparison,
+    Verification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RiskEvidence {
+    pub source: RiskEvidenceSource,
+    pub file_path: Option<String>,
+    pub finding_id: Option<String>,
+    pub risk_code: Option<String>,
+    pub rule_id: String,
+    pub description: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RiskFactor {
+    pub rule_id: String,
     pub label: String,
+    pub score: u8,
+    pub evidence: Vec<RiskEvidence>,
     pub points: i16,
 }
 
@@ -88,14 +110,54 @@ pub fn assess_merge_risk(
         match finding.severity {
             Severity::Critical => {
                 has_critical_actionable = true;
-                builder.add(35, "Validated critical actionable finding");
+                builder.add(
+                    35,
+                    "finding.severity.critical",
+                    "Validated critical actionable finding",
+                    vec![finding_evidence(
+                        "finding.severity.critical",
+                        finding,
+                        "Critical actionable finding validated in the current review.",
+                    )],
+                );
             }
             Severity::High => {
                 has_high_actionable = true;
-                builder.add(18, "Validated high actionable finding");
+                builder.add(
+                    18,
+                    "finding.severity.high",
+                    "Validated high actionable finding",
+                    vec![finding_evidence(
+                        "finding.severity.high",
+                        finding,
+                        "High actionable finding validated in the current review.",
+                    )],
+                );
             }
-            Severity::Medium => builder.add(8, "Validated medium actionable finding"),
-            Severity::Low => builder.add(2, "Validated low actionable finding"),
+            Severity::Medium => {
+                builder.add(
+                    8,
+                    "finding.severity.medium",
+                    "Validated medium actionable finding",
+                    vec![finding_evidence(
+                        "finding.severity.medium",
+                        finding,
+                        "Medium actionable finding validated in the current review.",
+                    )],
+                );
+            }
+            Severity::Low => {
+                builder.add(
+                    2,
+                    "finding.severity.low",
+                    "Validated low actionable finding",
+                    vec![finding_evidence(
+                        "finding.severity.low",
+                        finding,
+                        "Low actionable finding validated in the current review.",
+                    )],
+                );
+            }
             Severity::Note => {}
         }
 
@@ -103,39 +165,167 @@ pub fn assess_merge_risk(
             finding,
             &[RiskCode::PiiOrSecretLogging, RiskCode::SecretLeak],
         ) {
-            builder.add(25, "Secret or PII logging security finding");
+            let factor_index = builder.add(
+                25,
+                "finding.secret_or_pii_logging",
+                "Secret or PII logging security finding",
+                vec![finding_evidence(
+                    "finding.secret_or_pii_logging",
+                    finding,
+                    "Validated secret or PII logging finding.",
+                )],
+            );
             has_security_blocking_finding = true;
+            if credential_logging_finding(finding) {
+                push_blocker_for_factor(
+                    &mut blocking_issues,
+                    &builder.factors[factor_index],
+                    format!(
+                        "Sensitive credential/header logging in `{}`",
+                        finding_file_path(finding)
+                    ),
+                );
+                push_requirement_for_factor(
+                    &mut required_before_merge,
+                    &builder.factors[factor_index],
+                    credential_logging_requirement(finding),
+                );
+            }
+            if payload_logging_finding(finding) {
+                push_blocker_for_factor(
+                    &mut blocking_issues,
+                    &builder.factors[factor_index],
+                    format!(
+                        "Sensitive payload logging in `{}`",
+                        finding_file_path(finding)
+                    ),
+                );
+                push_requirement_for_factor(
+                    &mut required_before_merge,
+                    &builder.factors[factor_index],
+                    payload_logging_requirement(finding),
+                );
+            }
         }
         if security_finding_signal(
             finding,
             &[RiskCode::AuthBypass, RiskCode::MissingAuthorizationCheck],
         ) {
-            builder.add(35, "Authentication bypass security finding");
+            builder.add(
+                35,
+                "finding.auth_bypass",
+                "Authentication bypass security finding",
+                vec![finding_evidence(
+                    "finding.auth_bypass",
+                    finding,
+                    "Validated authorization or authentication bypass finding.",
+                )],
+            );
             has_security_blocking_finding = true;
         }
         if security_finding_signal(
             finding,
             &[RiskCode::SqlInjection, RiskCode::CommandInjection],
         ) {
-            builder.add(35, "SQL or command injection security finding");
+            let factor_index = builder.add(
+                35,
+                "finding.injection",
+                "SQL or command injection security finding",
+                vec![finding_evidence(
+                    "finding.injection",
+                    finding,
+                    "Validated SQL or command injection finding.",
+                )],
+            );
             has_security_blocking_finding = true;
+            if sql_injection_blocking_finding(finding) {
+                push_blocker_for_factor(
+                    &mut blocking_issues,
+                    &builder.factors[factor_index],
+                    format!("SQL injection in `{}`", finding_file_path(finding)),
+                );
+                push_requirement_for_factor(
+                    &mut required_before_merge,
+                    &builder.factors[factor_index],
+                    "Replace raw SQL interpolation with a parameterized query or safe query builder"
+                        .to_string(),
+                );
+            }
+        }
+        if weak_error_handling_required_finding(finding) {
+            let factor_index = builder.add(
+                8,
+                "finding.weak_error_handling",
+                "Weak error handling finding",
+                vec![finding_evidence(
+                    "finding.weak_error_handling",
+                    finding,
+                    "Validated weak error handling finding.",
+                )],
+            );
+            push_requirement_for_factor(
+                &mut required_before_merge,
+                &builder.factors[factor_index],
+                weak_error_handling_requirement(finding),
+            );
         }
     }
 
     if stats.changed_file_count > DEFAULT_LARGE_MR_FILE_THRESHOLD {
-        builder.add(10, "Changed files exceed large MR threshold");
+        builder.add(
+            10,
+            "verification.large_mr.changed_files",
+            "Changed files exceed large MR threshold",
+            vec![verification_evidence(
+                "verification.large_mr.changed_files",
+                format!(
+                    "{} changed files exceed the large MR threshold.",
+                    stats.changed_file_count
+                ),
+            )],
+        );
     }
     if stats.total_diff_bytes > DEFAULT_LARGE_MR_DIFF_BYTES {
-        builder.add(10, "Diff bytes exceed large MR threshold");
+        builder.add(
+            10,
+            "verification.large_mr.diff_bytes",
+            "Diff bytes exceed large MR threshold",
+            vec![verification_evidence(
+                "verification.large_mr.diff_bytes",
+                format!(
+                    "{} diff bytes exceed the large MR threshold.",
+                    stats.total_diff_bytes
+                ),
+            )],
+        );
     }
     if stats.collapsed_file_count > 0 || stats.too_large_file_count > 0 {
-        builder.add(10, "GitLab collapsed or too-large files are present");
+        builder.add(
+            10,
+            "verification.gitlab.partial_diff",
+            "GitLab collapsed or too-large files are present",
+            vec![verification_evidence(
+                "verification.gitlab.partial_diff",
+                format!(
+                    "{} collapsed and {} too-large files are present.",
+                    stats.collapsed_file_count, stats.too_large_file_count
+                ),
+            )],
+        );
     }
 
     if let Some(report) = signals.large_review {
         if report.failed_chunks > 0 {
             let points = (report.failed_chunks * 8).min(20) as i16;
-            builder.add(points, "Large MR review had failed chunks");
+            builder.add(
+                points,
+                "verification.large_review.failed_chunks",
+                "Large MR review had failed chunks",
+                vec![verification_evidence(
+                    "verification.large_review.failed_chunks",
+                    format!("{} review chunks failed.", report.failed_chunks),
+                )],
+            );
             needs_human = true;
         }
     }
@@ -144,24 +334,59 @@ pub fn assess_merge_risk(
         .iter()
         .any(|path| is_source_behavior_path(path) && !is_test_path(path));
     if source_changed && changed_test_files.is_empty() {
-        builder.add(10, "Source behavior changed without changed tests");
+        builder.add(
+            10,
+            "changed_file.source_without_tests",
+            "Source behavior changed without changed tests",
+            changed_files
+                .iter()
+                .filter(|path| is_source_behavior_path(path) && !is_test_path(path))
+                .map(|path| {
+                    changed_file_evidence(
+                        "changed_file.source_without_tests",
+                        path,
+                        "Source behavior changed and no test files changed.",
+                    )
+                })
+                .collect(),
+        );
     }
 
     let protected_matches = protected_path_matches(&changed_files, config);
     for protected in &protected_matches {
-        builder.add(20, format!("Protected path touched: {}", protected.pattern));
+        let protected_evidence = vec![policy_evidence(
+            "policy.protected_path",
+            &protected.matched_path,
+            &protected.pattern,
+            "Changed file matches a configured protected path.",
+        )];
+        builder.add(
+            20,
+            "policy.protected_path",
+            format!("Protected path touched: {}", protected.pattern),
+            protected_evidence.clone(),
+        );
         let issue = format!("Touched protected module: `{}`", protected.pattern);
-        push_unique(&mut blocking_issues, issue);
+        push_blocker_for_evidence(&mut blocking_issues, &protected_evidence, issue);
         if let Some(owner) = protected.owner.as_deref() {
+            let owner_evidence = vec![policy_evidence(
+                "policy.protected_path.owner_review",
+                &protected.matched_path,
+                &protected.pattern,
+                format!("Protected path requires owner review from {owner}."),
+            )];
             builder.add(
                 30,
+                "policy.protected_path.owner_review",
                 format!(
                     "Protected path touched without required owner review: {}",
                     protected.pattern
                 ),
+                owner_evidence.clone(),
             );
-            push_unique(
+            push_requirement_for_evidence(
                 &mut required_before_merge,
+                &owner_evidence,
                 format!("Request owner review from {owner}"),
             );
         }
@@ -169,7 +394,12 @@ pub fn assess_merge_risk(
             .iter()
             .any(|path| test_matches_required_terms(path, protected.required_tests.as_slice()))
         {
-            builder.add(15, "Protected module changed without matching test file");
+            builder.add(
+                15,
+                "policy.protected_path.missing_tests",
+                "Protected module changed without matching test file",
+                protected_evidence,
+            );
         }
         needs_human = true;
     }
@@ -186,67 +416,139 @@ pub fn assess_merge_risk(
         ],
     );
     if auth_touched {
-        builder.add(15, "Architecture-sensitive auth or security area touched");
+        builder.add(
+            15,
+            "changed_file.auth_security_area",
+            "Architecture-sensitive auth or security area touched",
+            path_signal_evidence(
+                diffs,
+                "changed_file.auth_security_area",
+                &[
+                    "auth",
+                    "security",
+                    "session",
+                    "root",
+                    "jailbreak",
+                    "integrity",
+                ],
+                "Changed file or diff text matches an auth/security signal.",
+            ),
+        );
         needs_human = true;
     }
-    let sync_touched = any_path_or_diff_signal(
-        diffs,
-        &[
-            "sync", "offline", "queue", "retry", "cache", "pending", "recovery",
-        ],
-    );
-    if sync_touched {
-        builder.add(15, "Offline sync, cache, queue, or retry area touched");
+    let sync_changed_files = changed_files
+        .iter()
+        .filter(|path| offline_sync_path_signal(path) && !is_test_path(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !sync_changed_files.is_empty() {
+        let sync_evidence = sync_changed_files
+            .iter()
+            .map(|path| {
+                changed_file_evidence(
+                    "changed_file.offline_sync_area",
+                    path,
+                    "Changed file path matches offline sync/cache/queue/retry/recovery terms.",
+                )
+            })
+            .collect::<Vec<_>>();
+        builder.add(
+            15,
+            "changed_file.offline_sync_area",
+            "Offline sync, cache, queue, or retry area touched",
+            sync_evidence.clone(),
+        );
         needs_human = true;
         if !has_test_with_terms(
             &changed_test_files,
             &["sync", "offline", "recovery", "retry", "queue"],
         ) {
-            builder.add(25, "Offline sync layer changed without recovery test");
-            push_unique(
+            builder.add(
+                25,
+                "changed_file.offline_sync_missing_recovery_test",
+                "Offline sync layer changed without recovery test",
+                sync_evidence.clone(),
+            );
+            push_blocker_for_evidence(
                 &mut blocking_issues,
+                &sync_evidence,
                 "Modified offline sync layer without adding recovery test".to_string(),
             );
-            push_unique(
+            push_requirement_for_evidence(
                 &mut required_before_merge,
+                &sync_evidence,
                 "Add sync recovery test".to_string(),
             );
         }
     }
     if any_path_or_diff_signal(diffs, &["payment", "billing", "money"]) {
-        builder.add(20, "Payment, billing, or money area touched");
+        builder.add(
+            20,
+            "changed_file.payment_area",
+            "Payment, billing, or money area touched",
+            path_signal_evidence(
+                diffs,
+                "changed_file.payment_area",
+                &["payment", "billing", "money"],
+                "Changed file or diff text matches a payment/billing/money signal.",
+            ),
+        );
         needs_human = true;
     }
 
-    let migration_changed = migration_changed(diffs, config);
-    if migration_changed {
-        builder.add(20, "Database migration or schema area touched");
+    let migration_evidence = migration_evidence(diffs, config);
+    if !migration_evidence.is_empty() {
+        builder.add(
+            20,
+            "changed_file.migration_or_schema",
+            "Database migration or schema area touched",
+            migration_evidence.clone(),
+        );
         needs_human = true;
         if !rollback_note_detected(diffs) {
-            builder.add(25, "Database migration changed without rollback plan");
-            push_unique(
+            builder.add(
+                25,
+                "changed_file.migration_missing_rollback",
+                "Database migration changed without rollback plan",
+                migration_evidence.clone(),
+            );
+            push_blocker_for_evidence(
                 &mut blocking_issues,
+                &migration_evidence,
                 "Added DB migration without rollback plan".to_string(),
             );
-            push_unique(
+            push_requirement_for_evidence(
                 &mut required_before_merge,
+                &migration_evidence,
                 "Attach migration rollback note".to_string(),
             );
         }
     }
 
-    let contract_changed = contract_changed(diffs, config);
-    if contract_changed {
-        builder.add(15, "API contract area touched");
+    let contract_evidence = contract_evidence(diffs, config);
+    if !contract_evidence.is_empty() {
+        builder.add(
+            15,
+            "changed_file.api_contract",
+            "API contract area touched",
+            contract_evidence.clone(),
+        );
         needs_human = true;
         if !contract_snapshot_updated(diffs, config) {
-            builder.add(20, "API contract changed without contract snapshot update");
-            push_unique(
+            builder.add(
+                20,
+                "changed_file.api_contract_missing_snapshot",
+                "API contract changed without contract snapshot update",
+                contract_evidence.clone(),
+            );
+            push_blocker_for_evidence(
                 &mut blocking_issues,
+                &contract_evidence,
                 "Changed API response contract without updating contract snapshot".to_string(),
             );
-            push_unique(
+            push_requirement_for_evidence(
                 &mut required_before_merge,
+                &contract_evidence,
                 "Update OpenAPI/proto/contract snapshot".to_string(),
             );
         }
@@ -254,17 +556,52 @@ pub fn assess_merge_risk(
 
     if let Some(comparison) = signals.comparison {
         if comparison.still_detected > 0 {
-            builder.add(15, "Previous high-priority finding still detected");
+            builder.add(
+                15,
+                "comparison.previous_finding_still_detected",
+                "Previous high-priority finding still detected",
+                vec![comparison_evidence(
+                    "comparison.previous_finding_still_detected",
+                    format!(
+                        "{} previous high-priority findings are still detected.",
+                        comparison.still_detected
+                    ),
+                )],
+            );
             needs_human = true;
         }
         if comparison.not_detected > 0 {
-            builder.add(5, "Previous finding no longer detected but not verified");
+            builder.add(
+                5,
+                "comparison.previous_finding_not_verified",
+                "Previous finding no longer detected but not verified",
+                vec![comparison_evidence(
+                    "comparison.previous_finding_not_verified",
+                    format!(
+                        "{} previous findings are no longer detected but still need verification.",
+                        comparison.not_detected
+                    ),
+                )],
+            );
         }
         if comparison.verified_fixed > 0 {
             let points = -10 * comparison.verified_fixed.min(2) as i16;
-            builder.add(points, "Previous finding verified fixed");
+            builder.add(
+                points,
+                "comparison.previous_finding_verified_fixed",
+                "Previous finding verified fixed",
+                vec![comparison_evidence(
+                    "comparison.previous_finding_verified_fixed",
+                    format!(
+                        "{} previous findings were verified fixed.",
+                        comparison.verified_fixed
+                    ),
+                )],
+            );
         }
     }
+
+    push_combined_focused_test_requirement(&mut required_before_merge, &builder.factors);
 
     let score = builder.score();
     let blocked = score >= config.block_threshold
@@ -372,12 +709,22 @@ struct RiskBuilder {
 }
 
 impl RiskBuilder {
-    fn add(&mut self, points: i16, label: impl Into<String>) {
+    fn add(
+        &mut self,
+        points: i16,
+        rule_id: impl Into<String>,
+        label: impl Into<String>,
+        evidence: Vec<RiskEvidence>,
+    ) -> usize {
         self.total = self.total.saturating_add(points);
         self.factors.push(RiskFactor {
+            rule_id: rule_id.into(),
             label: label.into(),
+            score: points.clamp(0, 100) as u8,
+            evidence,
             points,
         });
+        self.factors.len() - 1
     }
 
     fn score(&self) -> u8 {
@@ -388,6 +735,7 @@ impl RiskBuilder {
 #[derive(Debug)]
 struct ProtectedMatch {
     pattern: String,
+    matched_path: String,
     owner: Option<String>,
     required_tests: Vec<String>,
 }
@@ -429,14 +777,19 @@ fn protected_path_matches(paths: &[String], config: &RiskGateConfig) -> Vec<Prot
     let mut seen = HashSet::new();
     let mut matches = Vec::new();
     for pattern in &config.protected_paths {
-        if !paths.iter().any(|path| path_matches_pattern(path, pattern)) {
+        let Some(matched_path) = paths
+            .iter()
+            .find(|path| path_matches_pattern(path, pattern))
+            .cloned()
+        else {
             continue;
-        }
+        };
         if !seen.insert(pattern.clone()) {
             continue;
         }
         matches.push(ProtectedMatch {
             pattern: pattern.clone(),
+            matched_path,
             owner: config.owner_reviews.get(pattern).cloned(),
             required_tests: config
                 .required_tests
@@ -446,6 +799,91 @@ fn protected_path_matches(paths: &[String], config: &RiskGateConfig) -> Vec<Prot
         });
     }
     matches
+}
+
+fn finding_evidence(rule_id: &str, finding: &ReviewFinding, description: &str) -> RiskEvidence {
+    RiskEvidence {
+        source: RiskEvidenceSource::Finding,
+        file_path: finding.file_path.clone(),
+        finding_id: finding.anchor_id.clone(),
+        risk_code: finding
+            .risk_code
+            .map(|risk_code| risk_code.display_lower().to_string()),
+        rule_id: rule_id.to_string(),
+        description: description.to_string(),
+    }
+}
+
+fn changed_file_evidence(
+    rule_id: &str,
+    file_path: &str,
+    description: impl Into<String>,
+) -> RiskEvidence {
+    RiskEvidence {
+        source: RiskEvidenceSource::ChangedFile,
+        file_path: Some(file_path.to_string()),
+        finding_id: None,
+        risk_code: None,
+        rule_id: rule_id.to_string(),
+        description: description.into(),
+    }
+}
+
+fn policy_evidence(
+    rule_id: &str,
+    file_path: &str,
+    pattern: &str,
+    description: impl Into<String>,
+) -> RiskEvidence {
+    RiskEvidence {
+        source: RiskEvidenceSource::PolicyRule,
+        file_path: Some(file_path.to_string()),
+        finding_id: None,
+        risk_code: Some(pattern.to_string()),
+        rule_id: rule_id.to_string(),
+        description: description.into(),
+    }
+}
+
+fn comparison_evidence(rule_id: &str, description: impl Into<String>) -> RiskEvidence {
+    RiskEvidence {
+        source: RiskEvidenceSource::Comparison,
+        file_path: None,
+        finding_id: None,
+        risk_code: None,
+        rule_id: rule_id.to_string(),
+        description: description.into(),
+    }
+}
+
+fn verification_evidence(rule_id: &str, description: impl Into<String>) -> RiskEvidence {
+    RiskEvidence {
+        source: RiskEvidenceSource::Verification,
+        file_path: None,
+        finding_id: None,
+        risk_code: None,
+        rule_id: rule_id.to_string(),
+        description: description.into(),
+    }
+}
+
+fn path_signal_evidence(
+    diffs: &[MergeRequestDiff],
+    rule_id: &str,
+    terms: &[&str],
+    description: &str,
+) -> Vec<RiskEvidence> {
+    diffs
+        .iter()
+        .filter(|diff| {
+            let path = normalize_path(&diff.new_path);
+            let body = diff.diff.to_ascii_lowercase();
+            terms
+                .iter()
+                .any(|term| path.contains(term) || body.contains(term))
+        })
+        .map(|diff| changed_file_evidence(rule_id, &diff.new_path, description))
+        .collect()
 }
 
 fn any_path_or_diff_signal(diffs: &[MergeRequestDiff], terms: &[&str]) -> bool {
@@ -458,21 +896,43 @@ fn any_path_or_diff_signal(diffs: &[MergeRequestDiff], terms: &[&str]) -> bool {
     })
 }
 
-fn migration_changed(diffs: &[MergeRequestDiff], config: &RiskGateConfig) -> bool {
-    diffs.iter().any(|diff| {
-        let path = normalize_path(&diff.new_path);
-        config
-            .migration_paths
-            .iter()
-            .any(|pattern| path_matches_pattern(&path, pattern))
-            || path.contains("migration")
-            || path.contains("migrations/")
-            || path.ends_with("schema.sql")
-            || contains_any(
-                &diff.diff,
-                &["ALTER TABLE", "CREATE TABLE", "DROP TABLE", "migration"],
+fn migration_evidence(diffs: &[MergeRequestDiff], config: &RiskGateConfig) -> Vec<RiskEvidence> {
+    diffs
+        .iter()
+        .filter(|diff| {
+            let path = normalize_path(&diff.new_path);
+            config
+                .migration_paths
+                .iter()
+                .any(|pattern| path_matches_pattern(&path, pattern))
+                || path.contains("migration")
+                || path.contains("migrations/")
+                || path.ends_with("schema.sql")
+                || migration_ddl_signal(&diff.diff)
+        })
+        .map(|diff| {
+            changed_file_evidence(
+                "changed_file.migration_or_schema",
+                &diff.new_path,
+                "Changed file or diff text contains migration/schema evidence.",
             )
-    })
+        })
+        .collect()
+}
+
+fn migration_ddl_signal(diff: &str) -> bool {
+    contains_any(
+        diff,
+        &[
+            "ALTER TABLE",
+            "CREATE TABLE",
+            "DROP TABLE",
+            "CREATE INDEX",
+            "DROP INDEX",
+            "ADD COLUMN",
+            "DROP COLUMN",
+        ],
+    )
 }
 
 fn rollback_note_detected(diffs: &[MergeRequestDiff]) -> bool {
@@ -490,27 +950,38 @@ fn rollback_note_detected(diffs: &[MergeRequestDiff]) -> bool {
     })
 }
 
-fn contract_changed(diffs: &[MergeRequestDiff], config: &RiskGateConfig) -> bool {
-    diffs.iter().any(|diff| {
-        let path = normalize_path(&diff.new_path);
-        config
-            .contract_paths
-            .iter()
-            .any(|pattern| path_matches_pattern(&path, pattern))
-            || contains_any(
-                &format!("{} {}", path, diff.diff),
-                &[
-                    "openapi",
-                    "swagger",
-                    "proto",
-                    "contract",
-                    "dto",
-                    "api response",
-                    "generated client",
-                    "endpoint types",
-                ],
+fn contract_evidence(diffs: &[MergeRequestDiff], config: &RiskGateConfig) -> Vec<RiskEvidence> {
+    diffs
+        .iter()
+        .filter(|diff| {
+            let path = normalize_path(&diff.new_path);
+            config
+                .contract_paths
+                .iter()
+                .any(|pattern| path_matches_pattern(&path, pattern))
+                || contract_path_signal(&path)
+        })
+        .map(|diff| {
+            changed_file_evidence(
+                "changed_file.api_contract",
+                &diff.new_path,
+                "Changed file path matches API contract evidence.",
             )
-    })
+        })
+        .collect()
+}
+
+fn contract_path_signal(path: &str) -> bool {
+    path.contains("openapi")
+        || path.contains("swagger")
+        || path.ends_with(".proto")
+        || path.contains("/contract")
+        || path.contains("contract/")
+        || path.contains("_dto.")
+        || path.contains("/dto/")
+        || path.contains("generated-client")
+        || path.contains("generated_client")
+        || (path.contains("endpoint") && path.contains("schema"))
 }
 
 fn contract_snapshot_updated(diffs: &[MergeRequestDiff], config: &RiskGateConfig) -> bool {
@@ -525,6 +996,189 @@ fn contract_snapshot_updated(diffs: &[MergeRequestDiff], config: &RiskGateConfig
                 &["openapi", "swagger", ".proto", "snapshot", "contract"],
             )
     })
+}
+
+fn sql_injection_blocking_finding(finding: &ReviewFinding) -> bool {
+    finding.risk_code == Some(RiskCode::SqlInjection)
+        && matches!(
+            finding.severity,
+            Severity::Critical | Severity::High | Severity::Medium
+        )
+        && finding.actionable
+}
+
+fn credential_logging_finding(finding: &ReviewFinding) -> bool {
+    matches!(
+        finding.risk_code,
+        Some(RiskCode::SecretLeak | RiskCode::PiiOrSecretLogging)
+    ) && contains_any(
+        &finding_text(finding),
+        &[
+            "authorization",
+            "header",
+            "token",
+            "password",
+            "cookie",
+            "credential",
+        ],
+    ) && contains_any(&finding_text(finding), &["log", "logged", "logging"])
+}
+
+fn payload_logging_finding(finding: &ReviewFinding) -> bool {
+    finding.risk_code == Some(RiskCode::PiiOrSecretLogging)
+        && matches!(
+            finding.category,
+            ReviewCategory::Security | ReviewCategory::Privacy
+        )
+        && contains_any(
+            &format!(
+                "{} {}",
+                finding.file_path.as_deref().unwrap_or_default(),
+                finding_text(finding)
+            ),
+            &["payload", "webhook", "body", "log", "logged", "logging"],
+        )
+}
+
+fn weak_error_handling_required_finding(finding: &ReviewFinding) -> bool {
+    finding.risk_code == Some(RiskCode::WeakErrorHandling)
+        && matches!(finding.severity, Severity::High | Severity::Medium)
+        && finding.actionable
+}
+
+fn credential_logging_requirement(finding: &ReviewFinding) -> String {
+    if contains_any(&finding_text(finding), &["authorization", "auth header"]) {
+        "Remove raw Authorization header logging".to_string()
+    } else {
+        "Remove raw credential/header logging or replace it with sanitized metadata".to_string()
+    }
+}
+
+fn payload_logging_requirement(finding: &ReviewFinding) -> String {
+    if contains_any(
+        &format!(
+            "{} {}",
+            finding.file_path.as_deref().unwrap_or_default(),
+            finding_text(finding)
+        ),
+        &["webhook"],
+    ) {
+        "Remove or sanitize full webhook payload logging".to_string()
+    } else {
+        "Remove full payload logging or log only approved non-sensitive fields".to_string()
+    }
+}
+
+fn weak_error_handling_requirement(finding: &ReviewFinding) -> String {
+    if contains_any(
+        &format!(
+            "{} {}",
+            finding.file_path.as_deref().unwrap_or_default(),
+            finding_text(finding)
+        ),
+        &["webhook", "json", "parse", "payload", "malformed"],
+    ) {
+        "Fix webhook parse failure handling so malformed payloads are not silently accepted"
+            .to_string()
+    } else {
+        "Fix error handling so failures are not silently accepted".to_string()
+    }
+}
+
+fn finding_text(finding: &ReviewFinding) -> String {
+    format!("{} {}", finding.title, finding.body).to_ascii_lowercase()
+}
+
+fn finding_file_path(finding: &ReviewFinding) -> String {
+    finding
+        .file_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or("unknown file")
+        .to_string()
+}
+
+fn offline_sync_path_signal(path: &str) -> bool {
+    contains_any(
+        &normalize_path(path),
+        &[
+            "sync", "offline", "queue", "retry", "cache", "pending", "recovery",
+        ],
+    )
+}
+
+fn push_blocker_for_factor(
+    values: &mut Vec<String>,
+    factor: &RiskFactor,
+    value: impl Into<String>,
+) {
+    if !factor.evidence.is_empty() {
+        push_unique(values, value.into());
+    }
+}
+
+fn push_requirement_for_factor(
+    values: &mut Vec<String>,
+    factor: &RiskFactor,
+    value: impl Into<String>,
+) {
+    if !factor.evidence.is_empty() {
+        push_unique(values, value.into());
+    }
+}
+
+fn push_blocker_for_evidence(
+    values: &mut Vec<String>,
+    evidence: &[RiskEvidence],
+    value: impl Into<String>,
+) {
+    if !evidence.is_empty() {
+        push_unique(values, value.into());
+    }
+}
+
+fn push_requirement_for_evidence(
+    values: &mut Vec<String>,
+    evidence: &[RiskEvidence],
+    value: impl Into<String>,
+) {
+    if !evidence.is_empty() {
+        push_unique(values, value.into());
+    }
+}
+
+fn push_combined_focused_test_requirement(values: &mut Vec<String>, factors: &[RiskFactor]) {
+    let has_sql = factors.iter().any(|factor| {
+        factor.rule_id == "finding.injection"
+            && factor
+                .evidence
+                .iter()
+                .any(|evidence| evidence.risk_code.as_deref() == Some("sql_injection"))
+    });
+    let has_webhook_parse = factors.iter().any(|factor| {
+        factor.rule_id == "finding.weak_error_handling"
+            && factor.evidence.iter().any(|evidence| {
+                let text = format!(
+                    "{} {}",
+                    evidence.file_path.as_deref().unwrap_or_default(),
+                    evidence.description
+                );
+                contains_any(&text, &["webhook", "parse", "json", "payload", "malformed"])
+            })
+    });
+
+    match (has_sql, has_webhook_parse) {
+        (true, true) => push_unique(
+            values,
+            "Add focused tests for SQL query safety and webhook parse failure handling".to_string(),
+        ),
+        (true, false) => push_unique(values, "Add focused tests for SQL query safety".to_string()),
+        (false, true) => push_unique(
+            values,
+            "Add focused tests for webhook parse failure handling".to_string(),
+        ),
+        (false, false) => {}
+    }
 }
 
 fn is_source_behavior_path(path: &str) -> bool {
@@ -816,6 +1470,23 @@ mod tests {
     }
 
     #[test]
+    fn offline_sync_blocker_does_not_appear_without_sync_file_change() {
+        let assessment = assess(
+            &[],
+            &[diff(
+                "src/paymentClient.ts",
+                "+logger.info('retry payment request')",
+            )],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert!(!assessment
+            .blocking_issues
+            .contains(&"Modified offline sync layer without adding recovery test".to_string()));
+    }
+
+    #[test]
     fn api_contract_without_snapshot_blocks() {
         let assessment = assess(
             &[],
@@ -826,6 +1497,20 @@ mod tests {
 
         assert_eq!(assessment.decision, MergeDecision::Blocked);
         assert!(assessment.blocking_issues.contains(
+            &"Changed API response contract without updating contract snapshot".to_string()
+        ));
+    }
+
+    #[test]
+    fn api_contract_blocker_does_not_appear_for_generic_client_file() {
+        let assessment = assess(
+            &[],
+            &[diff("src/paymentClient.ts", "+fetch('/api/payments')")],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert!(!assessment.blocking_issues.contains(
             &"Changed API response contract without updating contract snapshot".to_string()
         ));
     }
@@ -883,6 +1568,23 @@ mod tests {
     }
 
     #[test]
+    fn migration_blocker_does_not_appear_without_migration_evidence() {
+        let assessment = assess(
+            &[],
+            &[diff(
+                "src/paymentClient.ts",
+                "+const migrationNote = 'none';",
+            )],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert!(!assessment
+            .blocking_issues
+            .contains(&"Added DB migration without rollback plan".to_string()));
+    }
+
+    #[test]
     fn protected_path_touched_requires_owner_review() {
         let assessment = assess(
             &[],
@@ -909,6 +1611,191 @@ mod tests {
         assert!(assessment
             .required_before_merge
             .contains(&"Request owner review from Security Lead".to_string()));
+    }
+
+    #[test]
+    fn protected_path_blocker_includes_matched_pattern() {
+        let assessment = assess(
+            &[],
+            &[diff("src/features/sync/worker.rs", "+start queue")],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert!(assessment
+            .blocking_issues
+            .contains(&"Touched protected module: `src/features/sync/**`".to_string()));
+    }
+
+    #[test]
+    fn sql_injection_finding_emits_evidence_bound_blocker_and_requirement() {
+        let assessment = assess(
+            &[finding_with_details(
+                Severity::Critical,
+                ReviewCategory::Security,
+                Some(RiskCode::SqlInjection),
+                "src/paymentClient.ts",
+                "Raw SQL interpolation",
+                "findPaymentsByCustomer interpolates customer input into SQL.",
+            )],
+            &[diff("src/paymentClient.ts", "+db.query(`SELECT ${id}`)")],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert!(assessment
+            .blocking_issues
+            .contains(&"SQL injection in `src/paymentClient.ts`".to_string()));
+        assert!(assessment.required_before_merge.contains(
+            &"Replace raw SQL interpolation with a parameterized query or safe query builder"
+                .to_string()
+        ));
+    }
+
+    #[test]
+    fn secret_leak_finding_emits_credential_logging_blocker() {
+        let assessment = assess(
+            &[finding_with_details(
+                Severity::High,
+                ReviewCategory::Security,
+                Some(RiskCode::SecretLeak),
+                "src/paymentClient.ts",
+                "Authorization header is logged",
+                "The raw Authorization header token is written to logs.",
+            )],
+            &[diff(
+                "src/paymentClient.ts",
+                "+logger.info(headers.authorization)",
+            )],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert!(assessment.blocking_issues.contains(
+            &"Sensitive credential/header logging in `src/paymentClient.ts`".to_string()
+        ));
+        assert!(assessment
+            .required_before_merge
+            .contains(&"Remove raw Authorization header logging".to_string()));
+    }
+
+    #[test]
+    fn webhook_pii_logging_finding_emits_payload_logging_blocker() {
+        let assessment = assess(
+            &[finding_with_details(
+                Severity::High,
+                ReviewCategory::Privacy,
+                Some(RiskCode::PiiOrSecretLogging),
+                "src/webhook.ts",
+                "Webhook payload is logged",
+                "The full webhook body payload is logged.",
+            )],
+            &[diff("src/webhook.ts", "+console.log(req.body)")],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert!(assessment
+            .blocking_issues
+            .contains(&"Sensitive payload logging in `src/webhook.ts`".to_string()));
+        assert!(assessment
+            .required_before_merge
+            .contains(&"Remove or sanitize full webhook payload logging".to_string()));
+    }
+
+    #[test]
+    fn weak_error_handling_finding_adds_requirement_without_unrelated_blocker() {
+        let assessment = assess(
+            &[finding_with_details(
+                Severity::Medium,
+                ReviewCategory::Reliability,
+                Some(RiskCode::WeakErrorHandling),
+                "src/webhook.ts",
+                "JSON parse errors are suppressed",
+                "Malformed webhook JSON is silently accepted.",
+            )],
+            &[diff("src/webhook.ts", "+try { JSON.parse(body) } catch {}")],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert!(assessment.required_before_merge.contains(
+            &"Fix webhook parse failure handling so malformed payloads are not silently accepted"
+                .to_string()
+        ));
+        assert!(!assessment
+            .blocking_issues
+            .contains(&"Modified offline sync layer without adding recovery test".to_string()));
+    }
+
+    #[test]
+    fn sample_payment_webhook_findings_block_without_unrelated_policy_blockers() {
+        let assessment = assess(
+            &[
+                finding_with_details(
+                    Severity::Critical,
+                    ReviewCategory::Security,
+                    Some(RiskCode::SqlInjection),
+                    "src/paymentClient.ts",
+                    "SQL injection in payment lookup",
+                    "findPaymentsByCustomer uses raw SQL interpolation.",
+                ),
+                finding_with_details(
+                    Severity::High,
+                    ReviewCategory::Security,
+                    Some(RiskCode::SecretLeak),
+                    "src/paymentClient.ts",
+                    "Authorization header is logged",
+                    "The raw Authorization header token is logged.",
+                ),
+                finding_with_details(
+                    Severity::High,
+                    ReviewCategory::Privacy,
+                    Some(RiskCode::PiiOrSecretLogging),
+                    "src/webhook.ts",
+                    "Webhook payload is logged",
+                    "The full webhook body payload is logged.",
+                ),
+                finding_with_details(
+                    Severity::Medium,
+                    ReviewCategory::Reliability,
+                    Some(RiskCode::WeakErrorHandling),
+                    "src/webhook.ts",
+                    "JSON parse errors are suppressed",
+                    "Malformed webhook JSON is silently accepted.",
+                ),
+            ],
+            &[
+                diff("src/paymentClient.ts", "+db.query(`SELECT ${id}`)"),
+                diff("src/webhook.ts", "+console.log(req.body)"),
+            ],
+            stats(2, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert_eq!(assessment.decision, MergeDecision::Blocked);
+        assert!(assessment
+            .blocking_issues
+            .contains(&"SQL injection in `src/paymentClient.ts`".to_string()));
+        assert!(assessment.blocking_issues.contains(
+            &"Sensitive credential/header logging in `src/paymentClient.ts`".to_string()
+        ));
+        assert!(assessment
+            .blocking_issues
+            .contains(&"Sensitive payload logging in `src/webhook.ts`".to_string()));
+        assert!(!assessment
+            .blocking_issues
+            .contains(&"Modified offline sync layer without adding recovery test".to_string()));
+        assert!(!assessment
+            .blocking_issues
+            .contains(&"Added DB migration without rollback plan".to_string()));
+        assert!(!assessment.blocking_issues.contains(
+            &"Changed API response contract without updating contract snapshot".to_string()
+        ));
+        assert!(assessment.required_before_merge.contains(
+            &"Add focused tests for SQL query safety and webhook parse failure handling"
+                .to_string()
+        ));
     }
 
     #[test]
@@ -1048,15 +1935,26 @@ mod tests {
         category: ReviewCategory,
         risk_code: Option<RiskCode>,
     ) -> ReviewFinding {
+        finding_with_details(severity, category, risk_code, "src/lib.rs", "title", "body")
+    }
+
+    fn finding_with_details(
+        severity: Severity,
+        category: ReviewCategory,
+        risk_code: Option<RiskCode>,
+        file_path: &str,
+        title: &str,
+        body: &str,
+    ) -> ReviewFinding {
         ReviewFinding {
             severity,
             category,
             risk_code,
             anchor_id: None,
-            file_path: Some("src/lib.rs".to_string()),
+            file_path: Some(file_path.to_string()),
             line: Some(1),
-            title: "title".to_string(),
-            body: "body".to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
             suggested_fix: Some("fix".to_string()),
             effort: Effort::Moderate,
             actionable: true,

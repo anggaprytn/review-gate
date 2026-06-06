@@ -84,7 +84,10 @@ fn summary_markdown_can_include_merge_risk_gate_near_top() {
         ],
         required_before_merge: vec!["Add sync recovery test".to_string()],
         risk_factors: vec![RiskFactor {
+            rule_id: "changed_file.offline_sync_missing_recovery_test".to_string(),
             label: "Offline sync layer changed without recovery test".to_string(),
+            score: 25,
+            evidence: vec![],
             points: 25,
         }],
         blast_radius: BlastRadius::default(),
