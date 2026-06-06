@@ -8,9 +8,13 @@ use crate::{
         anchors::{AnchorLineKind, AnchoredDiffContext, ReviewLineAnchor},
         engine::{estimate_prompt_tokens, ReviewPreview},
         evidence::validate_review_analysis_evidence,
-        formatter::{format_review_markdown_for_mode, MarkdownRenderMode},
+        formatter::{
+            format_review_markdown_for_mode, format_review_markdown_for_mode_with_risk_gate,
+            MarkdownRenderMode,
+        },
         parser::parse_review_analysis,
         quality::normalize_review_analysis,
+        risk::MergeRiskAssessment,
         types::{OverallRisk, ReviewAnalysis, ReviewFinding, Severity},
     },
 };
@@ -658,6 +662,7 @@ where
         prompt_token_estimate,
         parsed: true,
         analysis: Some(analysis),
+        large_report: Some(report),
     })
 }
 
@@ -1105,7 +1110,24 @@ pub fn format_large_review_markdown(
     report: &LargeReviewReport,
     mode: MarkdownRenderMode,
 ) -> String {
-    let markdown = format_review_markdown_for_mode(analysis, mode);
+    format_large_review_markdown_with_risk_gate(analysis, report, mode, None)
+}
+
+pub fn format_large_review_markdown_with_risk_gate(
+    analysis: &ReviewAnalysis,
+    report: &LargeReviewReport,
+    mode: MarkdownRenderMode,
+    risk_assessment: Option<&MergeRiskAssessment>,
+) -> String {
+    let markdown = match risk_assessment {
+        Some(assessment) => format_review_markdown_for_mode_with_risk_gate(
+            analysis,
+            mode,
+            crate::counters::emoji_enabled(),
+            Some(assessment),
+        ),
+        None => format_review_markdown_for_mode(analysis, mode),
+    };
     let mut section = format!(
         "## Large MR Review Plan\n\nPlanned chunks: {}\nReviewed chunks: {}\n",
         report.total_chunks, report.reviewed_chunks

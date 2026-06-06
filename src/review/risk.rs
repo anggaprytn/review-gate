@@ -1,0 +1,1119 @@
+use crate::{
+    config::RiskGateConfig,
+    gitlab::{context::DiffStats, types::MergeRequestDiff},
+    plan::{DEFAULT_LARGE_MR_DIFF_BYTES, DEFAULT_LARGE_MR_FILE_THRESHOLD},
+    review::{
+        comparison::ReviewComparison,
+        large::LargeReviewReport,
+        types::{
+            EvidenceValidationStatus, ReviewAnalysis, ReviewCategory, ReviewFinding, RiskCode,
+            Severity,
+        },
+    },
+};
+use std::collections::HashSet;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeDecision {
+    Pass,
+    NeedsHuman,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeRiskAssessment {
+    pub score: u8,
+    pub decision: MergeDecision,
+    pub blocking_issues: Vec<String>,
+    pub required_before_merge: Vec<String>,
+    pub risk_factors: Vec<RiskFactor>,
+    pub blast_radius: BlastRadius,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RiskFactor {
+    pub label: String,
+    pub points: i16,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlastRadius {
+    pub changed_files: usize,
+    pub diff_bytes: usize,
+    pub collapsed_files: usize,
+    pub too_large_files: usize,
+    pub failed_chunks: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RiskGateRunSignals<'a> {
+    pub large_review: Option<&'a LargeReviewReport>,
+    pub comparison: Option<&'a ReviewComparison>,
+}
+
+impl MergeDecision {
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::NeedsHuman => "NEEDS HUMAN",
+            Self::Blocked => "BLOCKED",
+        }
+    }
+}
+
+pub fn assess_merge_risk(
+    analysis: &ReviewAnalysis,
+    diffs: &[MergeRequestDiff],
+    stats: &DiffStats,
+    config: &RiskGateConfig,
+    signals: RiskGateRunSignals<'_>,
+) -> MergeRiskAssessment {
+    let changed_files = changed_file_paths(diffs);
+    let changed_test_files = changed_files
+        .iter()
+        .filter(|path| is_test_path(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut builder = RiskBuilder::default();
+    let mut blocking_issues = Vec::new();
+    let mut required_before_merge = Vec::new();
+    let mut needs_human = false;
+    let mut has_high_actionable = false;
+    let mut has_critical_actionable = false;
+    let mut has_security_blocking_finding = false;
+
+    for finding in analysis.findings.iter().filter(|finding| {
+        finding.actionable && finding.severity != Severity::Note && has_validated_evidence(finding)
+    }) {
+        match finding.severity {
+            Severity::Critical => {
+                has_critical_actionable = true;
+                builder.add(35, "Validated critical actionable finding");
+            }
+            Severity::High => {
+                has_high_actionable = true;
+                builder.add(18, "Validated high actionable finding");
+            }
+            Severity::Medium => builder.add(8, "Validated medium actionable finding"),
+            Severity::Low => builder.add(2, "Validated low actionable finding"),
+            Severity::Note => {}
+        }
+
+        if security_finding_signal(
+            finding,
+            &[RiskCode::PiiOrSecretLogging, RiskCode::SecretLeak],
+        ) {
+            builder.add(25, "Secret or PII logging security finding");
+            has_security_blocking_finding = true;
+        }
+        if security_finding_signal(
+            finding,
+            &[RiskCode::AuthBypass, RiskCode::MissingAuthorizationCheck],
+        ) {
+            builder.add(35, "Authentication bypass security finding");
+            has_security_blocking_finding = true;
+        }
+        if security_finding_signal(
+            finding,
+            &[RiskCode::SqlInjection, RiskCode::CommandInjection],
+        ) {
+            builder.add(35, "SQL or command injection security finding");
+            has_security_blocking_finding = true;
+        }
+    }
+
+    if stats.changed_file_count > DEFAULT_LARGE_MR_FILE_THRESHOLD {
+        builder.add(10, "Changed files exceed large MR threshold");
+    }
+    if stats.total_diff_bytes > DEFAULT_LARGE_MR_DIFF_BYTES {
+        builder.add(10, "Diff bytes exceed large MR threshold");
+    }
+    if stats.collapsed_file_count > 0 || stats.too_large_file_count > 0 {
+        builder.add(10, "GitLab collapsed or too-large files are present");
+    }
+
+    if let Some(report) = signals.large_review {
+        if report.failed_chunks > 0 {
+            let points = (report.failed_chunks * 8).min(20) as i16;
+            builder.add(points, "Large MR review had failed chunks");
+            needs_human = true;
+        }
+    }
+
+    let source_changed = changed_files
+        .iter()
+        .any(|path| is_source_behavior_path(path) && !is_test_path(path));
+    if source_changed && changed_test_files.is_empty() {
+        builder.add(10, "Source behavior changed without changed tests");
+    }
+
+    let protected_matches = protected_path_matches(&changed_files, config);
+    for protected in &protected_matches {
+        builder.add(20, format!("Protected path touched: {}", protected.pattern));
+        let issue = format!("Touched protected module: `{}`", protected.pattern);
+        push_unique(&mut blocking_issues, issue);
+        if let Some(owner) = protected.owner.as_deref() {
+            builder.add(
+                30,
+                format!(
+                    "Protected path touched without required owner review: {}",
+                    protected.pattern
+                ),
+            );
+            push_unique(
+                &mut required_before_merge,
+                format!("Request owner review from {owner}"),
+            );
+        }
+        if !changed_test_files
+            .iter()
+            .any(|path| test_matches_required_terms(path, protected.required_tests.as_slice()))
+        {
+            builder.add(15, "Protected module changed without matching test file");
+        }
+        needs_human = true;
+    }
+
+    let auth_touched = any_path_or_diff_signal(
+        diffs,
+        &[
+            "auth",
+            "security",
+            "session",
+            "root",
+            "jailbreak",
+            "integrity",
+        ],
+    );
+    if auth_touched {
+        builder.add(15, "Architecture-sensitive auth or security area touched");
+        needs_human = true;
+    }
+    let sync_touched = any_path_or_diff_signal(
+        diffs,
+        &[
+            "sync", "offline", "queue", "retry", "cache", "pending", "recovery",
+        ],
+    );
+    if sync_touched {
+        builder.add(15, "Offline sync, cache, queue, or retry area touched");
+        needs_human = true;
+        if !has_test_with_terms(
+            &changed_test_files,
+            &["sync", "offline", "recovery", "retry", "queue"],
+        ) {
+            builder.add(25, "Offline sync layer changed without recovery test");
+            push_unique(
+                &mut blocking_issues,
+                "Modified offline sync layer without adding recovery test".to_string(),
+            );
+            push_unique(
+                &mut required_before_merge,
+                "Add sync recovery test".to_string(),
+            );
+        }
+    }
+    if any_path_or_diff_signal(diffs, &["payment", "billing", "money"]) {
+        builder.add(20, "Payment, billing, or money area touched");
+        needs_human = true;
+    }
+
+    let migration_changed = migration_changed(diffs, config);
+    if migration_changed {
+        builder.add(20, "Database migration or schema area touched");
+        needs_human = true;
+        if !rollback_note_detected(diffs) {
+            builder.add(25, "Database migration changed without rollback plan");
+            push_unique(
+                &mut blocking_issues,
+                "Added DB migration without rollback plan".to_string(),
+            );
+            push_unique(
+                &mut required_before_merge,
+                "Attach migration rollback note".to_string(),
+            );
+        }
+    }
+
+    let contract_changed = contract_changed(diffs, config);
+    if contract_changed {
+        builder.add(15, "API contract area touched");
+        needs_human = true;
+        if !contract_snapshot_updated(diffs, config) {
+            builder.add(20, "API contract changed without contract snapshot update");
+            push_unique(
+                &mut blocking_issues,
+                "Changed API response contract without updating contract snapshot".to_string(),
+            );
+            push_unique(
+                &mut required_before_merge,
+                "Update OpenAPI/proto/contract snapshot".to_string(),
+            );
+        }
+    }
+
+    if let Some(comparison) = signals.comparison {
+        if comparison.still_detected > 0 {
+            builder.add(15, "Previous high-priority finding still detected");
+            needs_human = true;
+        }
+        if comparison.not_detected > 0 {
+            builder.add(5, "Previous finding no longer detected but not verified");
+        }
+        if comparison.verified_fixed > 0 {
+            let points = -10 * comparison.verified_fixed.min(2) as i16;
+            builder.add(points, "Previous finding verified fixed");
+        }
+    }
+
+    let score = builder.score();
+    let blocked = score >= config.block_threshold
+        || has_critical_actionable
+        || has_security_blocking_finding
+        || !blocking_issues.is_empty();
+    let needs_human = needs_human
+        || score >= config.needs_human_threshold
+        || has_high_actionable
+        || signals
+            .comparison
+            .is_some_and(|comparison| comparison.still_detected > 0);
+    let decision = if blocked {
+        MergeDecision::Blocked
+    } else if needs_human {
+        MergeDecision::NeedsHuman
+    } else {
+        MergeDecision::Pass
+    };
+
+    if decision == MergeDecision::NeedsHuman && required_before_merge.is_empty() {
+        required_before_merge.extend(needs_human_requirements(&builder.factors));
+    }
+
+    MergeRiskAssessment {
+        score,
+        decision,
+        blocking_issues,
+        required_before_merge,
+        risk_factors: builder.factors,
+        blast_radius: BlastRadius {
+            changed_files: stats.changed_file_count,
+            diff_bytes: stats.total_diff_bytes,
+            collapsed_files: stats.collapsed_file_count,
+            too_large_files: stats.too_large_file_count,
+            failed_chunks: signals
+                .large_review
+                .map(|report| report.failed_chunks)
+                .unwrap_or_default(),
+        },
+    }
+}
+
+pub fn format_merge_risk_gate_markdown(assessment: &MergeRiskAssessment) -> String {
+    let mut output = String::new();
+    output.push_str("## Merge Risk Gate\n\n");
+    output.push_str(&format!("Risk Score: {}/100  \n", assessment.score));
+    output.push_str(&format!(
+        "Decision: {}\n\n",
+        assessment.decision.display_label()
+    ));
+
+    if !assessment.blocking_issues.is_empty() {
+        output.push_str("Blocking Issues:\n");
+        for issue in &assessment.blocking_issues {
+            output.push_str("- ");
+            output.push_str(issue);
+            output.push('\n');
+        }
+        output.push('\n');
+    } else if assessment.decision == MergeDecision::Pass {
+        output.push_str("No blocking issues detected by ReviewGate.\n\n");
+    } else {
+        output.push_str("Why:\n");
+        for factor in assessment
+            .risk_factors
+            .iter()
+            .filter(|factor| factor.points > 0)
+            .take(4)
+        {
+            output.push_str("- ");
+            output.push_str(&factor.label);
+            output.push('\n');
+        }
+        output.push('\n');
+    }
+
+    if !assessment.required_before_merge.is_empty() {
+        output.push_str("Required Before Merge:\n");
+        for item in &assessment.required_before_merge {
+            output.push_str("- ");
+            output.push_str(item);
+            output.push('\n');
+        }
+        output.push('\n');
+    }
+
+    output.trim_end().to_string()
+}
+
+pub fn format_merge_risk_gate_terminal(assessment: &MergeRiskAssessment) -> String {
+    format!(
+        "Merge Risk Gate:\nRisk Score: {}/100\nDecision: {}\nBlocking Issues: {}\nRequired Before Merge: {}\n",
+        assessment.score,
+        assessment.decision.display_label(),
+        assessment.blocking_issues.len(),
+        assessment.required_before_merge.len()
+    )
+}
+
+#[derive(Default)]
+struct RiskBuilder {
+    total: i16,
+    factors: Vec<RiskFactor>,
+}
+
+impl RiskBuilder {
+    fn add(&mut self, points: i16, label: impl Into<String>) {
+        self.total = self.total.saturating_add(points);
+        self.factors.push(RiskFactor {
+            label: label.into(),
+            points,
+        });
+    }
+
+    fn score(&self) -> u8 {
+        self.total.clamp(0, 100) as u8
+    }
+}
+
+#[derive(Debug)]
+struct ProtectedMatch {
+    pattern: String,
+    owner: Option<String>,
+    required_tests: Vec<String>,
+}
+
+fn changed_file_paths(diffs: &[MergeRequestDiff]) -> Vec<String> {
+    diffs
+        .iter()
+        .map(|diff| diff.new_path.trim())
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn has_validated_evidence(finding: &ReviewFinding) -> bool {
+    !matches!(
+        finding.evidence_status,
+        Some(
+            EvidenceValidationStatus::WeakEvidence
+                | EvidenceValidationStatus::StaleContext
+                | EvidenceValidationStatus::NeedsManualConfirmation
+                | EvidenceValidationStatus::PositiveChange
+        )
+    )
+}
+
+fn security_finding_signal(finding: &ReviewFinding, risk_codes: &[RiskCode]) -> bool {
+    if !matches!(
+        finding.category,
+        ReviewCategory::Security | ReviewCategory::Privacy
+    ) {
+        return false;
+    }
+    finding
+        .risk_code
+        .is_some_and(|risk_code| risk_codes.contains(&risk_code))
+}
+
+fn protected_path_matches(paths: &[String], config: &RiskGateConfig) -> Vec<ProtectedMatch> {
+    let mut seen = HashSet::new();
+    let mut matches = Vec::new();
+    for pattern in &config.protected_paths {
+        if !paths.iter().any(|path| path_matches_pattern(path, pattern)) {
+            continue;
+        }
+        if !seen.insert(pattern.clone()) {
+            continue;
+        }
+        matches.push(ProtectedMatch {
+            pattern: pattern.clone(),
+            owner: config.owner_reviews.get(pattern).cloned(),
+            required_tests: config
+                .required_tests
+                .get(pattern)
+                .cloned()
+                .unwrap_or_default(),
+        });
+    }
+    matches
+}
+
+fn any_path_or_diff_signal(diffs: &[MergeRequestDiff], terms: &[&str]) -> bool {
+    diffs.iter().any(|diff| {
+        let path = normalize_path(&diff.new_path);
+        let body = diff.diff.to_ascii_lowercase();
+        terms
+            .iter()
+            .any(|term| path.contains(term) || body.contains(term))
+    })
+}
+
+fn migration_changed(diffs: &[MergeRequestDiff], config: &RiskGateConfig) -> bool {
+    diffs.iter().any(|diff| {
+        let path = normalize_path(&diff.new_path);
+        config
+            .migration_paths
+            .iter()
+            .any(|pattern| path_matches_pattern(&path, pattern))
+            || path.contains("migration")
+            || path.contains("migrations/")
+            || path.ends_with("schema.sql")
+            || contains_any(
+                &diff.diff,
+                &["ALTER TABLE", "CREATE TABLE", "DROP TABLE", "migration"],
+            )
+    })
+}
+
+fn rollback_note_detected(diffs: &[MergeRequestDiff]) -> bool {
+    diffs.iter().any(|diff| {
+        contains_any(
+            &format!("{} {}", diff.new_path, diff.diff),
+            &[
+                "rollback",
+                "down.sql",
+                "revert",
+                "migration note",
+                "rollback plan",
+            ],
+        )
+    })
+}
+
+fn contract_changed(diffs: &[MergeRequestDiff], config: &RiskGateConfig) -> bool {
+    diffs.iter().any(|diff| {
+        let path = normalize_path(&diff.new_path);
+        config
+            .contract_paths
+            .iter()
+            .any(|pattern| path_matches_pattern(&path, pattern))
+            || contains_any(
+                &format!("{} {}", path, diff.diff),
+                &[
+                    "openapi",
+                    "swagger",
+                    "proto",
+                    "contract",
+                    "dto",
+                    "api response",
+                    "generated client",
+                    "endpoint types",
+                ],
+            )
+    })
+}
+
+fn contract_snapshot_updated(diffs: &[MergeRequestDiff], config: &RiskGateConfig) -> bool {
+    diffs.iter().any(|diff| {
+        let path = normalize_path(&diff.new_path);
+        config
+            .contract_paths
+            .iter()
+            .any(|pattern| path_matches_pattern(&path, pattern))
+            || contains_any(
+                &path,
+                &["openapi", "swagger", ".proto", "snapshot", "contract"],
+            )
+    })
+}
+
+fn is_source_behavior_path(path: &str) -> bool {
+    let path = normalize_path(path);
+    !path.is_empty()
+        && !path.contains("/docs/")
+        && !path.starts_with("docs/")
+        && !path.ends_with(".md")
+        && !path.ends_with(".txt")
+}
+
+fn is_test_path(path: &str) -> bool {
+    let path = normalize_path(path);
+    path.contains("/__tests__/")
+        || path.starts_with("__tests__/")
+        || path.contains("/tests/")
+        || path.starts_with("tests/")
+        || path.contains("/androidtest/")
+        || path.contains("/test/")
+        || path.ends_with(".test.rs")
+        || path.ends_with(".spec.rs")
+        || path.contains(".test.")
+        || path.contains(".spec.")
+}
+
+fn test_matches_required_terms(path: &str, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return is_test_path(path);
+    }
+    let path = normalize_path(path);
+    terms
+        .iter()
+        .any(|term| path.contains(&term.to_ascii_lowercase()))
+}
+
+fn has_test_with_terms(paths: &[String], terms: &[&str]) -> bool {
+    paths.iter().any(|path| {
+        let path = normalize_path(path);
+        terms.iter().any(|term| path.contains(term))
+    })
+}
+
+fn needs_human_requirements(factors: &[RiskFactor]) -> Vec<String> {
+    let mut requirements = Vec::new();
+    if factors.iter().any(|factor| {
+        factor
+            .label
+            .to_ascii_lowercase()
+            .contains("auth or security")
+    }) {
+        requirements.push("Human review recommended from Security Lead".to_string());
+    }
+    if requirements.is_empty() {
+        requirements.push("Human review recommended".to_string());
+    }
+    requirements
+}
+
+fn contains_any(value: &str, terms: &[&str]) -> bool {
+    let value = value.to_ascii_lowercase();
+    terms
+        .iter()
+        .any(|term| value.contains(&term.to_ascii_lowercase()))
+}
+
+fn path_matches_pattern(path: &str, pattern: &str) -> bool {
+    let path = normalize_path(path);
+    let pattern = normalize_path(pattern);
+
+    if pattern == path {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return path == prefix || path.starts_with(&format!("{prefix}/"));
+    }
+    if let Some(suffix) = pattern.strip_prefix("**/*") {
+        return path.ends_with(suffix);
+    }
+    if let Some(suffix) = pattern.strip_prefix("**/") {
+        return path.ends_with(suffix);
+    }
+    if pattern.contains('*') {
+        return wildcard_match(&path, &pattern);
+    }
+    path.starts_with(&pattern)
+}
+
+fn wildcard_match(path: &str, pattern: &str) -> bool {
+    let parts = pattern.split('*').collect::<Vec<_>>();
+    if parts.is_empty() {
+        return path.is_empty();
+    }
+
+    let mut remaining = path;
+    if let Some(first) = parts.first().filter(|part| !part.is_empty()) {
+        let Some(stripped) = remaining.strip_prefix(first) else {
+            return false;
+        };
+        remaining = stripped;
+    }
+
+    for part in parts.iter().skip(1).filter(|part| !part.is_empty()) {
+        let Some(index) = remaining.find(part) else {
+            return false;
+        };
+        remaining = &remaining[index + part.len()..];
+    }
+
+    pattern.ends_with('*') || parts.last().is_none_or(|last| remaining.ends_with(last))
+}
+
+fn normalize_path(path: &str) -> String {
+    path.trim().replace('\\', "/").to_ascii_lowercase()
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        assess_merge_risk, format_merge_risk_gate_markdown, format_merge_risk_gate_terminal,
+        MergeDecision, RiskGateRunSignals,
+    };
+    use crate::{
+        config::RiskGateConfig,
+        gitlab::{context::DiffStats, types::MergeRequestDiff},
+        review::{
+            comparison::ReviewComparison,
+            large::LargeReviewReport,
+            risk::path_matches_pattern,
+            types::{
+                Effort, EvidenceValidationStatus, OverallRisk, ReviewAnalysis, ReviewCategory,
+                ReviewFinding, RiskCode, Severity,
+            },
+        },
+    };
+
+    #[test]
+    fn risk_score_from_validated_findings() {
+        let assessment = assess(
+            &[
+                finding(Severity::Critical, ReviewCategory::Correctness, None),
+                finding(Severity::High, ReviewCategory::Correctness, None),
+                finding(Severity::Medium, ReviewCategory::Correctness, None),
+                finding(Severity::Low, ReviewCategory::Correctness, None),
+            ],
+            &[],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert_eq!(assessment.score, 63);
+    }
+
+    #[test]
+    fn critical_finding_blocks() {
+        let assessment = assess(
+            &[finding(
+                Severity::Critical,
+                ReviewCategory::Correctness,
+                None,
+            )],
+            &[],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert_eq!(assessment.decision, MergeDecision::Blocked);
+    }
+
+    #[test]
+    fn high_security_finding_blocks() {
+        let assessment = assess(
+            &[finding(
+                Severity::High,
+                ReviewCategory::Security,
+                Some(RiskCode::AuthBypass),
+            )],
+            &[],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert_eq!(assessment.decision, MergeDecision::Blocked);
+    }
+
+    #[test]
+    fn high_non_security_finding_needs_human() {
+        let assessment = assess(
+            &[finding(Severity::High, ReviewCategory::Correctness, None)],
+            &[],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+    }
+
+    #[test]
+    fn low_and_notes_do_not_inflate_decision() {
+        let mut note = finding(Severity::Note, ReviewCategory::Correctness, None);
+        note.actionable = false;
+
+        let assessment = assess(
+            &[
+                finding(Severity::Low, ReviewCategory::Correctness, None),
+                note,
+            ],
+            &[diff("src/lib.rs", "+fn changed() {}")],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert_eq!(assessment.decision, MergeDecision::Pass);
+    }
+
+    #[test]
+    fn large_mr_partial_review_and_failed_chunks_increase_score() {
+        let report = large_report(3);
+        let assessment = assess(
+            &[],
+            &[],
+            DiffStats {
+                changed_file_count: 31,
+                total_diff_bytes: 200_001,
+                collapsed_file_count: 1,
+                ..DiffStats::default()
+            },
+            RiskGateRunSignals {
+                large_review: Some(&report),
+                comparison: None,
+            },
+        );
+
+        assert_eq!(assessment.score, 50);
+        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+    }
+
+    #[test]
+    fn failed_chunk_score_is_capped() {
+        let report = large_report(9);
+        let assessment = assess(
+            &[],
+            &[],
+            stats(1, 100),
+            RiskGateRunSignals {
+                large_review: Some(&report),
+                comparison: None,
+            },
+        );
+
+        assert_eq!(assessment.score, 20);
+    }
+
+    #[test]
+    fn offline_sync_without_recovery_test_blocks() {
+        let assessment = assess(
+            &[],
+            &[diff("src/features/sync/worker.rs", "+retry queue")],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert_eq!(assessment.decision, MergeDecision::Blocked);
+        assert!(assessment
+            .blocking_issues
+            .contains(&"Modified offline sync layer without adding recovery test".to_string()));
+    }
+
+    #[test]
+    fn offline_sync_with_recovery_test_does_not_block_for_sync_gate() {
+        let assessment = assess(
+            &[],
+            &[
+                diff("src/sync/worker.rs", "+retry queue"),
+                diff("tests/sync_recovery.test.rs", "+recovers pending queue"),
+            ],
+            stats(2, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert!(!assessment
+            .blocking_issues
+            .contains(&"Modified offline sync layer without adding recovery test".to_string()));
+    }
+
+    #[test]
+    fn api_contract_without_snapshot_blocks() {
+        let assessment = assess(
+            &[],
+            &[diff("src/api/user_dto.rs", "+api response changes")],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert_eq!(assessment.decision, MergeDecision::Blocked);
+        assert!(assessment.blocking_issues.contains(
+            &"Changed API response contract without updating contract snapshot".to_string()
+        ));
+    }
+
+    #[test]
+    fn api_contract_with_snapshot_does_not_block() {
+        let assessment = assess(
+            &[],
+            &[
+                diff("src/api/user_dto.rs", "+api response changes"),
+                diff("openapi/user.yaml", "+schema update"),
+            ],
+            stats(2, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert!(!assessment.blocking_issues.contains(
+            &"Changed API response contract without updating contract snapshot".to_string()
+        ));
+    }
+
+    #[test]
+    fn db_migration_without_rollback_blocks() {
+        let assessment = assess(
+            &[],
+            &[diff(
+                "migrations/001.sql",
+                "+ALTER TABLE users ADD COLUMN role",
+            )],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert_eq!(assessment.decision, MergeDecision::Blocked);
+        assert!(assessment
+            .blocking_issues
+            .contains(&"Added DB migration without rollback plan".to_string()));
+    }
+
+    #[test]
+    fn migration_with_rollback_note_does_not_block() {
+        let assessment = assess(
+            &[],
+            &[
+                diff("migrations/001.sql", "+ALTER TABLE users ADD COLUMN role"),
+                diff("migrations/down.sql", "+rollback plan"),
+            ],
+            stats(2, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert!(!assessment
+            .blocking_issues
+            .contains(&"Added DB migration without rollback plan".to_string()));
+    }
+
+    #[test]
+    fn protected_path_touched_requires_owner_review() {
+        let assessment = assess(
+            &[],
+            &[diff("src/auth/session.rs", "+renew session")],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert_eq!(assessment.decision, MergeDecision::Blocked);
+        assert!(assessment
+            .blocking_issues
+            .contains(&"Touched protected module: `src/auth/**`".to_string()));
+    }
+
+    #[test]
+    fn protected_path_owner_appears_in_required_before_merge() {
+        let assessment = assess(
+            &[],
+            &[diff("src/auth/session.rs", "+renew session")],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert!(assessment
+            .required_before_merge
+            .contains(&"Request owner review from Security Lead".to_string()));
+    }
+
+    #[test]
+    fn previous_finding_still_detected_increases_score() {
+        let comparison = comparison(1, 0, 0);
+        let assessment = assess(
+            &[],
+            &[],
+            stats(1, 100),
+            RiskGateRunSignals {
+                large_review: None,
+                comparison: Some(&comparison),
+            },
+        );
+
+        assert_eq!(assessment.score, 15);
+        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+    }
+
+    #[test]
+    fn verified_fixed_reduces_score() {
+        let comparison = comparison(0, 0, 3);
+        let assessment = assess(
+            &[finding(Severity::High, ReviewCategory::Correctness, None)],
+            &[],
+            stats(1, 100),
+            RiskGateRunSignals {
+                large_review: None,
+                comparison: Some(&comparison),
+            },
+        );
+
+        assert_eq!(assessment.score, 0);
+    }
+
+    #[test]
+    fn pass_decision_when_no_risk() {
+        let assessment = assess(&[], &[], stats(1, 100), RiskGateRunSignals::default());
+
+        assert_eq!(assessment.decision, MergeDecision::Pass);
+    }
+
+    #[test]
+    fn needs_human_decision_when_score_moderate() {
+        let assessment = assess(
+            &[
+                finding(Severity::Medium, ReviewCategory::Correctness, None),
+                finding(Severity::Medium, ReviewCategory::Correctness, None),
+                finding(Severity::Medium, ReviewCategory::Correctness, None),
+                finding(Severity::Medium, ReviewCategory::Correctness, None),
+                finding(Severity::Medium, ReviewCategory::Correctness, None),
+                finding(Severity::Medium, ReviewCategory::Correctness, None),
+                finding(Severity::Medium, ReviewCategory::Correctness, None),
+            ],
+            &[],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert_eq!(assessment.score, 56);
+        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+    }
+
+    #[test]
+    fn blocked_decision_when_blocking_issue_exists() {
+        let assessment = assess(
+            &[],
+            &[diff("src/offline/cache.rs", "+pending queue")],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert_eq!(assessment.decision, MergeDecision::Blocked);
+    }
+
+    #[test]
+    fn markdown_output_matches_target_shape() {
+        let assessment = assess(
+            &[],
+            &[diff("src/offline/cache.rs", "+pending queue")],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+        let markdown = format_merge_risk_gate_markdown(&assessment);
+
+        assert!(markdown.starts_with("## Merge Risk Gate\n\nRisk Score: "));
+        assert!(markdown.contains("Decision: BLOCKED"));
+        assert!(markdown.contains("Blocking Issues:\n- Modified offline sync layer"));
+        assert!(markdown.contains("Required Before Merge:\n- Add sync recovery test"));
+    }
+
+    #[test]
+    fn terminal_output_includes_score_and_decision() {
+        let assessment = assess(&[], &[], stats(1, 100), RiskGateRunSignals::default());
+        let output = format_merge_risk_gate_terminal(&assessment);
+
+        assert!(output.contains("Merge Risk Gate:"));
+        assert!(output.contains("Risk Score: 0/100"));
+        assert!(output.contains("Decision: PASS"));
+    }
+
+    #[test]
+    fn wildcard_matching_supports_config_shapes() {
+        assert!(path_matches_pattern("src/auth/session.rs", "src/auth/**"));
+        assert!(path_matches_pattern("api/user.proto", "**/*.proto"));
+        assert!(path_matches_pattern("db/schema.sql", "**/schema.sql"));
+    }
+
+    fn assess(
+        findings: &[ReviewFinding],
+        diffs: &[MergeRequestDiff],
+        stats: DiffStats,
+        signals: RiskGateRunSignals<'_>,
+    ) -> super::MergeRiskAssessment {
+        let config = RiskGateConfig::default();
+        assess_merge_risk(
+            &analysis(findings.to_vec()),
+            diffs,
+            &stats,
+            &config,
+            signals,
+        )
+    }
+
+    fn analysis(findings: Vec<ReviewFinding>) -> ReviewAnalysis {
+        ReviewAnalysis {
+            summary: "summary".to_string(),
+            findings,
+            test_coverage_note: None,
+            privacy_note: None,
+            overall_risk: OverallRisk::Low,
+        }
+    }
+
+    fn finding(
+        severity: Severity,
+        category: ReviewCategory,
+        risk_code: Option<RiskCode>,
+    ) -> ReviewFinding {
+        ReviewFinding {
+            severity,
+            category,
+            risk_code,
+            anchor_id: None,
+            file_path: Some("src/lib.rs".to_string()),
+            line: Some(1),
+            title: "title".to_string(),
+            body: "body".to_string(),
+            suggested_fix: Some("fix".to_string()),
+            effort: Effort::Moderate,
+            actionable: true,
+            evidence_status: Some(EvidenceValidationStatus::Validated),
+            evidence_reason: None,
+        }
+    }
+
+    fn diff(path: &str, body: &str) -> MergeRequestDiff {
+        MergeRequestDiff {
+            old_path: path.to_string(),
+            new_path: path.to_string(),
+            diff: body.to_string(),
+            new_file: false,
+            renamed_file: false,
+            deleted_file: false,
+            generated_file: None,
+            collapsed: None,
+            too_large: None,
+        }
+    }
+
+    fn stats(changed_file_count: usize, total_diff_bytes: usize) -> DiffStats {
+        DiffStats {
+            changed_file_count,
+            total_diff_bytes,
+            ..DiffStats::default()
+        }
+    }
+
+    fn large_report(failed_chunks: usize) -> LargeReviewReport {
+        LargeReviewReport {
+            total_chunks: failed_chunks.max(1),
+            reviewed_chunks: 1,
+            retried_chunks: 0,
+            failed_chunks,
+            reviewed_files: 1,
+            skipped_files: 0,
+            skipped_reasons: Vec::new(),
+        }
+    }
+
+    fn comparison(
+        still_detected: usize,
+        not_detected: usize,
+        verified_fixed: usize,
+    ) -> ReviewComparison {
+        ReviewComparison {
+            previous_run_id: Some("previous".to_string()),
+            current_run_id: "current".to_string(),
+            new_findings: 0,
+            still_detected,
+            not_detected,
+            verified_fixed,
+            needs_verification: not_detected,
+            previous_total_actionable: 0,
+            current_total_actionable: 0,
+        }
+    }
+}

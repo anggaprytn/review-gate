@@ -11,4 +11,5 @@ pub mod parser;
 pub mod prompt;
 pub mod qa;
 pub mod quality;
+pub mod risk;
 pub mod types;

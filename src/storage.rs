@@ -1377,6 +1377,7 @@ mod tests {
             prompt_token_estimate: 10,
             parsed: true,
             analysis: Some(analysis),
+            large_report: None,
         };
 
         storage
@@ -1981,6 +1982,7 @@ mod tests {
                 max_note_chars: 60_000,
                 internal_note: false,
             },
+            risk_gate: crate::config::RiskGateConfig::default(),
             storage: StorageConfig {
                 enabled: true,
                 db_path: path,
@@ -2085,6 +2087,7 @@ mod tests {
                 privacy_note: None,
                 overall_risk: OverallRisk::High,
             }),
+            large_report: None,
         }
     }
 

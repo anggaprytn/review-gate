@@ -6,6 +6,7 @@ use crate::{
         formatter::{
             format_malformed_review_markdown, format_review_markdown_for_mode, MarkdownRenderMode,
         },
+        large::LargeReviewReport,
         parser::parse_review_analysis,
         prompt::build_review_prompt,
         quality::normalize_review_analysis,
@@ -21,6 +22,7 @@ pub struct ReviewPreview {
     pub prompt_token_estimate: u64,
     pub parsed: bool,
     pub analysis: Option<ReviewAnalysis>,
+    pub large_report: Option<LargeReviewReport>,
 }
 
 pub fn build_sanitized_review_prompt(context: &MergeRequestContext) -> String {
@@ -69,6 +71,7 @@ where
         prompt_token_estimate,
         parsed,
         analysis,
+        large_report: None,
     })
 }
 

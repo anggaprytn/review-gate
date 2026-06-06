@@ -3,6 +3,7 @@ use crate::{
     counters::{count_findings_from_analysis, emoji_enabled, format_finding_counters_markdown},
     review::{
         parser::ReviewParseError,
+        risk::{format_merge_risk_gate_markdown, MergeRiskAssessment},
         types::{EvidenceValidationStatus, ReviewAnalysis, ReviewFinding, RiskCode, Severity},
     },
 };
@@ -35,6 +36,15 @@ pub fn format_review_markdown_for_mode_with_emoji(
     mode: MarkdownRenderMode,
     emoji: bool,
 ) -> String {
+    format_review_markdown_for_mode_with_risk_gate(analysis, mode, emoji, None)
+}
+
+pub fn format_review_markdown_for_mode_with_risk_gate(
+    analysis: &ReviewAnalysis,
+    mode: MarkdownRenderMode,
+    emoji: bool,
+    risk_assessment: Option<&MergeRiskAssessment>,
+) -> String {
     let sorted_findings = sorted_findings(&analysis.findings);
     let sorted_findings = match mode {
         MarkdownRenderMode::Preview => sorted_findings,
@@ -51,6 +61,10 @@ pub fn format_review_markdown_for_mode_with_emoji(
         emoji,
     ));
     output.push('\n');
+    if let Some(assessment) = risk_assessment {
+        output.push_str(&format_merge_risk_gate_markdown(assessment));
+        output.push_str("\n\n");
+    }
     output.push_str("## Summary\n\n");
     output.push_str(&format_summary_note(&analysis.summary, mode));
     output.push_str("\n\n");

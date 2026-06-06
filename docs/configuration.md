@@ -58,6 +58,50 @@ REVIEWGATE_GITLAB_INTERNAL_NOTE=false
 
 Plain `--publish` is summary-only. Inline publishing requires `--publish --publish-inline`.
 
+## Merge Risk Gate
+
+The merge risk gate is advisory by default. It adds a deterministic risk section to preview and published summary markdown, but it does not fail CI or block GitLab merges automatically.
+
+```toml
+[risk_gate]
+enabled = true
+publish = true
+block_threshold = 75
+needs_human_threshold = 50
+
+protected_paths = [
+  "src/features/sync/**",
+  "src/auth/**",
+  "src/security/**",
+  "migrations/**"
+]
+
+[risk_gate.owner_reviews]
+"src/features/sync/**" = "Mobile Lead"
+"src/auth/**" = "Security Lead"
+"migrations/**" = "Backend Lead"
+
+[risk_gate.required_tests]
+"src/features/sync/**" = ["recovery", "offline", "retry"]
+"src/auth/**" = ["auth", "session"]
+"migrations/**" = ["rollback"]
+
+[risk_gate.contract_paths]
+patterns = [
+  "openapi/**",
+  "**/*.proto",
+  "docs/api/**",
+  "src/api/contracts/**"
+]
+
+[risk_gate.migration_paths]
+patterns = [
+  "migrations/**",
+  "db/migrations/**",
+  "**/schema.sql"
+]
+```
+
 ## Inline Controls
 
 ```bash

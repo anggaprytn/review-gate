@@ -2,6 +2,7 @@ use crate::error::{Result, ReviewGateError};
 use crate::llm::types::LlmProvider;
 use serde::Deserialize;
 use std::{
+    collections::HashMap,
     env, fmt, fs,
     path::{Path, PathBuf},
 };
@@ -17,6 +18,7 @@ pub struct AppConfig {
     pub current_file_validation: CurrentFileValidationConfig,
     pub inline: InlineConfig,
     pub publish: PublishConfig,
+    pub risk_gate: RiskGateConfig,
     pub storage: StorageConfig,
     pub ci: CiConfig,
 }
@@ -76,6 +78,19 @@ pub struct PublishConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct RiskGateConfig {
+    pub enabled: bool,
+    pub publish: bool,
+    pub block_threshold: u8,
+    pub needs_human_threshold: u8,
+    pub protected_paths: Vec<String>,
+    pub owner_reviews: HashMap<String, String>,
+    pub required_tests: HashMap<String, Vec<String>>,
+    pub contract_paths: Vec<String>,
+    pub migration_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct StorageConfig {
     pub enabled: bool,
     pub db_path: PathBuf,
@@ -129,6 +144,7 @@ impl fmt::Debug for AppConfig {
             .field("current_file_validation", &self.current_file_validation)
             .field("inline", &self.inline)
             .field("publish", &self.publish)
+            .field("risk_gate", &self.risk_gate)
             .field("storage", &self.storage)
             .field("ci", &self.ci)
             .finish()
@@ -141,6 +157,7 @@ struct FileConfig {
     llm: Option<FileLlmConfig>,
     privacy: Option<FilePrivacyConfig>,
     review: Option<FileReviewConfig>,
+    risk_gate: Option<FileRiskGateConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -181,6 +198,24 @@ struct FileReviewConfig {
     severity_threshold: Option<String>,
     max_diff_bytes: Option<usize>,
     max_files: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileRiskGateConfig {
+    enabled: Option<bool>,
+    publish: Option<bool>,
+    block_threshold: Option<u8>,
+    needs_human_threshold: Option<u8>,
+    protected_paths: Option<Vec<String>>,
+    owner_reviews: Option<HashMap<String, String>>,
+    required_tests: Option<HashMap<String, Vec<String>>>,
+    contract_paths: Option<FilePatternListConfig>,
+    migration_paths: Option<FilePatternListConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FilePatternListConfig {
+    patterns: Option<Vec<String>>,
 }
 
 impl AppConfig {
@@ -318,6 +353,7 @@ impl AppConfig {
                 .unwrap_or(60_000),
             internal_note: env_bool("REVIEWGATE_GITLAB_INTERNAL_NOTE").unwrap_or(false),
         };
+        let risk_gate = RiskGateConfig::from_file(file_config.risk_gate.as_ref());
         let ci = CiConfig {
             allow_ci_job_token: env_bool("REVIEWGATE_ALLOW_CI_JOB_TOKEN").unwrap_or(false),
             history_required: env_bool("REVIEWGATE_CI_HISTORY_REQUIRED").unwrap_or(false),
@@ -362,6 +398,7 @@ impl AppConfig {
             current_file_validation,
             inline,
             publish,
+            risk_gate,
             storage,
             ci,
         })
@@ -408,6 +445,96 @@ impl AppConfig {
             ));
         }
         Ok(())
+    }
+}
+
+impl Default for RiskGateConfig {
+    fn default() -> Self {
+        let mut owner_reviews = HashMap::new();
+        owner_reviews.insert(
+            "src/features/sync/**".to_string(),
+            "Mobile Lead".to_string(),
+        );
+        owner_reviews.insert("src/auth/**".to_string(), "Security Lead".to_string());
+        owner_reviews.insert("migrations/**".to_string(), "Backend Lead".to_string());
+
+        let mut required_tests = HashMap::new();
+        required_tests.insert(
+            "src/features/sync/**".to_string(),
+            vec![
+                "recovery".to_string(),
+                "offline".to_string(),
+                "retry".to_string(),
+            ],
+        );
+        required_tests.insert(
+            "src/auth/**".to_string(),
+            vec!["auth".to_string(), "session".to_string()],
+        );
+        required_tests.insert("migrations/**".to_string(), vec!["rollback".to_string()]);
+
+        Self {
+            enabled: true,
+            publish: true,
+            block_threshold: 75,
+            needs_human_threshold: 50,
+            protected_paths: vec![
+                "src/features/sync/**".to_string(),
+                "src/auth/**".to_string(),
+                "src/security/**".to_string(),
+                "migrations/**".to_string(),
+            ],
+            owner_reviews,
+            required_tests,
+            contract_paths: vec![
+                "openapi/**".to_string(),
+                "**/*.proto".to_string(),
+                "docs/api/**".to_string(),
+                "src/api/contracts/**".to_string(),
+            ],
+            migration_paths: vec![
+                "migrations/**".to_string(),
+                "db/migrations/**".to_string(),
+                "**/schema.sql".to_string(),
+            ],
+        }
+    }
+}
+
+impl RiskGateConfig {
+    fn from_file(file: Option<&FileRiskGateConfig>) -> Self {
+        let defaults = Self::default();
+        let Some(file) = file else {
+            return defaults;
+        };
+
+        Self {
+            enabled: file.enabled.unwrap_or(defaults.enabled),
+            publish: file.publish.unwrap_or(defaults.publish),
+            block_threshold: file.block_threshold.unwrap_or(defaults.block_threshold),
+            needs_human_threshold: file
+                .needs_human_threshold
+                .unwrap_or(defaults.needs_human_threshold),
+            protected_paths: file
+                .protected_paths
+                .clone()
+                .unwrap_or(defaults.protected_paths),
+            owner_reviews: file.owner_reviews.clone().unwrap_or(defaults.owner_reviews),
+            required_tests: file
+                .required_tests
+                .clone()
+                .unwrap_or(defaults.required_tests),
+            contract_paths: file
+                .contract_paths
+                .as_ref()
+                .and_then(|paths| paths.patterns.clone())
+                .unwrap_or(defaults.contract_paths),
+            migration_paths: file
+                .migration_paths
+                .as_ref()
+                .and_then(|paths| paths.patterns.clone())
+                .unwrap_or(defaults.migration_paths),
+        }
     }
 }
 
@@ -495,7 +622,7 @@ mod tests {
     use super::{
         select_gitlab_token_from_values, AppConfig, CiConfig, CurrentFileValidationConfig,
         GitLabTokenSource, InlineConfig, LlmConfig, PrivacyConfig, PublishConfig, ReviewConfig,
-        StorageConfig,
+        RiskGateConfig, StorageConfig,
     };
     use crate::error::ReviewGateError;
 
@@ -652,6 +779,7 @@ mod tests {
                 max_note_chars: 60_000,
                 internal_note: false,
             },
+            risk_gate: RiskGateConfig::default(),
             storage: StorageConfig {
                 enabled: true,
                 db_path: ".reviewgate/reviewgate.sqlite".into(),

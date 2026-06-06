@@ -338,6 +338,7 @@ mod tests {
                 max_note_chars: 60_000,
                 internal_note: false,
             },
+            risk_gate: crate::config::RiskGateConfig::default(),
             storage: StorageConfig {
                 enabled: true,
                 db_path: ".reviewgate/reviewgate.sqlite".into(),

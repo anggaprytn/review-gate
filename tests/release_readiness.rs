@@ -7,7 +7,11 @@ use reviewgate::{
     },
     review::{
         comparison::{insert_comparison_section_with_emoji, ReviewComparison},
-        formatter::format_review_markdown_with_emoji,
+        formatter::{
+            format_review_markdown_for_mode_with_risk_gate, format_review_markdown_with_emoji,
+            MarkdownRenderMode,
+        },
+        risk::{BlastRadius, MergeDecision, MergeRiskAssessment, RiskFactor},
         types::{
             Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, RiskCode, Severity,
         },
@@ -65,8 +69,41 @@ fn inline_output_keeps_attribution_and_hidden_marker() {
     assert!(body.contains("reviewgate:inline"));
     assert!(!body.contains("## Finding Summary"));
     assert!(!body.contains("## Change Since Previous Published Review"));
+    assert!(!body.contains("## Merge Risk Gate"));
     assert!(!body.contains("| Severity | Count |"));
     assert!(!body.contains("| Status | Count |"));
+}
+
+#[test]
+fn summary_markdown_can_include_merge_risk_gate_near_top() {
+    let assessment = MergeRiskAssessment {
+        score: 78,
+        decision: MergeDecision::Blocked,
+        blocking_issues: vec![
+            "Modified offline sync layer without adding recovery test".to_string()
+        ],
+        required_before_merge: vec!["Add sync recovery test".to_string()],
+        risk_factors: vec![RiskFactor {
+            label: "Offline sync layer changed without recovery test".to_string(),
+            points: 25,
+        }],
+        blast_radius: BlastRadius::default(),
+    };
+
+    let markdown = format_review_markdown_for_mode_with_risk_gate(
+        &analysis(),
+        MarkdownRenderMode::Publish,
+        false,
+        Some(&assessment),
+    );
+
+    let gate_index = markdown.find("## Merge Risk Gate").unwrap();
+    let summary_index = markdown.find("## Summary").unwrap();
+    let findings_index = markdown.find("## Critical").unwrap();
+    assert!(gate_index < summary_index);
+    assert!(gate_index < findings_index);
+    assert!(markdown.contains("Risk Score: 78/100"));
+    assert!(markdown.contains("Decision: BLOCKED"));
 }
 
 #[test]

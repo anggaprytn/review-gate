@@ -47,9 +47,9 @@ use reviewgate::review::inline::{
     format_inline_dry_run_report, resolve_inline_candidates_with_anchors,
 };
 use reviewgate::review::large::{
-    build_large_review_plan, review_large_chunks_with_llm, selected_diffs_in_order,
-    validate_large_inline_mapping, ChunkReviewProgress, LargeReviewExecutionOptions,
-    LargeReviewOptions, LargeReviewRunContext,
+    build_large_review_plan, format_large_review_markdown_with_risk_gate,
+    review_large_chunks_with_llm, validate_large_inline_mapping, ChunkReviewProgress,
+    LargeReviewExecutionOptions, LargeReviewOptions, LargeReviewRunContext,
 };
 use reviewgate::review::mode::{
     build_auto_review_plan, decide_auto_review_mode, AutoLargeOptions, AutoReviewDecision,
@@ -57,6 +57,9 @@ use reviewgate::review::mode::{
 };
 use reviewgate::review::qa::format_qa_checklist;
 use reviewgate::review::quality::normalize_review_analysis;
+use reviewgate::review::risk::{
+    assess_merge_risk, format_merge_risk_gate_terminal, MergeRiskAssessment, RiskGateRunSignals,
+};
 use reviewgate::storage::{PersistedReviewRun, Storage};
 use reviewgate::verify::{
     no_previous_run_message, verification_prompt_with_llm, VerificationPreview,
@@ -445,7 +448,6 @@ async fn run_large_review(
         large_options,
         args.include_low_risk,
     )?;
-    let selected_diffs = selected_diffs_in_order(&diffs, &large_plan.selection.files);
     let execution = LargeReviewExecutionOptions::from(large_options);
     let effective_parallelism = execution.effective_parallelism(large_plan.chunks.len());
 
@@ -557,7 +559,7 @@ async fn run_large_review(
         publish_review_preview(
             &gitlab,
             &context,
-            &selected_diffs,
+            &diffs,
             &config,
             PublishOptions {
                 force_new_note: args.force_new_note,
@@ -577,7 +579,16 @@ async fn run_large_review(
             validate_preview_current_file(preview, &context, &config, &gitlab, render_mode).await;
         let (persisted, comparison) =
             persist_review_run_and_apply_comparison(storage, &context, &config, &mut preview);
+        let risk_assessment = refresh_preview_risk_gate(
+            &mut preview,
+            &context,
+            &diffs,
+            &config,
+            render_mode,
+            comparison.as_ref(),
+        );
         println!("{}", preview.markdown);
+        print_merge_risk_gate(risk_assessment.as_ref());
         print_finding_counters(&preview);
         print_review_comparison(comparison.as_ref());
         print_run_metadata(
@@ -587,10 +598,10 @@ async fn run_large_review(
             preview.parsed,
         );
         if args.inline_dry_run {
-            print_inline_dry_run_report(&preview, &context, &selected_diffs, &config);
+            print_inline_dry_run_report(&preview, &context, &diffs, &config);
         }
         if args.qa_preview {
-            print_qa_preview(&preview, &selected_diffs)?;
+            print_qa_preview(&preview, &diffs)?;
         }
         print_persisted_review_run(storage, persisted.as_ref());
     }
@@ -633,6 +644,14 @@ async fn publish_review_preview(
     .await;
     let (persisted, comparison) =
         persist_review_run_and_apply_comparison(storage, context, config, &mut preview);
+    let risk_assessment = refresh_preview_risk_gate(
+        &mut preview,
+        context,
+        diffs,
+        config,
+        MarkdownRenderMode::Publish,
+        comparison.as_ref(),
+    );
 
     let body = build_summary_note_body(
         &preview.markdown,
@@ -665,6 +684,7 @@ async fn publish_review_preview(
     }
 
     print_publish_result(&result, options.publish_inline, options.inline_dry_run);
+    print_merge_risk_gate(risk_assessment.as_ref());
     print_finding_counters(&preview);
     print_review_comparison(comparison.as_ref());
     if options.publish_qa {
@@ -902,8 +922,17 @@ async fn print_preview(
     .await;
     let (persisted, comparison) =
         persist_review_run_and_apply_comparison(storage, context, config, &mut preview);
+    let risk_assessment = refresh_preview_risk_gate(
+        &mut preview,
+        context,
+        diffs,
+        config,
+        MarkdownRenderMode::Preview,
+        comparison.as_ref(),
+    );
 
     println!("{}", preview.markdown);
+    print_merge_risk_gate(risk_assessment.as_ref());
     print_finding_counters(&preview);
     print_review_comparison(comparison.as_ref());
     print_run_metadata(
@@ -963,6 +992,47 @@ fn validate_preview_evidence(
     preview.markdown = format_review_markdown_for_mode(&analysis, mode);
     preview.analysis = Some(analysis);
     preview
+}
+
+fn refresh_preview_risk_gate(
+    preview: &mut ReviewPreview,
+    context: &MergeRequestContext,
+    diffs: &[reviewgate::gitlab::types::MergeRequestDiff],
+    config: &AppConfig,
+    mode: MarkdownRenderMode,
+    comparison: Option<&ReviewComparison>,
+) -> Option<MergeRiskAssessment> {
+    if !config.risk_gate.enabled {
+        return None;
+    }
+    let analysis = preview.analysis.as_ref()?;
+    let assessment = assess_merge_risk(
+        analysis,
+        diffs,
+        &context.stats,
+        &config.risk_gate,
+        RiskGateRunSignals {
+            large_review: preview.large_report.as_ref(),
+            comparison,
+        },
+    );
+    let render_assessment = config.risk_gate.publish.then_some(&assessment);
+    preview.markdown = match preview.large_report.as_ref() {
+        Some(report) => {
+            format_large_review_markdown_with_risk_gate(analysis, report, mode, render_assessment)
+        }
+        None => reviewgate::review::formatter::format_review_markdown_for_mode_with_risk_gate(
+            analysis,
+            mode,
+            emoji_enabled(),
+            render_assessment,
+        ),
+    };
+    if let Some(comparison) = comparison {
+        preview.markdown = insert_comparison_section(&preview.markdown, comparison);
+    }
+
+    Some(assessment)
 }
 
 async fn validate_preview_current_file(
@@ -1506,6 +1576,14 @@ fn print_review_comparison(comparison: Option<&ReviewComparison>) {
     };
     println!();
     print!("{}", format_comparison_terminal_default(comparison));
+}
+
+fn print_merge_risk_gate(assessment: Option<&MergeRiskAssessment>) {
+    let Some(assessment) = assessment else {
+        return;
+    };
+    println!();
+    print!("{}", format_merge_risk_gate_terminal(assessment));
 }
 
 fn print_storage_open_warning(outcome: &reviewgate::storage::StorageOpenOutcome) {
