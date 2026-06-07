@@ -120,10 +120,7 @@ pub fn assess_merge_risk(
     let mut needs_human = false;
     let mut has_high_actionable = false;
     let mut has_critical_actionable = false;
-    let mut has_security_blocking_finding = false;
-    let mut has_migration_hard_blocker = false;
-    let mut has_contract_hard_blocker = false;
-    let mut has_offline_sync_hard_blocker = false;
+    let mut has_high_blocking_finding = false;
 
     for finding in analysis.findings.iter().filter(|finding| {
         finding.actionable && finding.severity != Severity::Note && has_validated_evidence(finding)
@@ -131,7 +128,7 @@ pub fn assess_merge_risk(
         match finding.severity {
             Severity::Critical => {
                 has_critical_actionable = true;
-                let factor_index = builder.add(
+                builder.add(
                     35,
                     "finding.severity.critical",
                     "Validated critical actionable finding",
@@ -141,19 +138,10 @@ pub fn assess_merge_risk(
                         "Critical actionable finding validated in the current review.",
                     )],
                 );
-                push_blocker_for_factor(
-                    &mut blocking_issues,
-                    &builder.factors[factor_index],
-                    format!(
-                        "Critical finding in `{}`: {}",
-                        finding_file_path(finding),
-                        sentence_fragment(&finding.title)
-                    ),
-                );
             }
             Severity::High => {
                 has_high_actionable = true;
-                let factor_index = builder.add(
+                builder.add(
                     18,
                     "finding.severity.high",
                     "Validated high actionable finding",
@@ -163,17 +151,8 @@ pub fn assess_merge_risk(
                         "High actionable finding validated in the current review.",
                     )],
                 );
-                if severe_high_finding(finding) {
-                    has_security_blocking_finding = true;
-                    push_blocker_for_factor(
-                        &mut blocking_issues,
-                        &builder.factors[factor_index],
-                        format!(
-                            "High-risk finding in `{}`: {}",
-                            finding_file_path(finding),
-                            sentence_fragment(&finding.title)
-                        ),
-                    );
+                if high_blocking_finding(finding) {
+                    has_high_blocking_finding = true;
                 }
             }
             Severity::Medium => {
@@ -203,11 +182,34 @@ pub fn assess_merge_risk(
             Severity::Note => {}
         }
 
+        if let Some(label) = blocking_issue_label(finding) {
+            push_unique_item(
+                &mut blocking_issues,
+                label,
+                vec![finding_evidence(
+                    "finding.blocking_issue",
+                    finding,
+                    "Final validated blocker finding used for Merge Risk Gate.",
+                )],
+            );
+        }
+        if let Some(label) = required_action_for_finding(finding) {
+            push_unique_item(
+                &mut required_before_merge,
+                label,
+                vec![finding_evidence(
+                    "finding.required_action",
+                    finding,
+                    "Final validated finding used for required merge action.",
+                )],
+            );
+        }
+
         if security_finding_signal(
             finding,
             &[RiskCode::PiiOrSecretLogging, RiskCode::SecretLeak],
         ) {
-            let factor_index = builder.add(
+            builder.add(
                 25,
                 "finding.secret_or_pii_logging",
                 "Secret or PII exposure security finding",
@@ -217,46 +219,6 @@ pub fn assess_merge_risk(
                     "Validated secret or PII exposure finding.",
                 )],
             );
-            has_security_blocking_finding |=
-                matches!(finding.severity, Severity::Critical | Severity::High);
-            if google_maps_api_key_finding(finding) {
-                push_requirement_for_factor(
-                    &mut required_before_merge,
-                    &builder.factors[factor_index],
-                    "Confirm Google Maps API key is package/SHA restricted or move it to build-time config"
-                        .to_string(),
-                );
-            }
-            if credential_logging_finding(finding) {
-                push_blocker_for_factor(
-                    &mut blocking_issues,
-                    &builder.factors[factor_index],
-                    format!(
-                        "Sensitive credential/header logging in `{}`",
-                        finding_file_path(finding)
-                    ),
-                );
-                push_requirement_for_factor(
-                    &mut required_before_merge,
-                    &builder.factors[factor_index],
-                    credential_logging_requirement(finding),
-                );
-            }
-            if payload_logging_finding(finding) {
-                push_blocker_for_factor(
-                    &mut blocking_issues,
-                    &builder.factors[factor_index],
-                    format!(
-                        "Sensitive payload logging in `{}`",
-                        finding_file_path(finding)
-                    ),
-                );
-                push_requirement_for_factor(
-                    &mut required_before_merge,
-                    &builder.factors[factor_index],
-                    payload_logging_requirement(finding),
-                );
-            }
         }
         if security_finding_signal(
             finding,
@@ -272,13 +234,12 @@ pub fn assess_merge_risk(
                     "Validated authorization or authentication bypass finding.",
                 )],
             );
-            has_security_blocking_finding = true;
         }
         if security_finding_signal(
             finding,
             &[RiskCode::SqlInjection, RiskCode::CommandInjection],
         ) {
-            let factor_index = builder.add(
+            builder.add(
                 35,
                 "finding.injection",
                 "SQL or command injection security finding",
@@ -288,23 +249,9 @@ pub fn assess_merge_risk(
                     "Validated SQL or command injection finding.",
                 )],
             );
-            has_security_blocking_finding = true;
-            if sql_injection_blocking_finding(finding) {
-                push_blocker_for_factor(
-                    &mut blocking_issues,
-                    &builder.factors[factor_index],
-                    format!("SQL injection in `{}`", finding_file_path(finding)),
-                );
-                push_requirement_for_factor(
-                    &mut required_before_merge,
-                    &builder.factors[factor_index],
-                    "Replace raw SQL interpolation with a parameterized query or safe query builder"
-                        .to_string(),
-                );
-            }
         }
         if weak_error_handling_required_finding(finding) {
-            let factor_index = builder.add(
+            builder.add(
                 8,
                 "finding.weak_error_handling",
                 "Weak error handling finding",
@@ -314,14 +261,9 @@ pub fn assess_merge_risk(
                     "Validated weak error handling finding.",
                 )],
             );
-            push_requirement_for_factor(
-                &mut required_before_merge,
-                &builder.factors[factor_index],
-                weak_error_handling_requirement(finding),
-            );
         }
         if data_integrity_wipe_finding(finding) {
-            let factor_index = builder.add(
+            builder.add(
                 30,
                 "finding.data_integrity.local_data_wipe",
                 "Local data wipe data-integrity finding",
@@ -330,25 +272,6 @@ pub fn assess_merge_risk(
                     finding,
                     "Validated automatic local data deletion finding.",
                 )],
-            );
-            push_blocker_for_factor(
-                &mut blocking_issues,
-                &builder.factors[factor_index],
-                format!(
-                    "Automatic local data wipe risk in {}",
-                    finding_file_path(finding)
-                ),
-            );
-            push_requirement_for_factor(
-                &mut required_before_merge,
-                &builder.factors[factor_index],
-                "Add guardrails for compromised-device false positives before wiping local user data"
-                    .to_string(),
-            );
-            push_requirement_for_factor(
-                &mut required_before_merge,
-                &builder.factors[factor_index],
-                "Add tests for compromised-device startup and wipe-failure behavior".to_string(),
             );
         }
     }
@@ -448,8 +371,6 @@ pub fn assess_merge_risk(
             format!("Protected path touched: {}", protected.pattern),
             protected_evidence.clone(),
         );
-        let issue = format!("Touched protected module: `{}`", protected.pattern);
-        push_blocker_for_evidence(&mut blocking_issues, &protected_evidence, issue);
         if let Some(owner) = protected.owner.as_deref() {
             let owner_evidence = vec![policy_evidence(
                 "policy.protected_path.owner_review",
@@ -465,11 +386,6 @@ pub fn assess_merge_risk(
                     protected.pattern
                 ),
                 owner_evidence.clone(),
-            );
-            push_requirement_for_evidence(
-                &mut required_before_merge,
-                &owner_evidence,
-                format!("Request owner review from {owner}"),
             );
         }
         if !changed_test_files
@@ -551,17 +467,6 @@ pub fn assess_merge_risk(
                 "Offline sync layer changed without recovery test",
                 sync_evidence.clone(),
             );
-            push_blocker_for_evidence(
-                &mut blocking_issues,
-                &sync_evidence,
-                "Modified offline sync layer without adding recovery test".to_string(),
-            );
-            has_offline_sync_hard_blocker = true;
-            push_requirement_for_evidence(
-                &mut required_before_merge,
-                &sync_evidence,
-                "Add sync recovery test".to_string(),
-            );
         }
     }
     if any_path_or_diff_signal(diffs, &["payment", "billing", "money"]) {
@@ -595,17 +500,6 @@ pub fn assess_merge_risk(
                 "Database migration changed without rollback plan",
                 migration_evidence.clone(),
             );
-            push_blocker_for_evidence(
-                &mut blocking_issues,
-                &migration_evidence,
-                "Added DB migration without rollback plan".to_string(),
-            );
-            has_migration_hard_blocker = true;
-            push_requirement_for_evidence(
-                &mut required_before_merge,
-                &migration_evidence,
-                "Attach migration rollback note".to_string(),
-            );
         }
     }
 
@@ -624,17 +518,6 @@ pub fn assess_merge_risk(
                 "changed_file.api_contract_missing_snapshot",
                 "API contract changed without contract snapshot update",
                 contract_evidence.clone(),
-            );
-            push_blocker_for_evidence(
-                &mut blocking_issues,
-                &contract_evidence,
-                "Changed API response contract without updating contract snapshot".to_string(),
-            );
-            has_contract_hard_blocker = true;
-            push_requirement_for_evidence(
-                &mut required_before_merge,
-                &contract_evidence,
-                "Update OpenAPI/proto/contract snapshot".to_string(),
             );
         }
     }
@@ -686,19 +569,14 @@ pub fn assess_merge_risk(
         }
     }
 
-    push_combined_focused_test_requirement(&mut required_before_merge, &builder.factors);
+    required_before_merge.truncate(6);
 
     let mut score = builder.score();
-    let has_policy_hard_blocker = blocking_issues
+    let blocked = has_critical_actionable || has_high_blocking_finding;
+    let has_medium_actionable = analysis
+        .findings
         .iter()
-        .any(gate_item_has_policy_hard_blocker_evidence);
-    let has_any_hard_blocker = has_critical_actionable
-        || has_security_blocking_finding
-        || has_policy_hard_blocker
-        || has_migration_hard_blocker
-        || has_contract_hard_blocker
-        || has_offline_sync_hard_blocker;
-    let blocked = has_any_hard_blocker;
+        .any(|finding| validated_actionable_finding_with_severity(finding, Severity::Medium));
     let needs_human = needs_human
         || score >= config.needs_human_threshold
         || has_high_actionable
@@ -712,37 +590,18 @@ pub fn assess_merge_risk(
     } else {
         MergeDecision::Pass
     };
-    let has_large_failed_chunks_with_high_or_critical = signals
-        .large_review
-        .is_some_and(|report| report.failed_chunks > 0)
-        && (has_high_actionable || has_critical_actionable);
-    let score_100_allowed = has_critical_actionable
-        || has_security_blocking_finding
-        || has_policy_hard_blocker
-        || has_migration_hard_blocker
-        || has_contract_hard_blocker
-        || has_offline_sync_hard_blocker
-        || has_large_failed_chunks_with_high_or_critical;
+    let score_100_allowed = has_critical_actionable || has_high_blocking_finding;
     if !score_100_allowed {
-        score =
-            if has_high_actionable {
-                score.min(89)
-            } else if analysis.findings.iter().any(|finding| {
-                validated_actionable_finding_with_severity(finding, Severity::Medium)
-            }) {
-                score.min(74)
-            } else {
-                score.min(49)
-            };
+        score = if has_high_actionable {
+            score.min(89)
+        } else if has_medium_actionable {
+            score.min(74)
+        } else {
+            score.min(49)
+        };
     }
 
-    if !has_critical_actionable
-        && !has_high_actionable
-        && !has_policy_hard_blocker
-        && !has_migration_hard_blocker
-        && !has_contract_hard_blocker
-        && !has_offline_sync_hard_blocker
-    {
+    if !has_critical_actionable && !has_high_actionable {
         score = score.min(74);
         if decision == MergeDecision::Blocked {
             decision = if needs_human || score >= config.needs_human_threshold {
@@ -750,6 +609,15 @@ pub fn assess_merge_risk(
             } else {
                 MergeDecision::Pass
             };
+        }
+    }
+    if !has_critical_actionable && !has_high_actionable && !has_medium_actionable {
+        let non_low_finding_positive_factor = builder
+            .factors
+            .iter()
+            .any(|factor| factor.points > 0 && factor.rule_id != "finding.severity.low");
+        if !non_low_finding_positive_factor {
+            decision = MergeDecision::Pass;
         }
     }
 
@@ -924,25 +792,27 @@ fn security_finding_signal(finding: &ReviewFinding, risk_codes: &[RiskCode]) -> 
         .is_some_and(|risk_code| risk_codes.contains(&risk_code))
 }
 
-fn severe_high_finding(finding: &ReviewFinding) -> bool {
+fn high_blocking_finding(finding: &ReviewFinding) -> bool {
     finding.severity == Severity::High
         && finding.actionable
         && has_validated_evidence(finding)
-        && (matches!(
-            finding.category,
-            ReviewCategory::Security | ReviewCategory::Privacy
-        ) || matches!(
-            finding.risk_code,
-            Some(
-                RiskCode::AuthBypass
-                    | RiskCode::MissingAuthorizationCheck
-                    | RiskCode::SecretLeak
-                    | RiskCode::PiiOrSecretLogging
-                    | RiskCode::SqlInjection
-                    | RiskCode::CommandInjection
-                    | RiskCode::DataIntegrityRisk
-            )
-        ))
+        && blocker_risk_code(finding.risk_code)
+}
+
+fn blocker_risk_code(risk_code: Option<RiskCode>) -> bool {
+    matches!(
+        risk_code,
+        Some(
+            RiskCode::SqlInjection
+                | RiskCode::CommandInjection
+                | RiskCode::SecretLeak
+                | RiskCode::PiiOrSecretLogging
+                | RiskCode::AuthBypass
+                | RiskCode::MissingAuthorizationCheck
+                | RiskCode::DataIntegrityRisk
+                | RiskCode::MigrationRisk
+        )
+    )
 }
 
 fn validated_actionable_finding_with_severity(finding: &ReviewFinding, severity: Severity) -> bool {
@@ -1174,13 +1044,123 @@ fn contract_snapshot_updated(diffs: &[MergeRequestDiff], config: &RiskGateConfig
     })
 }
 
-fn sql_injection_blocking_finding(finding: &ReviewFinding) -> bool {
-    finding.risk_code == Some(RiskCode::SqlInjection)
-        && matches!(
-            finding.severity,
-            Severity::Critical | Severity::High | Severity::Medium
+fn blocking_issue_label(finding: &ReviewFinding) -> Option<String> {
+    let is_blocker = finding.severity == Severity::Critical || high_blocking_finding(finding);
+    if !is_blocker {
+        return None;
+    }
+
+    let file = finding_file_path(finding);
+    let label = match finding.risk_code {
+        Some(RiskCode::SqlInjection) => format!("SQL injection in `{file}`"),
+        Some(RiskCode::CommandInjection) => format!("Command injection in `{file}`"),
+        Some(RiskCode::SecretLeak | RiskCode::PiiOrSecretLogging)
+            if credential_logging_finding(finding) =>
+        {
+            format!("Sensitive credential/header logging in `{file}`")
+        }
+        Some(RiskCode::PiiOrSecretLogging) if payload_logging_finding(finding) => {
+            format!("Sensitive payload logging in `{file}`")
+        }
+        Some(RiskCode::AuthBypass) => format!("Authentication bypass in `{file}`"),
+        Some(RiskCode::MissingAuthorizationCheck) => {
+            format!("Missing authorization check in `{file}`")
+        }
+        Some(RiskCode::DataIntegrityRisk) if data_integrity_wipe_finding(finding) => {
+            format!("Automatic local data wipe risk in `{file}`")
+        }
+        Some(RiskCode::DataIntegrityRisk) => format!("Data integrity risk in `{file}`"),
+        Some(RiskCode::MigrationRisk) => format!("Migration risk in `{file}`"),
+        _ => format!("{} in `{file}`", sentence_fragment(&finding.title)),
+    };
+    Some(label)
+}
+
+fn required_action_for_finding(finding: &ReviewFinding) -> Option<String> {
+    if !matches!(
+        finding.severity,
+        Severity::Critical | Severity::High | Severity::Medium
+    ) {
+        return None;
+    }
+
+    if let Some(fix) = finding
+        .suggested_fix
+        .as_deref()
+        .map(str::trim)
+        .filter(|fix| specific_suggested_fix(fix))
+    {
+        return Some(sentence_from_suggested_fix(fix));
+    }
+
+    Some(format!(
+        "Address \"{}\" in {}.",
+        sentence_fragment(&finding.title),
+        finding_file_path(finding)
+    ))
+}
+
+fn specific_suggested_fix(fix: &str) -> bool {
+    let lower = fix.trim().to_ascii_lowercase();
+    !lower.is_empty()
+        && !matches!(
+            lower.as_str(),
+            "fix"
+                | "fix it"
+                | "fix this"
+                | "none"
+                | "n/a"
+                | "na"
+                | "no action needed"
+                | "add tests"
+                | "add test"
+                | "handle this"
+                | "address this"
         )
-        && finding.actionable
+        && !lower.starts_with("handle the validated")
+        && !lower.contains("fix error handling so failures are not silently accepted")
+}
+
+fn sentence_from_suggested_fix(fix: &str) -> String {
+    let compact = fix.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first_sentence = first_sentence(&compact);
+    let mut sentence = if first_sentence.chars().count() > 180 {
+        truncate_at_word(first_sentence, 180)
+    } else {
+        first_sentence.to_string()
+    };
+    if !matches!(sentence.chars().last(), Some('.') | Some('!') | Some('?')) {
+        sentence.push('.');
+    }
+    sentence
+}
+
+fn first_sentence(value: &str) -> &str {
+    for (index, ch) in value.char_indices() {
+        if !matches!(ch, '.' | '!' | '?') {
+            continue;
+        }
+        let next = &value[index + ch.len_utf8()..];
+        if next.is_empty() || next.starts_with(char::is_whitespace) {
+            return &value[..=index];
+        }
+    }
+    value
+}
+
+fn truncate_at_word(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for word in value.split_whitespace() {
+        let next_len = output.chars().count() + usize::from(!output.is_empty()) + word.len();
+        if next_len > max_chars {
+            break;
+        }
+        if !output.is_empty() {
+            output.push(' ');
+        }
+        output.push_str(word);
+    }
+    output.trim_end_matches(['.', '!', '?']).to_string()
 }
 
 fn credential_logging_finding(finding: &ReviewFinding) -> bool {
@@ -1244,79 +1224,6 @@ fn data_integrity_wipe_finding(finding: &ReviewFinding) -> bool {
         )
 }
 
-fn google_maps_api_key_finding(finding: &ReviewFinding) -> bool {
-    let text = format!(
-        "{} {}",
-        finding.file_path.as_deref().unwrap_or_default(),
-        finding_text(finding)
-    );
-    finding.risk_code == Some(RiskCode::SecretLeak)
-        && contains_any(&text, &["google maps", "maps api key"])
-        && contains_any(&text, &["api key", "androidmanifest.xml"])
-}
-
-fn credential_logging_requirement(finding: &ReviewFinding) -> String {
-    if contains_any(&finding_text(finding), &["authorization", "auth header"]) {
-        "Remove raw Authorization header logging".to_string()
-    } else {
-        "Remove raw credential/header logging or replace it with sanitized metadata".to_string()
-    }
-}
-
-fn payload_logging_requirement(finding: &ReviewFinding) -> String {
-    if contains_any(
-        &format!(
-            "{} {}",
-            finding.file_path.as_deref().unwrap_or_default(),
-            finding_text(finding)
-        ),
-        &["webhook"],
-    ) {
-        "Remove or sanitize full webhook payload logging".to_string()
-    } else {
-        "Remove full payload logging or log only approved non-sensitive fields".to_string()
-    }
-}
-
-fn weak_error_handling_requirement(finding: &ReviewFinding) -> String {
-    if contains_any(
-        &format!(
-            "{} {}",
-            finding.file_path.as_deref().unwrap_or_default(),
-            finding_text(finding)
-        ),
-        &[
-            "navigationref",
-            "navigation reset",
-            "reset failures",
-            "max-retry",
-            "max retry",
-        ],
-    ) {
-        return format!(
-            "Handle max-retry navigation reset failures with a visible fallback or error state in {}",
-            finding_file_path(finding)
-        );
-    }
-    if contains_any(
-        &format!(
-            "{} {}",
-            finding.file_path.as_deref().unwrap_or_default(),
-            finding_text(finding)
-        ),
-        &["webhook", "json", "parse", "payload", "malformed"],
-    ) {
-        "Fix webhook parse failure handling so malformed payloads are not silently accepted"
-            .to_string()
-    } else {
-        format!(
-            "Address {} in {}",
-            sentence_fragment(&finding.title),
-            finding_file_path(finding)
-        )
-    }
-}
-
 fn sentence_fragment(text: &str) -> String {
     text.trim().trim_end_matches(['.', '!', '?']).to_string()
 }
@@ -1341,100 +1248,6 @@ fn offline_sync_path_signal(path: &str) -> bool {
             "sync", "offline", "queue", "retry", "cache", "pending", "recovery",
         ],
     )
-}
-
-fn push_blocker_for_factor(
-    values: &mut Vec<RiskGateItem>,
-    factor: &RiskFactor,
-    value: impl Into<String>,
-) {
-    if !factor.evidence.is_empty() {
-        push_unique_item(values, value.into(), factor.evidence.clone());
-    }
-}
-
-fn push_requirement_for_factor(
-    values: &mut Vec<RiskGateItem>,
-    factor: &RiskFactor,
-    value: impl Into<String>,
-) {
-    if !factor.evidence.is_empty() {
-        push_unique_item(values, value.into(), factor.evidence.clone());
-    }
-}
-
-fn push_blocker_for_evidence(
-    values: &mut Vec<RiskGateItem>,
-    evidence: &[RiskEvidence],
-    value: impl Into<String>,
-) {
-    if !evidence.is_empty() {
-        push_unique_item(values, value.into(), evidence.to_vec());
-    }
-}
-
-fn push_requirement_for_evidence(
-    values: &mut Vec<RiskGateItem>,
-    evidence: &[RiskEvidence],
-    value: impl Into<String>,
-) {
-    if !evidence.is_empty() {
-        push_unique_item(values, value.into(), evidence.to_vec());
-    }
-}
-
-fn push_combined_focused_test_requirement(values: &mut Vec<RiskGateItem>, factors: &[RiskFactor]) {
-    let sql_evidence = factors.iter().find_map(|factor| {
-        if factor.rule_id == "finding.injection"
-            && factor
-                .evidence
-                .iter()
-                .any(|evidence| evidence.risk_code.as_deref() == Some("sql_injection"))
-        {
-            Some(factor.evidence.clone())
-        } else {
-            None
-        }
-    });
-    let webhook_parse_evidence = factors.iter().find_map(|factor| {
-        if factor.rule_id == "finding.weak_error_handling"
-            && factor.evidence.iter().any(|evidence| {
-                let text = format!(
-                    "{} {}",
-                    evidence.file_path.as_deref().unwrap_or_default(),
-                    evidence.description
-                );
-                contains_any(&text, &["webhook", "parse", "json", "payload", "malformed"])
-            })
-        {
-            Some(factor.evidence.clone())
-        } else {
-            None
-        }
-    });
-
-    match (sql_evidence, webhook_parse_evidence) {
-        (Some(mut sql), Some(webhook_parse)) => {
-            sql.extend(webhook_parse);
-            push_unique_item(
-                values,
-                "Add focused tests for SQL query safety and webhook parse failure handling"
-                    .to_string(),
-                sql,
-            );
-        }
-        (Some(sql), None) => push_unique_item(
-            values,
-            "Add focused tests for SQL query safety".to_string(),
-            sql,
-        ),
-        (None, Some(webhook_parse)) => push_unique_item(
-            values,
-            "Add focused tests for webhook parse failure handling".to_string(),
-            webhook_parse,
-        ),
-        (None, None) => {}
-    }
 }
 
 fn is_source_behavior_path(path: &str) -> bool {
@@ -1539,25 +1352,6 @@ fn push_unique_item(values: &mut Vec<RiskGateItem>, label: String, evidence: Vec
         return;
     }
     values.push(RiskGateItem { label, evidence });
-}
-
-fn gate_item_has_policy_hard_blocker_evidence(item: &RiskGateItem) -> bool {
-    if item.label.contains("Touched protected module") {
-        return item.evidence.iter().any(|evidence| {
-            evidence.rule_id.contains("protected_path")
-                && evidence
-                    .file_path
-                    .as_deref()
-                    .is_some_and(|path| !path.trim().is_empty())
-        });
-    }
-    item.evidence.iter().any(|evidence| {
-        evidence.rule_id.contains("protected_path")
-            && evidence
-                .file_path
-                .as_deref()
-                .is_some_and(|path| !path.trim().is_empty())
-    })
 }
 
 #[cfg(test)]
@@ -1698,7 +1492,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_sync_without_recovery_test_blocks() {
+    fn offline_sync_without_recovery_test_needs_human_without_policy_blocker() {
         let assessment = assess(
             &[],
             &[diff("src/features/sync/worker.rs", "+retry queue")],
@@ -1706,11 +1500,12 @@ mod tests {
             RiskGateRunSignals::default(),
         );
 
-        assert_eq!(assessment.decision, MergeDecision::Blocked);
-        assert!(has_blocker(
+        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+        assert!(!has_blocker(
             &assessment,
             "Modified offline sync layer without adding recovery test"
         ));
+        assert!(!has_requirement(&assessment, "Add sync recovery test"));
     }
 
     #[test]
@@ -1780,29 +1575,32 @@ mod tests {
         let report = large_report(1);
         let assessment = assess(
             &[
-                finding_with_details(
+                finding_with_details_and_fix(
                     Severity::High,
                     ReviewCategory::DataIntegrity,
                     Some(RiskCode::DataIntegrityRisk),
                     "android/app/src/main/java/id/go/bgn/sipgn/distribusi/MainApplication.kt",
                     "Automatic data deletion on security threat detection",
                     "Startup deletes local user data after compromised-device security threat detection.",
+                    "Add guardrails for compromised-device false positives before wiping local user data.",
                 ),
-                finding_with_details(
+                finding_with_details_and_fix(
                     Severity::Medium,
                     ReviewCategory::Security,
                     Some(RiskCode::SecretLeak),
                     "android/app/src/main/AndroidManifest.xml",
                     "Hardcoded Google Maps API key",
                     "The Android manifest contains a Google Maps API key.",
+                    "Move the Google Maps API key to build-time config or confirm package/SHA restrictions.",
                 ),
-                finding_with_details(
+                finding_with_details_and_fix(
                     Severity::Medium,
                     ReviewCategory::Reliability,
                     Some(RiskCode::WeakErrorHandling),
                     "src/routes/navigationRef.ts",
                     "Navigation reset failures are not bubbled up",
                     "Max-retry navigation reset failures are swallowed without a visible fallback.",
+                    "Handle max-retry navigation reset failures with a visible fallback or error state in src/routes/navigationRef.ts.",
                 ),
             ],
             &[
@@ -1837,28 +1635,24 @@ mod tests {
         ));
         assert!(has_blocker(
             &assessment,
-            "Automatic local data wipe risk in android/app/src/main/java/id/go/bgn/sipgn/distribusi/MainApplication.kt"
+            "Automatic local data wipe risk in `android/app/src/main/java/id/go/bgn/sipgn/distribusi/MainApplication.kt`"
         ));
         assert!(has_requirement(
             &assessment,
-            "Add guardrails for compromised-device false positives before wiping local user data"
+            "Add guardrails for compromised-device false positives before wiping local user data."
         ));
         assert!(has_requirement(
             &assessment,
-            "Add tests for compromised-device startup and wipe-failure behavior"
+            "Move the Google Maps API key to build-time config or confirm package/SHA restrictions."
         ));
         assert!(has_requirement(
             &assessment,
-            "Confirm Google Maps API key is package/SHA restricted or move it to build-time config"
-        ));
-        assert!(has_requirement(
-            &assessment,
-            "Handle max-retry navigation reset failures with a visible fallback or error state in src/routes/navigationRef.ts"
+            "Handle max-retry navigation reset failures with a visible fallback or error state in src/routes/navigationRef.ts."
         ));
     }
 
     #[test]
-    fn offline_sync_path_without_recovery_test_still_blocks() {
+    fn offline_sync_path_without_recovery_test_no_longer_blocks() {
         let assessment = assess(
             &[],
             &[diff(
@@ -1869,15 +1663,16 @@ mod tests {
             RiskGateRunSignals::default(),
         );
 
-        assert!(has_blocker(
+        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+        assert!(!has_blocker(
             &assessment,
             "Modified offline sync layer without adding recovery test"
         ));
-        assert!(has_requirement(&assessment, "Add sync recovery test"));
+        assert!(!has_requirement(&assessment, "Add sync recovery test"));
     }
 
     #[test]
-    fn api_contract_without_snapshot_blocks() {
+    fn api_contract_without_snapshot_needs_human_without_policy_blocker() {
         let assessment = assess(
             &[],
             &[diff("src/api/user_dto.rs", "+api response changes")],
@@ -1885,8 +1680,8 @@ mod tests {
             RiskGateRunSignals::default(),
         );
 
-        assert_eq!(assessment.decision, MergeDecision::Blocked);
-        assert!(has_blocker(
+        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+        assert!(!has_blocker(
             &assessment,
             "Changed API response contract without updating contract snapshot"
         ));
@@ -1926,7 +1721,7 @@ mod tests {
     }
 
     #[test]
-    fn db_migration_without_rollback_blocks() {
+    fn db_migration_without_rollback_needs_human_without_policy_blocker() {
         let assessment = assess(
             &[],
             &[diff(
@@ -1937,8 +1732,8 @@ mod tests {
             RiskGateRunSignals::default(),
         );
 
-        assert_eq!(assessment.decision, MergeDecision::Blocked);
-        assert!(has_blocker(
+        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+        assert!(!has_blocker(
             &assessment,
             "Added DB migration without rollback plan"
         ));
@@ -1981,7 +1776,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_path_touched_requires_owner_review() {
+    fn protected_path_touched_needs_human_without_policy_blocker() {
         let assessment = assess(
             &[],
             &[diff("src/auth/session.rs", "+renew session")],
@@ -1989,15 +1784,15 @@ mod tests {
             RiskGateRunSignals::default(),
         );
 
-        assert_eq!(assessment.decision, MergeDecision::Blocked);
-        assert!(has_blocker(
+        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+        assert!(!has_blocker(
             &assessment,
             "Touched protected module: `src/auth/**`"
         ));
     }
 
     #[test]
-    fn protected_path_owner_appears_in_required_before_merge() {
+    fn protected_path_owner_does_not_emit_required_before_merge_template() {
         let assessment = assess(
             &[],
             &[diff("src/auth/session.rs", "+renew session")],
@@ -2005,14 +1800,14 @@ mod tests {
             RiskGateRunSignals::default(),
         );
 
-        assert!(has_requirement(
+        assert!(!has_requirement(
             &assessment,
             "Request owner review from Security Lead"
         ));
     }
 
     #[test]
-    fn protected_path_blocker_includes_matched_pattern() {
+    fn protected_path_blocker_template_is_not_emitted() {
         let assessment = assess(
             &[],
             &[diff("src/features/sync/worker.rs", "+start queue")],
@@ -2020,7 +1815,7 @@ mod tests {
             RiskGateRunSignals::default(),
         );
 
-        assert!(has_blocker(
+        assert!(!has_blocker(
             &assessment,
             "Touched protected module: `src/features/sync/**`"
         ));
@@ -2029,13 +1824,14 @@ mod tests {
     #[test]
     fn sql_injection_finding_emits_evidence_bound_blocker_and_requirement() {
         let assessment = assess(
-            &[finding_with_details(
+            &[finding_with_details_and_fix(
                 Severity::Critical,
                 ReviewCategory::Security,
                 Some(RiskCode::SqlInjection),
                 "src/paymentClient.ts",
                 "Raw SQL interpolation",
                 "findPaymentsByCustomer interpolates customer input into SQL.",
+                "Replace raw SQL interpolation with a parameterized query or safe query builder.",
             )],
             &[diff("src/paymentClient.ts", "+db.query(`SELECT ${id}`)")],
             stats(1, 100),
@@ -2048,20 +1844,21 @@ mod tests {
         ));
         assert!(has_requirement(
             &assessment,
-            "Replace raw SQL interpolation with a parameterized query or safe query builder"
+            "Replace raw SQL interpolation with a parameterized query or safe query builder."
         ));
     }
 
     #[test]
     fn secret_leak_finding_emits_credential_logging_blocker() {
         let assessment = assess(
-            &[finding_with_details(
+            &[finding_with_details_and_fix(
                 Severity::High,
                 ReviewCategory::Security,
                 Some(RiskCode::SecretLeak),
                 "src/paymentClient.ts",
                 "Authorization header is logged",
                 "The raw Authorization header token is written to logs.",
+                "Remove raw Authorization header logging in src/paymentClient.ts.",
             )],
             &[diff(
                 "src/paymentClient.ts",
@@ -2077,20 +1874,21 @@ mod tests {
         ));
         assert!(has_requirement(
             &assessment,
-            "Remove raw Authorization header logging"
+            "Remove raw Authorization header logging in src/paymentClient.ts."
         ));
     }
 
     #[test]
     fn webhook_pii_logging_finding_emits_payload_logging_blocker() {
         let assessment = assess(
-            &[finding_with_details(
+            &[finding_with_details_and_fix(
                 Severity::High,
                 ReviewCategory::Privacy,
                 Some(RiskCode::PiiOrSecretLogging),
                 "src/webhook.ts",
                 "Webhook payload is logged",
                 "The full webhook body payload is logged.",
+                "Remove or sanitize full webhook payload logging in src/webhook.ts.",
             )],
             &[diff("src/webhook.ts", "+console.log(req.body)")],
             stats(1, 100),
@@ -2103,20 +1901,21 @@ mod tests {
         ));
         assert!(has_requirement(
             &assessment,
-            "Remove or sanitize full webhook payload logging"
+            "Remove or sanitize full webhook payload logging in src/webhook.ts."
         ));
     }
 
     #[test]
     fn weak_error_handling_finding_adds_requirement_without_unrelated_blocker() {
         let assessment = assess(
-            &[finding_with_details(
+            &[finding_with_details_and_fix(
                 Severity::Medium,
                 ReviewCategory::Reliability,
                 Some(RiskCode::WeakErrorHandling),
                 "src/webhook.ts",
                 "JSON parse errors are suppressed",
                 "Malformed webhook JSON is silently accepted.",
+                "Fix webhook parse failure handling so malformed payloads are not silently accepted.",
             )],
             &[diff("src/webhook.ts", "+try { JSON.parse(body) } catch {}")],
             stats(1, 100),
@@ -2125,7 +1924,7 @@ mod tests {
 
         assert!(has_requirement(
             &assessment,
-            "Fix webhook parse failure handling so malformed payloads are not silently accepted"
+            "Fix webhook parse failure handling so malformed payloads are not silently accepted."
         ));
         assert!(!has_blocker(
             &assessment,
@@ -2137,37 +1936,41 @@ mod tests {
     fn sample_payment_webhook_findings_block_without_unrelated_policy_blockers() {
         let assessment = assess(
             &[
-                finding_with_details(
+                finding_with_details_and_fix(
                     Severity::Critical,
                     ReviewCategory::Security,
                     Some(RiskCode::SqlInjection),
                     "src/paymentClient.ts",
                     "SQL injection in payment lookup",
                     "findPaymentsByCustomer uses raw SQL interpolation.",
+                    "Use parameterized queries or a safe query builder in src/paymentClient.ts.",
                 ),
-                finding_with_details(
+                finding_with_details_and_fix(
                     Severity::High,
                     ReviewCategory::Security,
                     Some(RiskCode::SecretLeak),
                     "src/paymentClient.ts",
                     "Authorization header is logged",
                     "The raw Authorization header token is logged.",
+                    "Remove Authorization header logging in src/paymentClient.ts.",
                 ),
-                finding_with_details(
+                finding_with_details_and_fix(
                     Severity::High,
                     ReviewCategory::Privacy,
                     Some(RiskCode::PiiOrSecretLogging),
                     "src/webhook.ts",
                     "Webhook payload is logged",
                     "The full webhook body payload is logged.",
+                    "Remove or sanitize full webhook payload logging in src/webhook.ts.",
                 ),
-                finding_with_details(
+                finding_with_details_and_fix(
                     Severity::Medium,
                     ReviewCategory::Reliability,
                     Some(RiskCode::WeakErrorHandling),
                     "src/webhook.ts",
                     "JSON parse errors are suppressed",
                     "Malformed webhook JSON is silently accepted.",
+                    "Fix webhook parse failure handling so malformed payloads are not silently accepted.",
                 ),
             ],
             &[
@@ -2205,7 +2008,19 @@ mod tests {
         ));
         assert!(has_requirement(
             &assessment,
-            "Add focused tests for SQL query safety and webhook parse failure handling"
+            "Use parameterized queries or a safe query builder in src/paymentClient.ts."
+        ));
+        assert!(has_requirement(
+            &assessment,
+            "Remove Authorization header logging in src/paymentClient.ts."
+        ));
+        assert!(has_requirement(
+            &assessment,
+            "Remove or sanitize full webhook payload logging in src/webhook.ts."
+        ));
+        assert!(has_requirement(
+            &assessment,
+            "Fix webhook parse failure handling so malformed payloads are not silently accepted."
         ));
     }
 
@@ -2282,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn low_and_note_only_findings_cannot_exceed_49() {
+    fn low_and_note_only_findings_pass_without_large_review_failure() {
         let mut note = finding(Severity::Note, ReviewCategory::Correctness, None);
         note.actionable = false;
         let mut findings = (0..60)
@@ -2293,7 +2108,7 @@ mod tests {
         let assessment = assess(&findings, &[], stats(1, 100), RiskGateRunSignals::default());
 
         assert_eq!(assessment.score, 49);
-        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+        assert_eq!(assessment.decision, MergeDecision::Pass);
     }
 
     #[test]
@@ -2319,7 +2134,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_decision_when_blocking_issue_exists() {
+    fn broad_offline_sync_signal_does_not_block_without_validated_blocker_finding() {
         let assessment = assess(
             &[],
             &[diff("src/offline/cache.rs", "+pending queue")],
@@ -2327,7 +2142,7 @@ mod tests {
             RiskGateRunSignals::default(),
         );
 
-        assert_eq!(assessment.decision, MergeDecision::Blocked);
+        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
     }
 
     #[test]
@@ -2341,9 +2156,78 @@ mod tests {
         let markdown = format_merge_risk_gate_markdown(&assessment);
 
         assert!(markdown.starts_with("## Merge Risk Gate\n\nRisk Score: "));
-        assert!(markdown.contains("Decision: BLOCKED"));
-        assert!(markdown.contains("Blocking Issues:\n- Modified offline sync layer"));
-        assert!(markdown.contains("Required Before Merge:\n- Add sync recovery test"));
+        assert!(markdown.contains("Decision: NEEDS HUMAN"));
+        assert!(!markdown.contains("Blocking Issues:"));
+        assert!(!markdown.contains("Modified offline sync layer"));
+        assert!(!markdown.contains("Add sync recovery test"));
+    }
+
+    #[test]
+    fn runtime_output_does_not_emit_hardcoded_policy_templates() {
+        let assessment = assess(
+            &[],
+            &[
+                diff("src/features/sync/offlineQueue.ts", "+pending retry queue"),
+                diff("src/api/user_dto.rs", "+api response changes"),
+                diff("migrations/001.sql", "+ALTER TABLE users ADD COLUMN role"),
+                diff("src/auth/session.rs", "+renew session"),
+            ],
+            stats(4, 100),
+            RiskGateRunSignals::default(),
+        );
+        let markdown = format_merge_risk_gate_markdown(&assessment);
+
+        for forbidden in [
+            "Modified offline sync layer without adding recovery test",
+            "Add sync recovery test",
+            "Fix error handling so failures are not silently accepted",
+            "Handle the validated error-handling failure",
+            "Changed API response contract without updating contract snapshot",
+            "Added DB migration without rollback plan",
+            "Touched protected module",
+            "Request owner review",
+            "Update OpenAPI",
+            "Attach migration rollback",
+        ] {
+            assert!(!markdown.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn required_actions_are_deduped_and_capped_from_suggested_fixes() {
+        let findings = (0..8)
+            .map(|index| {
+                let suggested_fix = if index < 2 {
+                    "Handle the shared failure mode in the affected file.".to_string()
+                } else {
+                    format!("Handle specific failure mode {index} in the affected file.")
+                };
+                finding_with_details_and_fix(
+                    Severity::Medium,
+                    ReviewCategory::Reliability,
+                    Some(RiskCode::WeakErrorHandling),
+                    &format!("src/file{index}.rs"),
+                    &format!("Finding {index}"),
+                    "body",
+                    &suggested_fix,
+                )
+            })
+            .collect::<Vec<_>>();
+        let assessment = assess(&findings, &[], stats(1, 100), RiskGateRunSignals::default());
+        let labels = assessment
+            .required_before_merge
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(labels.len() <= 6);
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| **label == "Handle the shared failure mode in the affected file.")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2405,6 +2289,18 @@ mod tests {
         title: &str,
         body: &str,
     ) -> ReviewFinding {
+        finding_with_details_and_fix(severity, category, risk_code, file_path, title, body, "fix")
+    }
+
+    fn finding_with_details_and_fix(
+        severity: Severity,
+        category: ReviewCategory,
+        risk_code: Option<RiskCode>,
+        file_path: &str,
+        title: &str,
+        body: &str,
+        suggested_fix: &str,
+    ) -> ReviewFinding {
         ReviewFinding {
             severity,
             category,
@@ -2414,7 +2310,7 @@ mod tests {
             line: Some(1),
             title: title.to_string(),
             body: body.to_string(),
-            suggested_fix: Some("fix".to_string()),
+            suggested_fix: Some(suggested_fix.to_string()),
             effort: Effort::Moderate,
             actionable: true,
             evidence_status: Some(EvidenceValidationStatus::Validated),

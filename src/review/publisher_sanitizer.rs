@@ -22,20 +22,13 @@ pub fn sanitize_merge_risk_assessment(
     analysis: &ReviewAnalysis,
     mut assessment: MergeRiskAssessment,
 ) -> MergeRiskAssessment {
-    assessment.blocking_issues.retain(|item| {
-        evidence_backed_gate_item(item) && hardcoded_item_has_matching_evidence(item)
-    });
-    assessment.required_before_merge.retain(|item| {
-        evidence_backed_gate_item(item) && hardcoded_item_has_matching_evidence(item)
-    });
-
-    replace_generic_required_actions(analysis, &mut assessment.required_before_merge);
+    assessment.blocking_issues.clear();
+    assessment.required_before_merge.clear();
+    add_finding_blockers(analysis, &mut assessment.blocking_issues);
     add_missing_finding_actions(analysis, &mut assessment.required_before_merge);
-    assessment
-        .blocking_issues
-        .retain(|item| true_hard_blocker(analysis, item));
     dedupe_gate_items(&mut assessment.blocking_issues);
     dedupe_gate_items(&mut assessment.required_before_merge);
+    assessment.required_before_merge.truncate(6);
 
     let has_critical = analysis.findings.iter().any(|finding| {
         validated_actionable_finding(finding) && finding.severity == Severity::Critical
@@ -44,29 +37,11 @@ pub fn sanitize_merge_risk_assessment(
         .findings
         .iter()
         .any(|finding| validated_actionable_finding(finding) && finding.severity == Severity::High);
-    let has_high_severe = analysis
+    let has_high_blocking = analysis
         .findings
         .iter()
-        .any(|finding| validated_actionable_finding(finding) && severe_high_finding(finding));
-    let has_policy_hard_blocker = assessment.blocking_issues.iter().any(policy_hard_blocker);
-    let has_migration_hard_blocker = assessment
-        .blocking_issues
-        .iter()
-        .any(migration_hard_blocker);
-    let has_contract_hard_blocker = assessment.blocking_issues.iter().any(contract_hard_blocker);
-    let has_offline_sync_hard_blocker = assessment
-        .blocking_issues
-        .iter()
-        .any(offline_sync_hard_blocker);
-    let has_large_failed_chunks_with_high_or_critical =
-        assessment.blast_radius.failed_chunks > 0 && (has_high || has_critical);
-    let score_100_allowed = has_critical
-        || has_high_severe
-        || has_policy_hard_blocker
-        || has_migration_hard_blocker
-        || has_contract_hard_blocker
-        || has_offline_sync_hard_blocker
-        || has_large_failed_chunks_with_high_or_critical;
+        .any(|finding| validated_actionable_finding(finding) && high_blocking_finding(finding));
+    let score_100_allowed = has_critical || has_high_blocking;
 
     if !score_100_allowed {
         assessment.score = if has_high {
@@ -82,13 +57,7 @@ pub fn sanitize_merge_risk_assessment(
         };
     }
 
-    if !has_critical
-        && !has_high
-        && !has_policy_hard_blocker
-        && !has_migration_hard_blocker
-        && !has_contract_hard_blocker
-        && !has_offline_sync_hard_blocker
-    {
+    if !has_critical && !has_high {
         assessment.score = assessment
             .score
             .min(medium_only_score_cap(analysis, &assessment));
@@ -101,19 +70,16 @@ pub fn sanitize_merge_risk_assessment(
         }
     }
 
-    if assessment.decision == MergeDecision::Blocked
-        && !has_critical
-        && !has_high_severe
-        && !has_policy_hard_blocker
-        && !has_migration_hard_blocker
-        && !has_contract_hard_blocker
-        && !has_offline_sync_hard_blocker
-    {
+    if assessment.decision == MergeDecision::Blocked && !has_critical && !has_high_blocking {
         assessment.decision = if should_need_human(analysis, &assessment) || has_high {
             MergeDecision::NeedsHuman
         } else {
             MergeDecision::Pass
         };
+    }
+
+    if (has_critical || has_high_blocking) && assessment.decision != MergeDecision::Blocked {
+        assessment.decision = MergeDecision::Blocked;
     }
 
     if assessment.decision == MergeDecision::Pass && should_need_human(analysis, &assessment) {
@@ -182,71 +148,22 @@ fn renderable_final_finding(finding: &ReviewFinding) -> bool {
     true
 }
 
-fn evidence_backed_gate_item(item: &RiskGateItem) -> bool {
-    !item.label.trim().is_empty()
-        && !item.evidence.is_empty()
-        && item.evidence.iter().any(evidence_has_signal)
-}
-
-fn evidence_has_signal(evidence: &RiskEvidence) -> bool {
-    evidence
-        .file_path
-        .as_deref()
-        .is_some_and(|path| !path.trim().is_empty())
-        || evidence
-            .finding_id
-            .as_deref()
-            .is_some_and(|id| !id.trim().is_empty())
-        || evidence
-            .risk_code
-            .as_deref()
-            .is_some_and(|risk_code| !risk_code.trim().is_empty())
-        || evidence.rule_id.starts_with("verification.")
-        || evidence.rule_id.starts_with("comparison.")
-}
-
-fn hardcoded_item_has_matching_evidence(item: &RiskGateItem) -> bool {
-    let label = item.label.as_str();
-    if label.contains("Modified offline sync") || label.contains("Add sync recovery test") {
-        return item.evidence.iter().any(|evidence| {
-            evidence.rule_id.contains("offline_sync")
-                && evidence
-                    .file_path
-                    .as_deref()
-                    .is_some_and(offline_sync_path_signal)
-        });
-    }
-    if label.contains("Changed API response contract") {
-        return item
-            .evidence
-            .iter()
-            .any(|evidence| evidence.rule_id.contains("api_contract"));
-    }
-    if label.contains("Added DB migration") {
-        return item
-            .evidence
-            .iter()
-            .any(|evidence| evidence.rule_id.contains("migration"));
-    }
-    if label.contains("Touched protected module") {
-        return item
-            .evidence
-            .iter()
-            .any(|evidence| evidence.rule_id.contains("protected_path"));
-    }
-    !contains_forbidden_hardcoded_text(label)
-}
-
-fn replace_generic_required_actions(analysis: &ReviewAnalysis, items: &mut Vec<RiskGateItem>) {
-    for item in items.iter_mut() {
-        if !is_generic_required_action(&item.label) {
+fn add_finding_blockers(analysis: &ReviewAnalysis, items: &mut Vec<RiskGateItem>) {
+    for finding in analysis
+        .findings
+        .iter()
+        .filter(|finding| validated_actionable_finding(finding))
+        .filter(|finding| finding.severity == Severity::Critical || high_blocking_finding(finding))
+    {
+        let evidence = finding_evidence(finding);
+        if evidence.is_empty() {
             continue;
         }
-        if let Some(finding) = matching_finding_for_item(analysis, item) {
-            item.label = finding_required_action(finding);
-        }
+        items.push(RiskGateItem {
+            label: finding_blocking_issue(finding),
+            evidence,
+        });
     }
-    items.retain(|item| !is_generic_required_action(&item.label));
 }
 
 fn add_missing_finding_actions(analysis: &ReviewAnalysis, items: &mut Vec<RiskGateItem>) {
@@ -282,26 +199,6 @@ fn add_missing_finding_actions(analysis: &ReviewAnalysis, items: &mut Vec<RiskGa
     }
 }
 
-fn matching_finding_for_item<'a>(
-    analysis: &'a ReviewAnalysis,
-    item: &RiskGateItem,
-) -> Option<&'a ReviewFinding> {
-    analysis.findings.iter().find(|finding| {
-        item.evidence.iter().any(|evidence| {
-            evidence
-                .file_path
-                .as_deref()
-                .zip(finding.file_path.as_deref())
-                .is_some_and(|(left, right)| left == right)
-                || evidence.risk_code.as_deref().is_some_and(|risk_code| {
-                    finding
-                        .risk_code
-                        .is_some_and(|finding_code| finding_code.display_lower() == risk_code)
-                })
-        })
-    })
-}
-
 fn finding_evidence(finding: &ReviewFinding) -> Vec<RiskEvidence> {
     if finding
         .file_path
@@ -327,100 +224,43 @@ fn finding_evidence(finding: &ReviewFinding) -> Vec<RiskEvidence> {
     }]
 }
 
-fn finding_required_action(finding: &ReviewFinding) -> String {
-    let text = format!(
-        "{} {} {}",
-        finding.file_path.as_deref().unwrap_or_default(),
-        finding.title,
-        finding.body
-    )
-    .to_ascii_lowercase();
+fn finding_blocking_issue(finding: &ReviewFinding) -> String {
+    let file = finding_file_path(finding);
+    match finding.risk_code {
+        Some(RiskCode::SqlInjection) => format!("SQL injection in `{file}`"),
+        Some(RiskCode::CommandInjection) => format!("Command injection in `{file}`"),
+        Some(RiskCode::SecretLeak | RiskCode::PiiOrSecretLogging)
+            if credential_logging_finding(finding) =>
+        {
+            format!("Sensitive credential/header logging in `{file}`")
+        }
+        Some(RiskCode::PiiOrSecretLogging) if payload_logging_finding(finding) => {
+            format!("Sensitive payload logging in `{file}`")
+        }
+        Some(RiskCode::AuthBypass) => format!("Authentication bypass in `{file}`"),
+        Some(RiskCode::MissingAuthorizationCheck) => {
+            format!("Missing authorization check in `{file}`")
+        }
+        Some(RiskCode::DataIntegrityRisk) if local_data_wipe_finding(finding) => {
+            format!("Automatic local data wipe risk in `{file}`")
+        }
+        Some(RiskCode::DataIntegrityRisk) => format!("Data integrity risk in `{file}`"),
+        Some(RiskCode::MigrationRisk) => format!("Migration risk in `{file}`"),
+        _ => format!("{} in `{file}`", sentence_fragment(&finding.title)),
+    }
+}
 
-    if finding.risk_code == Some(RiskCode::SecretLeak)
-        && contains_any(
-            &text,
-            &["google maps", "maps api key", "androidmanifest.xml"],
-        )
-    {
-        return "Confirm the Google Maps API key is package/SHA restricted or move it to build-time configuration.".to_string();
-    }
-    if finding.risk_code == Some(RiskCode::PiiOrSecretLogging)
-        || (finding.risk_code == Some(RiskCode::SecretLeak)
-            && contains_any(&text, &["log", "logged", "logging", "header", "token"]))
-    {
-        return format!(
-            "Remove or sanitize sensitive logging in {}.",
-            finding_file_path(finding)
-        );
-    }
-    if finding.risk_code == Some(RiskCode::WeakErrorHandling) {
-        if contains_any(
-            &text,
-            &["toast", "untrusted", "application warning", "build warning"],
-        ) {
-            return "Replace transient Toast-only untrusted-build warning with a persistent blocking error state.".to_string();
-        }
-        if contains_any(
-            &text,
-            &["antiinstrumentation", "native security", "security check"],
-        ) {
-            return format!(
-                "Surface or log native security check failures in {}.",
-                finding_file_path(finding)
-            );
-        }
-        if contains_any(
-            &text,
-            &[
-                "signature",
-                "verification",
-                "broad exception",
-                "exception handling",
-            ],
-        ) {
-            return "Log expected signature-verification exceptions without weakening fail-closed behavior.".to_string();
-        }
-        if contains_any(&text, &["webhook", "json", "parse", "payload", "malformed"]) {
-            return "Fix webhook parse failure handling so malformed payloads are not silently accepted.".to_string();
-        }
-        if contains_any(
-            &text,
-            &[
-                "navigationref",
-                "navigation reset",
-                "max-retry",
-                "max retry",
-            ],
-        ) {
-            return format!(
-                "Handle max-retry navigation reset failures with a visible fallback or error state in {}.",
-                finding_file_path(finding)
-            );
-        }
-    }
-    if contains_any(
-        &text,
-        &["webview", "logout", "fixed timeout", "cleanup timeout"],
-    ) {
-        return "Add monitoring or fallback behavior for WebView cleanup timeout during logout."
-            .to_string();
-    }
-    if finding.risk_code == Some(RiskCode::DataIntegrityRisk)
-        && contains_any(&text, &["wipe", "delete", "local data"])
-    {
-        return "Add guardrails for compromised-device false positives before wiping local user data."
-            .to_string();
-    }
+fn finding_required_action(finding: &ReviewFinding) -> String {
     if let Some(fix) = finding
         .suggested_fix
         .as_deref()
         .map(str::trim)
         .filter(|fix| specific_suggested_fix(fix))
     {
-        return sentence_from_text(fix);
+        return sentence_from_suggested_fix(fix);
     }
     format!(
-        "Address {} in {}.",
+        "Address \"{}\" in {}.",
         sentence_fragment(&finding.title),
         finding_file_path(finding)
     )
@@ -431,81 +271,37 @@ fn specific_suggested_fix(fix: &str) -> bool {
     !lower.is_empty()
         && !matches!(
             lower.as_str(),
-            "fix" | "none" | "n/a" | "na" | "no action needed"
+            "fix"
+                | "fix it"
+                | "fix this"
+                | "none"
+                | "n/a"
+                | "na"
+                | "no action needed"
+                | "add tests"
+                | "add test"
+                | "handle this"
+                | "address this"
         )
         && !lower.starts_with("handle the validated")
+        && !lower.contains("fix error handling so failures are not silently accepted")
 }
 
-fn true_hard_blocker(analysis: &ReviewAnalysis, item: &RiskGateItem) -> bool {
-    matching_finding_for_item(analysis, item).is_some_and(|finding| {
-        validated_actionable_finding(finding)
-            && (finding.severity == Severity::Critical || severe_high_finding(finding))
-    }) || policy_hard_blocker(item)
-        || migration_hard_blocker(item)
-        || contract_hard_blocker(item)
-        || offline_sync_hard_blocker(item)
-}
-
-fn policy_hard_blocker(item: &RiskGateItem) -> bool {
-    item.evidence.iter().any(|evidence| {
-        evidence.rule_id.contains("protected_path")
-            && evidence
-                .file_path
-                .as_deref()
-                .is_some_and(|path| !path.trim().is_empty())
-    })
-}
-
-fn migration_hard_blocker(item: &RiskGateItem) -> bool {
-    item.evidence.iter().any(|evidence| {
-        evidence.rule_id.contains("migration_missing_rollback")
-            && evidence
-                .file_path
-                .as_deref()
-                .is_some_and(|path| !path.trim().is_empty())
-    })
-}
-
-fn contract_hard_blocker(item: &RiskGateItem) -> bool {
-    item.evidence.iter().any(|evidence| {
-        evidence.rule_id.contains("api_contract_missing_snapshot")
-            && evidence
-                .file_path
-                .as_deref()
-                .is_some_and(|path| !path.trim().is_empty())
-    })
-}
-
-fn offline_sync_hard_blocker(item: &RiskGateItem) -> bool {
-    item.evidence.iter().any(|evidence| {
-        evidence
-            .rule_id
-            .contains("offline_sync_missing_recovery_test")
-            && evidence
-                .file_path
-                .as_deref()
-                .is_some_and(offline_sync_path_signal)
-    })
-}
-
-fn severe_high_finding(finding: &ReviewFinding) -> bool {
+fn high_blocking_finding(finding: &ReviewFinding) -> bool {
     finding.severity == Severity::High
-        && (matches!(
-            finding.category,
-            crate::review::types::ReviewCategory::Security
-                | crate::review::types::ReviewCategory::Privacy
-        ) || matches!(
+        && matches!(
             finding.risk_code,
             Some(
-                RiskCode::AuthBypass
-                    | RiskCode::MissingAuthorizationCheck
+                RiskCode::SqlInjection
+                    | RiskCode::CommandInjection
                     | RiskCode::SecretLeak
                     | RiskCode::PiiOrSecretLogging
-                    | RiskCode::SqlInjection
-                    | RiskCode::CommandInjection
+                    | RiskCode::AuthBypass
+                    | RiskCode::MissingAuthorizationCheck
                     | RiskCode::DataIntegrityRisk
+                    | RiskCode::MigrationRisk
             )
-        ))
+        )
 }
 
 fn medium_only_score_cap(analysis: &ReviewAnalysis, assessment: &MergeRiskAssessment) -> u8 {
@@ -587,8 +383,9 @@ fn should_need_human(analysis: &ReviewAnalysis, assessment: &MergeRiskAssessment
             validated_actionable_finding(finding) && finding.severity == Severity::Medium
         })
         .count();
+    let has_medium = medium_count > 0;
     medium_count > 1
-        || assessment.score >= 40
+        || (has_medium && assessment.score >= 40)
         || assessment.blast_radius.failed_chunks > 0
         || assessment.blast_radius.collapsed_files > 0
         || assessment.blast_radius.too_large_files > 0
@@ -708,14 +505,6 @@ fn significant_words(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn is_generic_required_action(label: &str) -> bool {
-    let lower = label.to_ascii_lowercase();
-    lower.contains("handle the validated error-handling failure")
-        || lower.contains("fix error handling so failures are not silently accepted")
-        || lower == "fix error handling."
-        || lower == "add tests."
-}
-
 fn contains_forbidden_hardcoded_text(value: &str) -> bool {
     [
         "Modified offline sync",
@@ -765,25 +554,96 @@ fn finding_file_path(finding: &ReviewFinding) -> String {
         .to_string()
 }
 
-fn sentence_from_text(text: &str) -> String {
-    let mut sentence = text.trim().to_string();
+fn sentence_from_suggested_fix(text: &str) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first_sentence = first_sentence(&compact);
+    let mut sentence = if first_sentence.chars().count() > 180 {
+        truncate_at_word(first_sentence, 180)
+    } else {
+        first_sentence.to_string()
+    };
     if !matches!(sentence.chars().last(), Some('.') | Some('!') | Some('?')) {
         sentence.push('.');
     }
     sentence
 }
 
+fn first_sentence(value: &str) -> &str {
+    for (index, ch) in value.char_indices() {
+        if !matches!(ch, '.' | '!' | '?') {
+            continue;
+        }
+        let next = &value[index + ch.len_utf8()..];
+        if next.is_empty() || next.starts_with(char::is_whitespace) {
+            return &value[..=index];
+        }
+    }
+    value
+}
+
+fn truncate_at_word(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for word in value.split_whitespace() {
+        let next_len = output.chars().count() + usize::from(!output.is_empty()) + word.len();
+        if next_len > max_chars {
+            break;
+        }
+        if !output.is_empty() {
+            output.push(' ');
+        }
+        output.push_str(word);
+    }
+    output.trim_end_matches(['.', '!', '?']).to_string()
+}
+
 fn sentence_fragment(text: &str) -> String {
     text.trim().trim_end_matches(['.', '!', '?']).to_string()
 }
 
-fn offline_sync_path_signal(path: &str) -> bool {
-    contains_any(
-        &path.replace('\\', "/").to_ascii_lowercase(),
+fn credential_logging_finding(finding: &ReviewFinding) -> bool {
+    matches!(
+        finding.risk_code,
+        Some(RiskCode::SecretLeak | RiskCode::PiiOrSecretLogging)
+    ) && contains_any(
+        &finding_text(finding),
         &[
-            "sync", "offline", "queue", "retry", "cache", "pending", "recovery",
+            "authorization",
+            "header",
+            "token",
+            "password",
+            "cookie",
+            "credential",
         ],
-    )
+    ) && contains_any(&finding_text(finding), &["log", "logged", "logging"])
+}
+
+fn payload_logging_finding(finding: &ReviewFinding) -> bool {
+    finding.risk_code == Some(RiskCode::PiiOrSecretLogging)
+        && contains_any(
+            &format!(
+                "{} {}",
+                finding.file_path.as_deref().unwrap_or_default(),
+                finding_text(finding)
+            ),
+            &["payload", "webhook", "body", "log", "logged", "logging"],
+        )
+}
+
+fn local_data_wipe_finding(finding: &ReviewFinding) -> bool {
+    let text = format!(
+        "{} {}",
+        finding.file_path.as_deref().unwrap_or_default(),
+        finding_text(finding)
+    );
+    finding.risk_code == Some(RiskCode::DataIntegrityRisk)
+        && contains_any(
+            &text,
+            &["wipe", "wiping", "delete", "deletion", "clear local"],
+        )
+        && contains_any(
+            &text,
+            &["local data", "user data", "compromised", "security threat"],
+        )
 }
 
 fn contains_any(value: &str, terms: &[&str]) -> bool {
@@ -877,12 +737,13 @@ mod tests {
 
     #[test]
     fn generic_required_action_is_replaced_with_finding_specific_action() {
-        let analysis = analysis(vec![finding(
+        let analysis = analysis(vec![finding_with_fix(
             Severity::Medium,
             ReviewCategory::Security,
             Some(RiskCode::WeakErrorHandling),
             "MainActivity.kt",
             "Untrusted application warning is easily missed",
+            "Replace transient Toast-only untrusted-build warning with a persistent blocking error state.",
         )]);
         let sanitized = sanitize_merge_risk_assessment(
             &analysis,
@@ -911,40 +772,45 @@ mod tests {
     #[test]
     fn current_android_sample_regression() {
         let analysis = analysis(vec![
-            finding(
+            finding_with_fix(
                 Severity::Medium,
                 ReviewCategory::Security,
                 Some(RiskCode::SecretLeak),
                 "AndroidManifest.xml",
                 "Hardcoded Google Maps API key in android manifest",
+                "Move the Google Maps API key to build-time configuration or confirm package/SHA restrictions.",
             ),
-            finding(
+            finding_with_fix(
                 Severity::Medium,
                 ReviewCategory::Security,
                 Some(RiskCode::WeakErrorHandling),
                 "MainActivity.kt",
                 "Untrusted application warning is easily missed",
+                "Replace transient Toast-only untrusted-build warning with a persistent blocking error state.",
             ),
-            finding(
+            finding_with_fix(
                 Severity::Medium,
                 ReviewCategory::Security,
                 Some(RiskCode::WeakErrorHandling),
                 "AntiInstrumentationModule.kt",
                 "Security check fails silently",
+                "Surface or log native security check failures in AntiInstrumentationModule.kt.",
             ),
-            finding(
+            finding_with_fix(
                 Severity::Medium,
                 ReviewCategory::Security,
                 Some(RiskCode::WeakErrorHandling),
                 "AppSignatureVerifier.kt",
                 "Overly broad exception handling in signature verification",
+                "Log expected signature-verification exceptions without weakening fail-closed behavior.",
             ),
-            finding(
+            finding_with_fix(
                 Severity::Medium,
                 ReviewCategory::Reliability,
                 Some(RiskCode::PerformanceRegression),
                 "Profile/index.tsx",
                 "Logout relies on fixed timeout for WebView cleanup",
+                "Add monitoring or fallback behavior for WebView cleanup timeout during logout.",
             ),
         ]);
         let sanitized = sanitize_merge_risk_assessment(
@@ -979,7 +845,7 @@ mod tests {
         assert!(sanitized.blocking_issues.is_empty());
         assert!(!labels(&sanitized.required_before_merge)
             .contains(&"Add sync recovery test".to_string()));
-        assert!(labels(&sanitized.required_before_merge).contains(&"Confirm the Google Maps API key is package/SHA restricted or move it to build-time configuration.".to_string()));
+        assert!(labels(&sanitized.required_before_merge).contains(&"Move the Google Maps API key to build-time configuration or confirm package/SHA restrictions.".to_string()));
         assert!(labels(&sanitized.required_before_merge).contains(&"Replace transient Toast-only untrusted-build warning with a persistent blocking error state.".to_string()));
         assert!(labels(&sanitized.required_before_merge).contains(
             &"Surface or log native security check failures in AntiInstrumentationModule.kt."
@@ -1021,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_hard_blocker_with_path_evidence_remains_blocked() {
+    fn policy_hard_blocker_with_path_evidence_is_removed_for_now() {
         let sanitized = sanitize_merge_risk_assessment(
             &analysis(vec![]),
             MergeRiskAssessment {
@@ -1037,8 +903,8 @@ mod tests {
             },
         );
 
-        assert_eq!(sanitized.decision, MergeDecision::Blocked);
-        assert_eq!(sanitized.blocking_issues.len(), 1);
+        assert_eq!(sanitized.decision, MergeDecision::Pass);
+        assert!(sanitized.blocking_issues.is_empty());
     }
 
     #[test]
@@ -1075,6 +941,35 @@ mod tests {
         file_path: &str,
         title: &str,
     ) -> ReviewFinding {
+        finding_with_optional_fix(severity, category, risk_code, file_path, title, None)
+    }
+
+    fn finding_with_fix(
+        severity: Severity,
+        category: ReviewCategory,
+        risk_code: Option<RiskCode>,
+        file_path: &str,
+        title: &str,
+        suggested_fix: &str,
+    ) -> ReviewFinding {
+        finding_with_optional_fix(
+            severity,
+            category,
+            risk_code,
+            file_path,
+            title,
+            Some(suggested_fix),
+        )
+    }
+
+    fn finding_with_optional_fix(
+        severity: Severity,
+        category: ReviewCategory,
+        risk_code: Option<RiskCode>,
+        file_path: &str,
+        title: &str,
+        suggested_fix: Option<&str>,
+    ) -> ReviewFinding {
         ReviewFinding {
             severity,
             category,
@@ -1084,7 +979,7 @@ mod tests {
             line: Some(1),
             title: title.to_string(),
             body: title.to_string(),
-            suggested_fix: None,
+            suggested_fix: suggested_fix.map(str::to_string),
             effort: Effort::Moderate,
             actionable: true,
             evidence_status: Some(EvidenceValidationStatus::Validated),

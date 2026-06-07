@@ -121,7 +121,7 @@ fn summary_markdown_can_include_merge_risk_gate_near_top() {
     assert!(gate_index < summary_index);
     assert!(gate_index < findings_index);
     assert!(markdown.contains("Risk Score: 78/100"));
-    assert!(markdown.contains("Decision: BLOCKED"));
+    assert!(markdown.contains("Decision: NEEDS HUMAN"));
 }
 
 #[test]
@@ -129,40 +129,45 @@ fn final_markdown_sanitizes_medium_only_bad_risk_gate() {
     let analysis = ReviewAnalysis {
         summary: "Main risks found:\n- Modified offline sync layer without adding recovery test\n- Hardcoded Google Maps API key in AndroidManifest.xml".to_string(),
         findings: vec![
-            finding_with(
+            finding_with_fix(
                 Severity::Medium,
                 ReviewCategory::Security,
                 Some(RiskCode::SecretLeak),
                 "AndroidManifest.xml",
                 "Hardcoded Google Maps API key in android manifest",
+                "Move the Google Maps API key to build-time configuration or confirm package/SHA restrictions.",
             ),
-            finding_with(
+            finding_with_fix(
                 Severity::Medium,
                 ReviewCategory::Security,
                 Some(RiskCode::WeakErrorHandling),
                 "MainActivity.kt",
                 "Untrusted application warning is easily missed",
+                "Replace transient Toast-only untrusted-build warning with a persistent blocking error state.",
             ),
-            finding_with(
+            finding_with_fix(
                 Severity::Medium,
                 ReviewCategory::Security,
                 Some(RiskCode::WeakErrorHandling),
                 "AntiInstrumentationModule.kt",
                 "Security check fails silently",
+                "Surface or log native security check failures in `AntiInstrumentationModule.kt`.",
             ),
-            finding_with(
+            finding_with_fix(
                 Severity::Medium,
                 ReviewCategory::Security,
                 Some(RiskCode::WeakErrorHandling),
                 "AppSignatureVerifier.kt",
                 "Overly broad exception handling in signature verification",
+                "Log expected signature-verification exceptions without weakening fail-closed behavior.",
             ),
-            finding_with(
+            finding_with_fix(
                 Severity::Medium,
                 ReviewCategory::Reliability,
                 Some(RiskCode::PerformanceRegression),
                 "Profile/index.tsx",
                 "Logout relies on fixed timeout for WebView cleanup",
+                "Add monitoring or fallback behavior for WebView cleanup timeout during logout.",
             ),
         ],
         test_coverage_note: Some("Test coverage is insufficient.".to_string()),
@@ -227,7 +232,7 @@ fn final_markdown_sanitizes_medium_only_bad_risk_gate() {
     assert!(!markdown.contains("Modified offline sync layer"));
     assert!(!markdown.contains("Add sync recovery test"));
     assert!(!markdown.contains("Blocking Issues:"));
-    assert!(markdown.contains("Confirm the Google Maps API key is package/SHA restricted"));
+    assert!(markdown.contains("Move the Google Maps API key to build-time configuration"));
     assert!(markdown.contains("Replace transient Toast-only untrusted-build warning"));
     assert!(markdown.contains("Surface or log native security check failures"));
     assert!(markdown.contains("Log expected signature-verification exceptions"));
@@ -572,12 +577,31 @@ fn finding() -> ReviewFinding {
     }
 }
 
-fn finding_with(
+fn finding_with_fix(
     severity: Severity,
     category: ReviewCategory,
     risk_code: Option<RiskCode>,
     file_path: &str,
     title: &str,
+    suggested_fix: &str,
+) -> ReviewFinding {
+    finding_with_optional_fix(
+        severity,
+        category,
+        risk_code,
+        file_path,
+        title,
+        Some(suggested_fix),
+    )
+}
+
+fn finding_with_optional_fix(
+    severity: Severity,
+    category: ReviewCategory,
+    risk_code: Option<RiskCode>,
+    file_path: &str,
+    title: &str,
+    suggested_fix: Option<&str>,
 ) -> ReviewFinding {
     ReviewFinding {
         severity,
@@ -588,7 +612,7 @@ fn finding_with(
         line: Some(1),
         title: title.to_string(),
         body: title.to_string(),
-        suggested_fix: None,
+        suggested_fix: suggested_fix.map(str::to_string),
         effort: Effort::Moderate,
         actionable: true,
         evidence_status: Some(reviewgate::review::types::EvidenceValidationStatus::Validated),
