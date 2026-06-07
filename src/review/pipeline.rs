@@ -6,7 +6,7 @@ use crate::{
         anchors::AnchoredDiffContext,
         claims::{
             validate_finding_claim_against_current_file, validate_finding_claim_against_diff,
-            ClaimValidationResult, ClaimValidationVerdict,
+            ClaimEvidence, ClaimSupport,
         },
         comparison::ReviewComparison,
         evidence::validate_review_analysis_evidence,
@@ -246,58 +246,32 @@ pub fn format_quality_report_terminal(report: &QualityReport) -> String {
 
 fn apply_claim_validation(
     mut finding: ReviewFinding,
-    validation: ClaimValidationResult,
+    validation: ClaimEvidence,
 ) -> Option<ReviewFinding> {
-    match validation.verdict {
-        ClaimValidationVerdict::Valid => Some(finding),
-        ClaimValidationVerdict::Invalid => None,
-        ClaimValidationVerdict::PartiallyValid => {
-            let lower_reason = validation.reason.to_ascii_lowercase();
-            if lower_reason.contains("debug-only")
-                || lower_reason.contains("debug")
-                || lower_reason.contains("toctou")
-                || lower_reason.contains("symlink")
-                || lower_reason.contains("hardening")
-            {
-                downgrade_to(&mut finding, Severity::Low);
-            } else {
-                downgrade_to(&mut finding, Severity::Medium);
-            }
-            finding.evidence_status = Some(EvidenceValidationStatus::WeakEvidence);
+    match validation.support {
+        ClaimSupport::Strong => {
+            finding.evidence_status = Some(EvidenceValidationStatus::Validated);
             finding.evidence_reason = Some(format!("claim validation: {}", validation.reason));
-            rewrite_partially_valid_claim(&mut finding, &lower_reason);
             Some(finding)
         }
-        ClaimValidationVerdict::NeedsManualConfirmation => {
+        ClaimSupport::Partial => {
             finding.severity = match finding.severity {
                 Severity::Critical | Severity::High => Severity::Medium,
                 Severity::Medium => Severity::Low,
                 severity => severity,
             };
+            finding.evidence_status = Some(EvidenceValidationStatus::NeedsManualConfirmation);
+            finding.evidence_reason = Some(format!("claim validation: {}", validation.reason));
+            Some(finding)
+        }
+        ClaimSupport::Weak => {
+            downgrade_to(&mut finding, Severity::Low);
             finding.actionable = false;
             finding.evidence_status = Some(EvidenceValidationStatus::NeedsManualConfirmation);
             finding.evidence_reason = Some(format!("claim validation: {}", validation.reason));
             Some(finding)
         }
-    }
-}
-
-fn rewrite_partially_valid_claim(finding: &mut ReviewFinding, reason: &str) {
-    if reason.contains("debug") {
-        finding.title = "Debug-only configuration needs production-path confirmation".to_string();
-        finding.body = "The evidence does not prove this debug-only configuration affects production or release builds. Treat it as a low-severity hardening follow-up unless a production path is shown.".to_string();
-        finding.suggested_fix = Some(
-            "Confirm the configuration is excluded from release builds or document the production path before treating it as a blocker.".to_string(),
-        );
-    } else if reason.contains("toctou")
-        || reason.contains("symlink")
-        || reason.contains("hardening")
-    {
-        finding.title = "File cleanup symlink handling is a hardening follow-up".to_string();
-        finding.body = "Current evidence does not prove an exploitable TOCTOU/symlink deletion issue. Keep this as low-severity hardening unless attacker-controlled filesystem entries are in scope.".to_string();
-        finding.suggested_fix = Some(
-            "Preserve canonical root checks and consider non-following deletion APIs if the threat model includes attacker-controlled entries.".to_string(),
-        );
+        ClaimSupport::Contradicted | ClaimSupport::NotFound => None,
     }
 }
 
@@ -738,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn final_pipeline_quality_report_counts_dropped_and_downgraded() {
+    fn final_pipeline_quality_report_counts_dropped_unsupported_claims() {
         let output = run_review_quality_pipeline(input(vec![
             finding(
                 Severity::High,
@@ -758,7 +732,7 @@ mod tests {
         .unwrap();
 
         assert!(output.quality_report.dropped_findings >= 1);
-        assert!(output.quality_report.downgraded_findings >= 1);
+        assert_eq!(output.quality_report.final_priority_findings, 0);
     }
 
     #[test]

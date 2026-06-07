@@ -434,41 +434,6 @@ pub fn assess_merge_risk(
         );
         needs_human = true;
     }
-    let sync_changed_files = changed_files
-        .iter()
-        .filter(|path| offline_sync_path_signal(path) && !is_test_path(path))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !sync_changed_files.is_empty() {
-        let sync_evidence = sync_changed_files
-            .iter()
-            .map(|path| {
-                changed_file_evidence(
-                    "changed_file.offline_sync_area",
-                    path,
-                    "Changed file path matches offline sync/cache/queue/retry/recovery terms.",
-                )
-            })
-            .collect::<Vec<_>>();
-        builder.add(
-            15,
-            "changed_file.offline_sync_area",
-            "Offline sync, cache, queue, or retry area touched",
-            sync_evidence.clone(),
-        );
-        needs_human = true;
-        if !has_test_with_terms(
-            &changed_test_files,
-            &["sync", "offline", "recovery", "retry", "queue"],
-        ) {
-            builder.add(
-                25,
-                "changed_file.offline_sync_missing_recovery_test",
-                "Offline sync layer changed without recovery test",
-                sync_evidence.clone(),
-            );
-        }
-    }
     if any_path_or_diff_signal(diffs, &["payment", "billing", "money"]) {
         builder.add(
             20,
@@ -1241,15 +1206,6 @@ fn finding_file_path(finding: &ReviewFinding) -> String {
         .to_string()
 }
 
-fn offline_sync_path_signal(path: &str) -> bool {
-    contains_any(
-        &normalize_path(path),
-        &[
-            "sync", "offline", "queue", "retry", "cache", "pending", "recovery",
-        ],
-    )
-}
-
 fn is_source_behavior_path(path: &str) -> bool {
     let path = normalize_path(path);
     !path.is_empty()
@@ -1281,13 +1237,6 @@ fn test_matches_required_terms(path: &str, terms: &[String]) -> bool {
     terms
         .iter()
         .any(|term| path.contains(&term.to_ascii_lowercase()))
-}
-
-fn has_test_with_terms(paths: &[String], terms: &[&str]) -> bool {
-    paths.iter().any(|path| {
-        let path = normalize_path(path);
-        terms.iter().any(|term| path.contains(term))
-    })
 }
 
 fn contains_any(value: &str, terms: &[&str]) -> bool {
@@ -2142,7 +2091,7 @@ mod tests {
             RiskGateRunSignals::default(),
         );
 
-        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+        assert_eq!(assessment.decision, MergeDecision::Pass);
     }
 
     #[test]
@@ -2156,7 +2105,7 @@ mod tests {
         let markdown = format_merge_risk_gate_markdown(&assessment);
 
         assert!(markdown.starts_with("## Merge Risk Gate\n\nRisk Score: "));
-        assert!(markdown.contains("Decision: NEEDS HUMAN"));
+        assert!(markdown.contains("Decision: PASS"));
         assert!(!markdown.contains("Blocking Issues:"));
         assert!(!markdown.contains("Modified offline sync layer"));
         assert!(!markdown.contains("Add sync recovery test"));

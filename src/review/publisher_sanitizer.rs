@@ -93,8 +93,9 @@ pub fn sanitize_merge_risk_assessment(
 
 fn sanitize_review_analysis(mut analysis: ReviewAnalysis) -> ReviewAnalysis {
     analysis.summary = sanitize_summary(&analysis.summary, &analysis.findings);
-    analysis.test_coverage_note = sanitize_optional_note(analysis.test_coverage_note);
-    analysis.privacy_note = sanitize_optional_note(analysis.privacy_note);
+    analysis.test_coverage_note =
+        sanitize_optional_note(analysis.test_coverage_note, &analysis.findings);
+    analysis.privacy_note = sanitize_optional_note(analysis.privacy_note, &analysis.findings);
     analysis.findings.retain(renderable_final_finding);
     analysis
 }
@@ -114,7 +115,7 @@ fn sanitize_summary(summary: &str, findings: &[ReviewFinding]) -> String {
             }
             continue;
         }
-        if !contains_forbidden_hardcoded_text(trimmed) {
+        if !policy_template_without_finding_evidence(trimmed, findings) {
             output.push(trimmed.to_string());
         }
     }
@@ -126,12 +127,18 @@ fn sanitize_summary(summary: &str, findings: &[ReviewFinding]) -> String {
     }
 }
 
-fn sanitize_optional_note(note: Option<String>) -> Option<String> {
+fn sanitize_optional_note(note: Option<String>, findings: &[ReviewFinding]) -> Option<String> {
     note.map(|note| {
         note.lines()
             .filter(|line| {
                 let trimmed = line.trim();
-                !trimmed.is_empty() && !contains_forbidden_hardcoded_text(trimmed)
+                if trimmed.is_empty() {
+                    return false;
+                }
+                if is_bullet(trimmed) {
+                    return has_item_evidence(bullet_text(trimmed), findings);
+                }
+                !policy_template_without_finding_evidence(trimmed, findings)
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -283,8 +290,7 @@ fn specific_suggested_fix(fix: &str) -> bool {
                 | "handle this"
                 | "address this"
         )
-        && !lower.starts_with("handle the validated")
-        && !lower.contains("fix error handling so failures are not silently accepted")
+        && !generic_placeholder_fix(&lower)
 }
 
 fn high_blocking_finding(finding: &ReviewFinding) -> bool {
@@ -463,9 +469,6 @@ fn negative_positive_note_text(finding: &ReviewFinding) -> bool {
 }
 
 fn has_item_evidence(item: &str, findings: &[ReviewFinding]) -> bool {
-    if contains_forbidden_hardcoded_text(item) {
-        return false;
-    }
     let item = item.to_ascii_lowercase();
     findings.iter().any(|finding| {
         let path = finding
@@ -491,6 +494,35 @@ fn has_item_evidence(item: &str, findings: &[ReviewFinding]) -> bool {
     })
 }
 
+fn policy_template_without_finding_evidence(value: &str, findings: &[ReviewFinding]) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let looks_like_required_action = lower.starts_with("add ")
+        || lower.starts_with("fix ")
+        || lower.starts_with("handle ")
+        || lower.starts_with("request ")
+        || lower.starts_with("update ")
+        || lower.starts_with("attach ");
+    let looks_like_policy_finding = contains_any(
+        &lower,
+        &[
+            "without adding",
+            "without updating",
+            "without rollback",
+            "protected module",
+            "owner review",
+        ],
+    );
+    (looks_like_required_action || looks_like_policy_finding) && !has_item_evidence(value, findings)
+}
+
+fn generic_placeholder_fix(lower: &str) -> bool {
+    let words = lower.split_whitespace().collect::<Vec<_>>();
+    let mentions_validated_placeholder = words.contains(&"validated") && words.len() <= 8;
+    let generic_failure_acceptance =
+        words.contains(&"failures") && words.contains(&"silently") && words.len() <= 10;
+    mentions_validated_placeholder || generic_failure_acceptance
+}
+
 fn significant_words(value: &str) -> Vec<String> {
     value
         .split(|ch: char| !ch.is_ascii_alphanumeric())
@@ -503,20 +535,6 @@ fn significant_words(value: &str) -> Vec<String> {
                 )
         })
         .collect()
-}
-
-fn contains_forbidden_hardcoded_text(value: &str) -> bool {
-    [
-        "Modified offline sync",
-        "Add sync recovery test",
-        "Fix error handling so failures are not silently accepted",
-        "Handle the validated error-handling failure",
-        "Changed API response contract",
-        "Added DB migration",
-        "Touched protected module",
-    ]
-    .iter()
-    .any(|needle| value.contains(needle))
 }
 
 fn dedupe_gate_items(items: &mut Vec<RiskGateItem>) {

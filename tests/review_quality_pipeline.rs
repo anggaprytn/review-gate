@@ -233,7 +233,7 @@ fn positive_note_spam_and_privacy_contradictions_are_sanitized() {
 }
 
 #[test]
-fn offline_sync_true_positive_policy_case_needs_human_without_generic_blocker() {
+fn medium_data_integrity_finding_does_not_block_or_force_path_policy() {
     let mut input = input(vec![finding!(
         Severity::Medium,
         ReviewCategory::DataIntegrity,
@@ -257,7 +257,7 @@ fn offline_sync_true_positive_policy_case_needs_human_without_generic_blocker() 
     let output = run_review_quality_pipeline(input).unwrap();
     let markdown = render_markdown(&output);
 
-    assert_eq!(output.risk_assessment.decision, MergeDecision::NeedsHuman);
+    assert_eq!(output.risk_assessment.decision, MergeDecision::Pass);
     assert!(!markdown.contains("Modified offline sync layer without adding recovery test"));
     assert!(!markdown.contains("Add sync recovery test"));
     assert_final_markdown_invariants(&markdown);
