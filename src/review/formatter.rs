@@ -438,6 +438,7 @@ fn compact_positive_notes(findings: &[&ReviewFinding], limit: usize) -> Vec<Stri
             && finding.risk_code == Some(RiskCode::PositiveNote)
             && !finding.actionable
             && positive_note_language(finding)
+            && positive_note_safe_topic(finding)
             && !negative_positive_note_text(finding)
             && !matches!(
                 finding.evidence_status,
@@ -611,6 +612,9 @@ fn useful_note_items(text: &str, limit: usize, is_generic: impl Fn(&str) -> bool
     let mut items = Vec::new();
     for item in split_note_items(text) {
         let sentence = sentence_from_text(&item);
+        if !renderable_note_item(&sentence) {
+            continue;
+        }
         if is_generic(&sentence) {
             continue;
         }
@@ -637,7 +641,11 @@ fn split_note_items(text: &str) -> Vec<String> {
             continue;
         }
         for part in line.split(['.', '!', '?']) {
-            let part = part.trim();
+            let part = part
+                .trim()
+                .trim_start_matches('`')
+                .trim_end_matches('`')
+                .trim();
             if !part.is_empty() {
                 items.push(part.to_string());
             }
@@ -690,6 +698,26 @@ fn positive_note_language(finding: &ReviewFinding) -> bool {
     .any(|needle| text.contains(needle))
 }
 
+fn positive_note_safe_topic(finding: &ReviewFinding) -> bool {
+    let text = finding_text(finding);
+    [
+        "added test",
+        "added unit test",
+        "tests added",
+        "test was added",
+        "coverage improved",
+        "input validation coverage",
+        "redaction",
+        "redacted",
+        "cleanup improved",
+        "secure storage",
+        "storage improved",
+        "screen security",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 fn negative_positive_note_text(finding: &ReviewFinding) -> bool {
     contains_any_text(
         &finding_text(finding),
@@ -711,6 +739,9 @@ fn negative_positive_note_text(finding: &ReviewFinding) -> bool {
             "fail",
             "error",
             "unsafe",
+            "debug code",
+            "commented-out",
+            "commented out",
         ],
     )
 }
@@ -856,6 +887,10 @@ fn is_positive_privacy_item(item: &str) -> bool {
         "cleanup",
         "sensitive",
         "secure",
+        "improve privacy",
+        "improves privacy",
+        "privacy by moving",
+        "temporary files",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -901,6 +936,67 @@ fn sanitize_privacy_item(item: &str) -> String {
             .to_string();
     }
     sentence_from_text(&cleaned)
+}
+
+fn renderable_note_item(item: &str) -> bool {
+    let trimmed = item.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if !trimmed.matches('`').count().is_multiple_of(2) {
+        return false;
+    }
+    let without_punctuation = trimmed
+        .trim_end_matches(|ch: char| ch.is_ascii_punctuation() || ch.is_whitespace())
+        .to_ascii_lowercase();
+    if without_punctuation.ends_with(" in") {
+        return false;
+    }
+    let words = trimmed
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| {
+            let lower = word.to_ascii_lowercase();
+            lower.len() > 1
+                && !matches!(
+                    lower.as_str(),
+                    "the" | "a" | "an" | "and" | "or" | "to" | "of" | "in" | "for" | "with"
+                )
+        })
+        .collect::<Vec<_>>();
+    if words.len() < 5
+        && !is_positive_test_coverage_item(trimmed)
+        && !is_positive_privacy_item(trimmed)
+    {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    [
+        " is ",
+        " are ",
+        " was ",
+        " were ",
+        " has ",
+        " have ",
+        " had ",
+        " need",
+        " should ",
+        " add ",
+        " added",
+        " cover",
+        " test",
+        " detect",
+        " handle",
+        " introduc",
+        " log",
+        " improve",
+        " move",
+        " remov",
+        " redact",
+        " cleanup",
+        " wipe",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn scrub_confidence_from_raw_text(value: &str) -> String {
@@ -1228,6 +1324,28 @@ mod tests {
     }
 
     #[test]
+    fn compact_test_coverage_drops_malformed_fragments() {
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![],
+                test_coverage_note: Some(
+                    "The core native security features in DeviceIntegrityModule.` Upload cleanup needs regression tests."
+                        .to_string(),
+                ),
+                privacy_note: None,
+                overall_risk: OverallRisk::Low,
+            },
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        let section = markdown_section(&markdown, "## Test Coverage");
+
+        assert!(!section.contains("The core native security features in DeviceIntegrityModule"));
+        assert!(section.contains("- Upload cleanup needs regression tests."));
+    }
+
+    #[test]
     fn compact_test_coverage_reports_only_generic_no_tests_once() {
         let markdown = format_review_markdown_for_mode_with_emoji(
             &ReviewAnalysis {
@@ -1315,6 +1433,30 @@ mod tests {
     }
 
     #[test]
+    fn privacy_positive_improvement_is_not_rendered_as_risk() {
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![],
+                test_coverage_note: None,
+                privacy_note: Some(
+                    "The changes improve privacy by moving temporary files into cache-backed cleanup paths."
+                        .to_string(),
+                ),
+                overall_risk: OverallRisk::Low,
+            },
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        let section = markdown_section(&markdown, "## Privacy");
+
+        assert!(section
+            .starts_with("No obvious new PII or secret exposure detected in reviewed chunks."));
+        assert!(section.contains("Privacy-positive changes:"));
+        assert!(!section.contains("Privacy risks:"));
+    }
+
+    #[test]
     fn positive_notes_exclude_negative_security_text() {
         let mut bad_note = finding(Severity::Note, "Secret access token is logged");
         bad_note.risk_code = Some(RiskCode::PositiveNote);
@@ -1338,6 +1480,32 @@ mod tests {
 
         assert!(!section.contains("Secret access token is logged."));
         assert!(section.contains("Input validation coverage improved."));
+    }
+
+    #[test]
+    fn positive_notes_exclude_commented_out_debug_code() {
+        let mut bad_note = finding(Severity::Note, "Commented-out debug code");
+        bad_note.risk_code = Some(RiskCode::PositiveNote);
+        bad_note.actionable = false;
+        let mut good_note = finding(Severity::Note, "Test coverage improved");
+        good_note.risk_code = Some(RiskCode::PositiveNote);
+        good_note.actionable = false;
+
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![bad_note, good_note],
+                test_coverage_note: None,
+                privacy_note: None,
+                overall_risk: OverallRisk::Low,
+            },
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        let section = markdown_section(&markdown, "## Low / Notes");
+
+        assert!(!section.contains("Commented-out debug code."));
+        assert!(section.contains("Test coverage improved."));
     }
 
     #[test]

@@ -11,7 +11,10 @@ use reviewgate::{
             format_review_markdown_for_mode_with_risk_gate, format_review_markdown_with_emoji,
             MarkdownRenderMode,
         },
-        risk::{BlastRadius, MergeDecision, MergeRiskAssessment, RiskFactor},
+        risk::{
+            BlastRadius, MergeDecision, MergeRiskAssessment, RiskEvidence, RiskEvidenceSource,
+            RiskFactor, RiskGateItem,
+        },
         types::{
             Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, RiskCode, Severity,
         },
@@ -76,18 +79,30 @@ fn inline_output_keeps_attribution_and_hidden_marker() {
 
 #[test]
 fn summary_markdown_can_include_merge_risk_gate_near_top() {
+    let sync_evidence = vec![RiskEvidence {
+        source: RiskEvidenceSource::ChangedFile,
+        file_path: Some("src/features/sync/offlineQueue.ts".to_string()),
+        finding_id: None,
+        risk_code: None,
+        rule_id: "changed_file.offline_sync_missing_recovery_test".to_string(),
+        description: "Changed file path matches offline sync evidence.".to_string(),
+    }];
     let assessment = MergeRiskAssessment {
         score: 78,
         decision: MergeDecision::Blocked,
-        blocking_issues: vec![
-            "Modified offline sync layer without adding recovery test".to_string()
-        ],
-        required_before_merge: vec!["Add sync recovery test".to_string()],
+        blocking_issues: vec![RiskGateItem {
+            label: "Modified offline sync layer without adding recovery test".to_string(),
+            evidence: sync_evidence.clone(),
+        }],
+        required_before_merge: vec![RiskGateItem {
+            label: "Add sync recovery test".to_string(),
+            evidence: sync_evidence.clone(),
+        }],
         risk_factors: vec![RiskFactor {
             rule_id: "changed_file.offline_sync_missing_recovery_test".to_string(),
             label: "Offline sync layer changed without recovery test".to_string(),
             score: 25,
-            evidence: vec![],
+            evidence: sync_evidence,
             points: 25,
         }],
         blast_radius: BlastRadius::default(),
