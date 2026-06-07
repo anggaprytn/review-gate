@@ -1,4 +1,5 @@
 pub mod anchors;
+pub mod claims;
 pub mod comparison;
 pub mod current_file;
 pub mod engine;
@@ -8,6 +9,7 @@ pub mod inline;
 pub mod large;
 pub mod mode;
 pub mod parser;
+pub mod pipeline;
 pub mod prompt;
 pub mod publisher_sanitizer;
 pub mod qa;

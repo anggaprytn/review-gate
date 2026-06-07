@@ -1378,6 +1378,7 @@ mod tests {
             parsed: true,
             analysis: Some(analysis),
             large_report: None,
+            quality_report: None,
         };
 
         storage
@@ -2088,6 +2089,7 @@ mod tests {
                 overall_risk: OverallRisk::High,
             }),
             large_report: None,
+            quality_report: None,
         }
     }
 

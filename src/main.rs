@@ -23,7 +23,7 @@ use reviewgate::gitlab::publish::{
     build_qa_checklist_note_body, build_summary_note_body, build_verification_note_body,
     publish_summary_with,
 };
-use reviewgate::gitlab::types::{DiffRefs, PublishAction, PublishResult};
+use reviewgate::gitlab::types::{DiffRefs, MergeRequestDiff, PublishAction, PublishResult};
 use reviewgate::gitlab::url::GitLabMrUrl;
 use reviewgate::llm::types::LlmProvider;
 use reviewgate::llm::types::LlmRunMetadata;
@@ -41,8 +41,7 @@ use reviewgate::review::current_file::{
 use reviewgate::review::engine::{
     build_sanitized_review_prompt, review_prompt_with_llm_for_mode, ReviewPreview,
 };
-use reviewgate::review::evidence::validate_review_analysis_evidence;
-use reviewgate::review::formatter::{format_review_markdown_for_mode, MarkdownRenderMode};
+use reviewgate::review::formatter::MarkdownRenderMode;
 use reviewgate::review::inline::{
     format_inline_dry_run_report, resolve_inline_candidates_with_anchors,
 };
@@ -55,12 +54,11 @@ use reviewgate::review::mode::{
     build_auto_review_plan, decide_auto_review_mode, AutoLargeOptions, AutoReviewDecision,
     ReviewMode, SelectedReviewMode,
 };
-use reviewgate::review::publisher_sanitizer::sanitize_merge_risk_assessment;
-use reviewgate::review::qa::format_qa_checklist;
-use reviewgate::review::quality::normalize_review_analysis;
-use reviewgate::review::risk::{
-    assess_merge_risk, format_merge_risk_gate_terminal, MergeRiskAssessment, RiskGateRunSignals,
+use reviewgate::review::pipeline::{
+    format_quality_report_terminal, run_review_quality_pipeline, ReviewQualityPipelineInput,
 };
+use reviewgate::review::qa::format_qa_checklist;
+use reviewgate::review::risk::{format_merge_risk_gate_terminal, MergeRiskAssessment};
 use reviewgate::storage::{PersistedReviewRun, Storage};
 use reviewgate::verify::{
     no_previous_run_message, verification_prompt_with_llm, VerificationPreview,
@@ -578,18 +576,27 @@ async fn run_large_review(
         let mut preview = preview;
         preview =
             validate_preview_current_file(preview, &context, &config, &gitlab, render_mode).await;
+        let _ = apply_review_quality_pipeline_to_preview(
+            &mut preview,
+            &context,
+            &diffs,
+            &config,
+            render_mode,
+            None,
+        )?;
         let (persisted, comparison) =
             persist_review_run_and_apply_comparison(storage, &context, &config, &mut preview);
-        let risk_assessment = refresh_preview_risk_gate(
+        let risk_assessment = apply_review_quality_pipeline_to_preview(
             &mut preview,
             &context,
             &diffs,
             &config,
             render_mode,
             comparison.as_ref(),
-        );
+        )?;
         println!("{}", preview.markdown);
         print_merge_risk_gate(risk_assessment.as_ref());
+        print_quality_report(&preview);
         print_finding_counters(&preview);
         print_review_comparison(comparison.as_ref());
         print_run_metadata(
@@ -643,16 +650,24 @@ async fn publish_review_preview(
         MarkdownRenderMode::Publish,
     )
     .await;
+    let _ = apply_review_quality_pipeline_to_preview(
+        &mut preview,
+        context,
+        diffs,
+        config,
+        MarkdownRenderMode::Publish,
+        None,
+    )?;
     let (persisted, comparison) =
         persist_review_run_and_apply_comparison(storage, context, config, &mut preview);
-    let risk_assessment = refresh_preview_risk_gate(
+    let risk_assessment = apply_review_quality_pipeline_to_preview(
         &mut preview,
         context,
         diffs,
         config,
         MarkdownRenderMode::Publish,
         comparison.as_ref(),
-    );
+    )?;
 
     let body = build_summary_note_body(
         &preview.markdown,
@@ -686,6 +701,7 @@ async fn publish_review_preview(
 
     print_publish_result(&result, options.publish_inline, options.inline_dry_run);
     print_merge_risk_gate(risk_assessment.as_ref());
+    print_quality_report(&preview);
     print_finding_counters(&preview);
     print_review_comparison(comparison.as_ref());
     if options.publish_qa {
@@ -921,19 +937,28 @@ async fn print_preview(
         MarkdownRenderMode::Preview,
     )
     .await;
+    let _ = apply_review_quality_pipeline_to_preview(
+        &mut preview,
+        context,
+        diffs,
+        config,
+        MarkdownRenderMode::Preview,
+        None,
+    )?;
     let (persisted, comparison) =
         persist_review_run_and_apply_comparison(storage, context, config, &mut preview);
-    let risk_assessment = refresh_preview_risk_gate(
+    let risk_assessment = apply_review_quality_pipeline_to_preview(
         &mut preview,
         context,
         diffs,
         config,
         MarkdownRenderMode::Preview,
         comparison.as_ref(),
-    );
+    )?;
 
     println!("{}", preview.markdown);
     print_merge_risk_gate(risk_assessment.as_ref());
+    print_quality_report(&preview);
     print_finding_counters(&preview);
     print_review_comparison(comparison.as_ref());
     print_run_metadata(
@@ -974,57 +999,45 @@ async fn generate_preview(
     })
     .await?;
 
-    Ok(validate_preview_evidence(
-        preview,
-        &context.anchored_diff,
-        mode,
-    ))
+    Ok(preview)
 }
 
-fn validate_preview_evidence(
-    mut preview: ReviewPreview,
-    anchors: &reviewgate::review::anchors::AnchoredDiffContext,
-    mode: MarkdownRenderMode,
-) -> ReviewPreview {
-    let Some(analysis) = preview.analysis.take() else {
-        return preview;
-    };
-    let analysis = validate_review_analysis_evidence(analysis, anchors);
-    preview.markdown = format_review_markdown_for_mode(&analysis, mode);
-    preview.analysis = Some(analysis);
-    preview
-}
-
-fn refresh_preview_risk_gate(
+fn apply_review_quality_pipeline_to_preview(
     preview: &mut ReviewPreview,
     context: &MergeRequestContext,
-    diffs: &[reviewgate::gitlab::types::MergeRequestDiff],
+    diffs: &[MergeRequestDiff],
     config: &AppConfig,
     mode: MarkdownRenderMode,
     comparison: Option<&ReviewComparison>,
-) -> Option<MergeRiskAssessment> {
-    if !config.risk_gate.enabled {
-        return None;
-    }
-    let analysis = preview.analysis.as_ref()?;
-    let assessment = assess_merge_risk(
+) -> Result<Option<MergeRiskAssessment>> {
+    let Some(analysis) = preview.analysis.take() else {
+        return Ok(None);
+    };
+    let previous_quality_report = preview.quality_report.clone();
+    let output = run_review_quality_pipeline(ReviewQualityPipelineInput {
         analysis,
-        diffs,
-        &context.stats,
-        &config.risk_gate,
-        RiskGateRunSignals {
-            large_review: preview.large_report.as_ref(),
-            comparison,
-        },
-    );
-    let assessment = sanitize_merge_risk_assessment(analysis, assessment);
-    let render_assessment = config.risk_gate.publish.then_some(&assessment);
+        changed_files: changed_file_paths(diffs),
+        diff_context: Some(context.anchored_diff.clone()),
+        current_file_provider: None,
+        comparison: comparison.cloned(),
+        large_review_stats: preview.large_report.clone(),
+        config: config.review.clone(),
+        risk_gate_config: config.risk_gate.enabled.then_some(config.risk_gate.clone()),
+        diffs: diffs.to_vec(),
+        diff_stats: Some(context.stats.clone()),
+    })?;
+    let assessment = output.risk_assessment;
+    let render_assessment =
+        (config.risk_gate.enabled && config.risk_gate.publish).then_some(&assessment);
     preview.markdown = match preview.large_report.as_ref() {
-        Some(report) => {
-            format_large_review_markdown_with_risk_gate(analysis, report, mode, render_assessment)
-        }
+        Some(report) => format_large_review_markdown_with_risk_gate(
+            &output.analysis,
+            report,
+            mode,
+            render_assessment,
+        ),
         None => reviewgate::review::formatter::format_review_markdown_for_mode_with_risk_gate(
-            analysis,
+            &output.analysis,
             mode,
             emoji_enabled(),
             render_assessment,
@@ -1033,8 +1046,14 @@ fn refresh_preview_risk_gate(
     if let Some(comparison) = comparison {
         preview.markdown = insert_comparison_section(&preview.markdown, comparison);
     }
+    preview.analysis = Some(output.analysis);
+    preview.quality_report = if comparison.is_some() {
+        previous_quality_report.or(Some(output.quality_report))
+    } else {
+        Some(output.quality_report)
+    };
 
-    Some(assessment)
+    Ok(config.risk_gate.enabled.then_some(assessment))
 }
 
 async fn validate_preview_current_file(
@@ -1082,8 +1101,7 @@ async fn validate_preview_current_file(
         },
     )
     .await;
-    let analysis = normalize_review_analysis(analysis);
-    preview.markdown = format_review_markdown_for_mode(&analysis, mode);
+    let _ = mode;
     preview.analysis = Some(analysis);
     preview
 }
@@ -1586,6 +1604,14 @@ fn print_merge_risk_gate(assessment: Option<&MergeRiskAssessment>) {
     };
     println!();
     print!("{}", format_merge_risk_gate_terminal(assessment));
+}
+
+fn print_quality_report(preview: &ReviewPreview) {
+    let Some(report) = preview.quality_report.as_ref() else {
+        return;
+    };
+    println!();
+    print!("{}", format_quality_report_terminal(report));
 }
 
 fn print_storage_open_warning(outcome: &reviewgate::storage::StorageOpenOutcome) {

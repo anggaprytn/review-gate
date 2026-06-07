@@ -663,6 +663,7 @@ where
         parsed: true,
         analysis: Some(analysis),
         large_report: Some(report),
+        quality_report: None,
     })
 }
 

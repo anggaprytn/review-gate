@@ -8,6 +8,7 @@ use crate::{
         },
         large::LargeReviewReport,
         parser::parse_review_analysis,
+        pipeline::QualityReport,
         prompt::build_review_prompt,
         quality::normalize_review_analysis,
         types::ReviewAnalysis,
@@ -23,6 +24,7 @@ pub struct ReviewPreview {
     pub parsed: bool,
     pub analysis: Option<ReviewAnalysis>,
     pub large_report: Option<LargeReviewReport>,
+    pub quality_report: Option<QualityReport>,
 }
 
 pub fn build_sanitized_review_prompt(context: &MergeRequestContext) -> String {
@@ -51,9 +53,9 @@ where
 
     let (markdown, parsed, analysis) = match parse_review_analysis(&llm_response.text) {
         Ok(analysis) => {
-            let analysis = normalize_review_analysis(analysis);
+            let render_analysis = normalize_review_analysis(analysis.clone());
             (
-                format_review_markdown_for_mode(&analysis, mode),
+                format_review_markdown_for_mode(&render_analysis, mode),
                 true,
                 Some(analysis),
             )
@@ -72,6 +74,7 @@ where
         parsed,
         analysis,
         large_report: None,
+        quality_report: None,
     })
 }
 
