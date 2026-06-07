@@ -125,6 +125,118 @@ fn summary_markdown_can_include_merge_risk_gate_near_top() {
 }
 
 #[test]
+fn final_markdown_sanitizes_medium_only_bad_risk_gate() {
+    let analysis = ReviewAnalysis {
+        summary: "Main risks found:\n- Modified offline sync layer without adding recovery test\n- Hardcoded Google Maps API key in AndroidManifest.xml".to_string(),
+        findings: vec![
+            finding_with(
+                Severity::Medium,
+                ReviewCategory::Security,
+                Some(RiskCode::SecretLeak),
+                "AndroidManifest.xml",
+                "Hardcoded Google Maps API key in android manifest",
+            ),
+            finding_with(
+                Severity::Medium,
+                ReviewCategory::Security,
+                Some(RiskCode::WeakErrorHandling),
+                "MainActivity.kt",
+                "Untrusted application warning is easily missed",
+            ),
+            finding_with(
+                Severity::Medium,
+                ReviewCategory::Security,
+                Some(RiskCode::WeakErrorHandling),
+                "AntiInstrumentationModule.kt",
+                "Security check fails silently",
+            ),
+            finding_with(
+                Severity::Medium,
+                ReviewCategory::Security,
+                Some(RiskCode::WeakErrorHandling),
+                "AppSignatureVerifier.kt",
+                "Overly broad exception handling in signature verification",
+            ),
+            finding_with(
+                Severity::Medium,
+                ReviewCategory::Reliability,
+                Some(RiskCode::PerformanceRegression),
+                "Profile/index.tsx",
+                "Logout relies on fixed timeout for WebView cleanup",
+            ),
+        ],
+        test_coverage_note: Some("Test coverage is insufficient.".to_string()),
+        privacy_note: Some("Temporary files were moved to cache-backed storage.".to_string()),
+        overall_risk: OverallRisk::Medium,
+    };
+    let assessment = MergeRiskAssessment {
+        score: 100,
+        decision: MergeDecision::Blocked,
+        blocking_issues: vec![RiskGateItem {
+            label: "Modified offline sync layer without adding recovery test".to_string(),
+            evidence: vec![RiskEvidence {
+                source: RiskEvidenceSource::ChangedFile,
+                file_path: Some("Profile/index.tsx".to_string()),
+                finding_id: None,
+                risk_code: None,
+                rule_id: "changed_file.offline_sync_missing_recovery_test".to_string(),
+                description: "bad fallback".to_string(),
+            }],
+        }],
+        required_before_merge: vec![RiskGateItem {
+            label: "Add sync recovery test".to_string(),
+            evidence: vec![RiskEvidence {
+                source: RiskEvidenceSource::ChangedFile,
+                file_path: Some("Profile/index.tsx".to_string()),
+                finding_id: None,
+                risk_code: None,
+                rule_id: "changed_file.offline_sync_missing_recovery_test".to_string(),
+                description: "bad fallback".to_string(),
+            }],
+        }],
+        risk_factors: vec![RiskFactor {
+            rule_id: "verification.large_review.failed_chunks".to_string(),
+            label: "Large MR review was partial or high-risk files were prioritized.".to_string(),
+            score: 16,
+            evidence: vec![RiskEvidence {
+                source: RiskEvidenceSource::Verification,
+                file_path: None,
+                finding_id: None,
+                risk_code: None,
+                rule_id: "verification.large_review.failed_chunks".to_string(),
+                description: "1 review chunk failed.".to_string(),
+            }],
+            points: 16,
+        }],
+        blast_radius: BlastRadius {
+            failed_chunks: 1,
+            ..BlastRadius::default()
+        },
+    };
+
+    let markdown = format_review_markdown_for_mode_with_risk_gate(
+        &analysis,
+        MarkdownRenderMode::Publish,
+        false,
+        Some(&assessment),
+    );
+
+    assert!(markdown.contains("Risk Score: 56/100"));
+    assert!(markdown.contains("Decision: NEEDS HUMAN"));
+    assert!(!markdown.contains("Risk Score: 100/100"));
+    assert!(!markdown.contains("Modified offline sync layer"));
+    assert!(!markdown.contains("Add sync recovery test"));
+    assert!(!markdown.contains("Blocking Issues:"));
+    assert!(markdown.contains("Confirm the Google Maps API key is package/SHA restricted"));
+    assert!(markdown.contains("Replace transient Toast-only untrusted-build warning"));
+    assert!(markdown.contains("Surface or log native security check failures"));
+    assert!(markdown.contains("Log expected signature-verification exceptions"));
+    assert!(markdown.contains("Add monitoring or fallback behavior for WebView cleanup timeout"));
+    assert!(markdown.contains(REVIEWGATE_ATTRIBUTION));
+    assert!(!markdown.contains("reviewgate:inline"));
+}
+
+#[test]
 fn verification_output_keeps_attribution_and_hidden_marker() {
     let markdown = format_verification_markdown(
         &VerificationOutcome {
@@ -456,6 +568,30 @@ fn finding() -> ReviewFinding {
         effort: Effort::Quick,
         actionable: true,
         evidence_status: None,
+        evidence_reason: None,
+    }
+}
+
+fn finding_with(
+    severity: Severity,
+    category: ReviewCategory,
+    risk_code: Option<RiskCode>,
+    file_path: &str,
+    title: &str,
+) -> ReviewFinding {
+    ReviewFinding {
+        severity,
+        category,
+        risk_code,
+        anchor_id: None,
+        file_path: Some(file_path.to_string()),
+        line: Some(1),
+        title: title.to_string(),
+        body: title.to_string(),
+        suggested_fix: None,
+        effort: Effort::Moderate,
+        actionable: true,
+        evidence_status: Some(reviewgate::review::types::EvidenceValidationStatus::Validated),
         evidence_reason: None,
     }
 }

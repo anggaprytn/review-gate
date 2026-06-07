@@ -3,6 +3,7 @@ use crate::{
     counters::{count_findings_from_analysis, emoji_enabled, format_finding_counters_markdown},
     review::{
         parser::ReviewParseError,
+        publisher_sanitizer::{sanitize_review_report, ReviewReport},
         risk::{format_merge_risk_gate_markdown, MergeRiskAssessment},
         types::{EvidenceValidationStatus, ReviewAnalysis, ReviewFinding, RiskCode, Severity},
     },
@@ -45,6 +46,12 @@ pub fn format_review_markdown_for_mode_with_risk_gate(
     emoji: bool,
     risk_assessment: Option<&MergeRiskAssessment>,
 ) -> String {
+    let report = sanitize_review_report(ReviewReport {
+        analysis: analysis.clone(),
+        risk_assessment: risk_assessment.cloned(),
+    });
+    let analysis = &report.analysis;
+    let risk_assessment = report.risk_assessment.as_ref();
     let sorted_findings = sorted_findings(&analysis.findings);
     let sorted_findings = match mode {
         MarkdownRenderMode::Preview => sorted_findings,
@@ -502,17 +509,13 @@ fn format_test_coverage_note(
 
     let text = note.unwrap_or_default();
     let raw_items = split_note_items(text);
-    let has_generic_no_tests = raw_items
+    let _has_generic_no_tests = raw_items
         .iter()
         .map(|item| sentence_from_text(item))
         .any(|item| is_generic_no_tests_item(&item));
     let items = useful_note_items(text, 8, is_generic_test_coverage_item);
     if items.is_empty() {
-        return if has_generic_no_tests {
-            "ReviewGate did not find visible tests for the reviewed high-risk changes.".to_string()
-        } else {
-            "No specific test coverage gaps were detected from the reviewed diff.".to_string()
-        };
+        return "No specific test coverage gaps were detected from the reviewed diff.".to_string();
     }
 
     let mut gaps = Vec::new();
@@ -561,10 +564,23 @@ fn format_privacy_note(
     }
 
     let privacy_risk_detected = has_validated_privacy_risk_finding(&analysis.findings);
+    let mut finding_risks = privacy_risks_from_findings(&analysis.findings);
     let items = useful_note_items(note.unwrap_or_default(), 8, is_generic_privacy_item);
     if items.is_empty() {
         return if privacy_risk_detected {
-            "Potential privacy risks were detected in reviewed chunks.".to_string()
+            if finding_risks.is_empty() {
+                "Potential privacy risks were detected in reviewed chunks.".to_string()
+            } else {
+                let mut output =
+                    "Potential privacy risks were detected in reviewed chunks.\n\nPrivacy risks:\n"
+                        .to_string();
+                for risk in finding_risks.into_iter().take(3) {
+                    output.push_str("- ");
+                    output.push_str(&risk);
+                    output.push('\n');
+                }
+                output.trim_end().to_string()
+            }
         } else {
             "No obvious new PII or secret exposure detected in reviewed chunks.".to_string()
         };
@@ -581,6 +597,8 @@ fn format_privacy_note(
             risks.push(sanitize_privacy_item(&item));
         }
     }
+    finding_risks.append(&mut risks);
+    let risks = finding_risks;
 
     let mut output = if privacy_risk_detected || !risks.is_empty() {
         "Potential privacy risks were detected in reviewed chunks.".to_string()
@@ -762,6 +780,19 @@ fn concrete_coverage_gaps(findings: &[ReviewFinding]) -> Vec<String> {
         );
     }
     if validated.iter().any(|finding| {
+        finding.risk_code == Some(RiskCode::SecretLeak)
+            && contains_any_text(
+                &format!(
+                    "{} {}",
+                    finding.file_path.as_deref().unwrap_or_default(),
+                    finding_text(finding)
+                ),
+                &["google maps", "maps api key", "androidmanifest.xml"],
+            )
+    }) {
+        gaps.push("Add a release/configuration check proving the Google Maps API key is package/SHA restricted.".to_string());
+    }
+    if validated.iter().any(|finding| {
         matches!(
             finding.risk_code,
             Some(RiskCode::SecretLeak | RiskCode::PiiOrSecretLogging)
@@ -785,6 +816,45 @@ fn concrete_coverage_gaps(findings: &[ReviewFinding]) -> Vec<String> {
     }) {
         gaps.push("Add a test for malformed webhook JSON handling.".to_string());
     }
+    if validated.iter().any(|finding| {
+        finding.risk_code == Some(RiskCode::WeakErrorHandling)
+            && contains_any_text(
+                &format!(
+                    "{} {}",
+                    finding.file_path.as_deref().unwrap_or_default(),
+                    finding_text(finding)
+                ),
+                &[
+                    "antiinstrumentation",
+                    "native security",
+                    "security check",
+                    "signature verification",
+                    "broad exception",
+                ],
+            )
+    }) {
+        gaps.push("Add a test for security module failure handling.".to_string());
+    }
+    if validated.iter().any(|finding| {
+        finding.risk_code == Some(RiskCode::DataIntegrityRisk)
+            && contains_any_text(&finding_text(finding), &["wipe", "delete", "local data"])
+    }) {
+        gaps.push("Add a regression test for local data wipe behavior.".to_string());
+    }
+    if validated.iter().any(|finding| {
+        contains_any_text(
+            &format!(
+                "{} {}",
+                finding.file_path.as_deref().unwrap_or_default(),
+                finding_text(finding)
+            ),
+            &["webview", "logout", "fixed timeout", "cleanup timeout"],
+        )
+    }) {
+        gaps.push(
+            "Add a test or monitor for WebView cleanup timeout behavior during logout.".to_string(),
+        );
+    }
 
     gaps
 }
@@ -797,6 +867,66 @@ fn has_validated_privacy_risk_finding(findings: &[ReviewFinding]) -> bool {
                 Some(RiskCode::SecretLeak | RiskCode::PiiOrSecretLogging)
             )
     })
+}
+
+fn privacy_risks_from_findings(findings: &[ReviewFinding]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut risks = Vec::new();
+    for finding in findings.iter().filter(|finding| {
+        validated_finding(finding)
+            && matches!(
+                finding.risk_code,
+                Some(RiskCode::SecretLeak | RiskCode::PiiOrSecretLogging)
+            )
+    }) {
+        let text = format!(
+            "{} {}",
+            finding.file_path.as_deref().unwrap_or_default(),
+            finding_text(finding)
+        );
+        let risk = if finding.risk_code == Some(RiskCode::SecretLeak)
+            && contains_any_text(
+                &text,
+                &["google maps", "maps api key", "androidmanifest.xml"],
+            ) {
+            "Hardcoded Google Maps API key exposure in AndroidManifest.xml.".to_string()
+        } else if contains_any_text(
+            &text,
+            &[
+                "credential",
+                "token",
+                "password",
+                "cookie",
+                "authorization",
+                "header",
+            ],
+        ) && contains_any_text(&text, &["log", "logged", "logging"])
+        {
+            format!(
+                "Credential or token logging risk in {}.",
+                finding
+                    .file_path
+                    .as_deref()
+                    .filter(|path| !path.trim().is_empty())
+                    .unwrap_or("the reviewed diff")
+            )
+        } else {
+            format!(
+                "{} in {}.",
+                finding.title.trim_end_matches('.'),
+                finding
+                    .file_path
+                    .as_deref()
+                    .filter(|path| !path.trim().is_empty())
+                    .unwrap_or("the reviewed diff")
+            )
+        };
+        let key = normalize_sentence_key(&risk);
+        if seen.insert(key) {
+            risks.push(risk);
+        }
+    }
+    risks
 }
 
 fn validated_finding(finding: &ReviewFinding) -> bool {
@@ -825,6 +955,9 @@ fn is_generic_test_coverage_item(item: &str) -> bool {
     let lower = item.to_ascii_lowercase();
     is_generic_no_tests_item(item)
         || lower.contains("cannot be assessed")
+        || lower.contains("test coverage insufficient")
+        || lower.contains("test coverage is insufficient")
+        || lower.contains("no tests visible in this chunk")
         || lower.contains("should be thoroughly tested")
         || lower == "recommended to add tests."
         || lower == "add tests."
@@ -1346,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_test_coverage_reports_only_generic_no_tests_once() {
+    fn compact_test_coverage_drops_generic_no_tests_text() {
         let markdown = format_review_markdown_for_mode_with_emoji(
             &ReviewAnalysis {
                 summary: "summary".to_string(),
@@ -1363,7 +1496,7 @@ mod tests {
         );
 
         assert!(markdown
-            .contains("ReviewGate did not find visible tests for the reviewed high-risk changes."));
+            .contains("No specific test coverage gaps were detected from the reviewed diff."));
         assert_eq!(
             markdown
                 .matches("No tests are visible in this chunk")
@@ -1454,6 +1587,70 @@ mod tests {
             .starts_with("No obvious new PII or secret exposure detected in reviewed chunks."));
         assert!(section.contains("Privacy-positive changes:"));
         assert!(!section.contains("Privacy risks:"));
+    }
+
+    #[test]
+    fn secret_leak_finding_creates_privacy_risk_without_positive_contradiction() {
+        let mut leak = finding(Severity::Medium, "Hardcoded Google Maps API key");
+        leak.category = ReviewCategory::Security;
+        leak.risk_code = Some(RiskCode::SecretLeak);
+        leak.file_path = Some("AndroidManifest.xml".to_string());
+        leak.body = "The Android manifest contains a Google Maps API key.".to_string();
+
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![leak],
+                test_coverage_note: None,
+                privacy_note: Some(
+                    "Temporary files were moved to cache-backed storage.".to_string(),
+                ),
+                overall_risk: OverallRisk::Medium,
+            },
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        let section = markdown_section(&markdown, "## Privacy");
+
+        assert!(section.starts_with("Potential privacy risks were detected in reviewed chunks."));
+        assert!(section.contains(
+            "Privacy risks:\n- Hardcoded Google Maps API key exposure in AndroidManifest.xml."
+        ));
+        assert!(section.contains(
+            "Privacy-positive changes:\n- Temporary files were moved to cache-backed storage."
+        ));
+    }
+
+    #[test]
+    fn finding_specific_coverage_gaps_override_generic_test_text() {
+        let mut native = finding(Severity::Medium, "Security check fails silently");
+        native.risk_code = Some(RiskCode::WeakErrorHandling);
+        native.file_path = Some("AntiInstrumentationModule.kt".to_string());
+        let mut logout = finding(
+            Severity::Medium,
+            "Logout relies on fixed timeout for WebView cleanup",
+        );
+        logout.risk_code = Some(RiskCode::PerformanceRegression);
+        logout.file_path = Some("Profile/index.tsx".to_string());
+
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![native, logout],
+                test_coverage_note: Some("Test coverage is insufficient.".to_string()),
+                privacy_note: None,
+                overall_risk: OverallRisk::Medium,
+            },
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        let section = markdown_section(&markdown, "## Test Coverage");
+
+        assert!(section.contains("- Add a test for security module failure handling."));
+        assert!(section.contains(
+            "- Add a test or monitor for WebView cleanup timeout behavior during logout."
+        ));
+        assert!(!section.contains("Test coverage is insufficient"));
     }
 
     #[test]
@@ -1618,9 +1815,16 @@ mod tests {
     fn published_summary_is_compact() {
         let markdown = format_review_markdown_for_mode_with_emoji(
             &ReviewAnalysis {
-                summary: "ReviewGate reviewed 64 risk-prioritized files across 8 chunks.\n\nMain risks found:\n- First risk.\n- Second risk.\n- Third risk.\n- Fourth risk.\n- Fifth risk.\n- Sixth risk.\n\nThis is a partial risk-prioritized review, not a full exhaustive review.\nExtra trailing sentence that should not survive."
+                summary: "ReviewGate reviewed 64 risk-prioritized files across 8 chunks.\n\nMain risks found:\n- First security risk.\n- Second reliability risk.\n- Third privacy risk.\n- Fourth correctness risk.\n- Fifth coverage risk.\n- Sixth deployment risk.\n\nThis is a partial risk-prioritized review, not a full exhaustive review.\nExtra trailing sentence that should not survive."
                     .to_string(),
-                findings: vec![],
+                findings: vec![
+                    finding(Severity::Low, "First security risk"),
+                    finding(Severity::Low, "Second reliability risk"),
+                    finding(Severity::Low, "Third privacy risk"),
+                    finding(Severity::Low, "Fourth correctness risk"),
+                    finding(Severity::Low, "Fifth coverage risk"),
+                    finding(Severity::Low, "Sixth deployment risk"),
+                ],
                 test_coverage_note: None,
                 privacy_note: None,
                 overall_risk: OverallRisk::Low,
@@ -1633,9 +1837,9 @@ mod tests {
         assert!(
             section.starts_with("ReviewGate reviewed 64 risk-prioritized files across 8 chunks.")
         );
-        assert!(section.contains("Main risks found:\n- First risk."));
-        assert!(section.contains("- Fifth risk."));
-        assert!(!section.contains("- Sixth risk."));
+        assert!(section.contains("Main risks found:\n- First security risk."));
+        assert!(section.contains("- Fifth coverage risk."));
+        assert!(!section.contains("- Sixth deployment risk."));
         assert!(section
             .contains("This is a partial risk-prioritized review, not a full exhaustive review."));
         assert!(!section.contains("Extra trailing sentence"));

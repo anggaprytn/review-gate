@@ -55,6 +55,7 @@ use reviewgate::review::mode::{
     build_auto_review_plan, decide_auto_review_mode, AutoLargeOptions, AutoReviewDecision,
     ReviewMode, SelectedReviewMode,
 };
+use reviewgate::review::publisher_sanitizer::sanitize_merge_risk_assessment;
 use reviewgate::review::qa::format_qa_checklist;
 use reviewgate::review::quality::normalize_review_analysis;
 use reviewgate::review::risk::{
@@ -1016,6 +1017,7 @@ fn refresh_preview_risk_gate(
             comparison,
         },
     );
+    let assessment = sanitize_merge_risk_assessment(analysis, assessment);
     let render_assessment = config.risk_gate.publish.then_some(&assessment);
     preview.markdown = match preview.large_report.as_ref() {
         Some(report) => {

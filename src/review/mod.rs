@@ -9,6 +9,7 @@ pub mod large;
 pub mod mode;
 pub mod parser;
 pub mod prompt;
+pub mod publisher_sanitizer;
 pub mod qa;
 pub mod quality;
 pub mod risk;

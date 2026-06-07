@@ -661,10 +661,13 @@ pub fn assess_merge_risk(
 
     push_combined_focused_test_requirement(&mut required_before_merge, &builder.factors);
 
-    let score = builder.score();
+    let mut score = builder.score();
     let has_blocking_issues = blocking_issues
         .iter()
         .any(|issue| !issue.evidence.is_empty());
+    let has_policy_hard_blocker = blocking_issues
+        .iter()
+        .any(gate_item_has_policy_hard_blocker_evidence);
     let blocked = score >= config.block_threshold
         || has_critical_actionable
         || has_security_blocking_finding
@@ -675,13 +678,23 @@ pub fn assess_merge_risk(
         || signals
             .comparison
             .is_some_and(|comparison| comparison.still_detected > 0);
-    let decision = if blocked {
+    let mut decision = if blocked {
         MergeDecision::Blocked
     } else if needs_human {
         MergeDecision::NeedsHuman
     } else {
         MergeDecision::Pass
     };
+    if !has_critical_actionable && !has_high_actionable && !has_policy_hard_blocker {
+        score = score.min(74);
+        if decision == MergeDecision::Blocked {
+            decision = if needs_human || score >= config.needs_human_threshold {
+                MergeDecision::NeedsHuman
+            } else {
+                MergeDecision::Pass
+            };
+        }
+    }
 
     MergeRiskAssessment {
         score,
@@ -1215,10 +1228,15 @@ fn weak_error_handling_requirement(finding: &ReviewFinding) -> String {
             .to_string()
     } else {
         format!(
-            "Handle the validated error-handling failure in {}",
+            "Address {} in {}",
+            sentence_fragment(&finding.title),
             finding_file_path(finding)
         )
     }
+}
+
+fn sentence_fragment(text: &str) -> String {
+    text.trim().trim_end_matches(['.', '!', '?']).to_string()
 }
 
 fn finding_text(finding: &ReviewFinding) -> String {
@@ -1439,6 +1457,32 @@ fn push_unique_item(values: &mut Vec<RiskGateItem>, label: String, evidence: Vec
         return;
     }
     values.push(RiskGateItem { label, evidence });
+}
+
+fn gate_item_has_policy_hard_blocker_evidence(item: &RiskGateItem) -> bool {
+    if item.label.contains("Modified offline sync")
+        || item.label.contains("Changed API response contract")
+        || item.label.contains("Added DB migration")
+        || item.label.contains("Touched protected module")
+    {
+        return item.evidence.iter().any(|evidence| {
+            evidence
+                .file_path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty())
+        });
+    }
+    item.evidence.iter().any(|evidence| {
+        evidence.rule_id.contains("protected_path")
+            || evidence.rule_id.contains("migration_or_schema")
+            || evidence.rule_id.contains("migration_missing_rollback")
+            || evidence.rule_id.contains("api_contract")
+            || evidence.rule_id.contains("api_contract_missing_snapshot")
+            || evidence.rule_id.contains("offline_sync")
+            || evidence
+                .rule_id
+                .contains("offline_sync_missing_recovery_test")
+    })
 }
 
 #[cfg(test)]
