@@ -1,5 +1,5 @@
 use crate::review::{
-    risk::{MergeDecision, MergeRiskAssessment, RiskEvidence, RiskGateItem},
+    risk::{MergeDecision, MergeRiskAssessment, RiskEvidence, RiskFactor, RiskGateItem},
     types::{EvidenceValidationStatus, ReviewAnalysis, ReviewFinding, RiskCode, Severity},
 };
 use std::collections::HashSet;
@@ -31,6 +31,9 @@ pub fn sanitize_merge_risk_assessment(
 
     replace_generic_required_actions(analysis, &mut assessment.required_before_merge);
     add_missing_finding_actions(analysis, &mut assessment.required_before_merge);
+    assessment
+        .blocking_issues
+        .retain(|item| true_hard_blocker(analysis, item));
     dedupe_gate_items(&mut assessment.blocking_issues);
     dedupe_gate_items(&mut assessment.required_before_merge);
 
@@ -41,12 +44,51 @@ pub fn sanitize_merge_risk_assessment(
         .findings
         .iter()
         .any(|finding| validated_actionable_finding(finding) && finding.severity == Severity::High);
-    let has_policy_hard_blocker = assessment
+    let has_high_severe = analysis
+        .findings
+        .iter()
+        .any(|finding| validated_actionable_finding(finding) && severe_high_finding(finding));
+    let has_policy_hard_blocker = assessment.blocking_issues.iter().any(policy_hard_blocker);
+    let has_migration_hard_blocker = assessment
         .blocking_issues
         .iter()
-        .any(true_policy_hard_blocker);
+        .any(migration_hard_blocker);
+    let has_contract_hard_blocker = assessment.blocking_issues.iter().any(contract_hard_blocker);
+    let has_offline_sync_hard_blocker = assessment
+        .blocking_issues
+        .iter()
+        .any(offline_sync_hard_blocker);
+    let has_large_failed_chunks_with_high_or_critical =
+        assessment.blast_radius.failed_chunks > 0 && (has_high || has_critical);
+    let score_100_allowed = has_critical
+        || has_high_severe
+        || has_policy_hard_blocker
+        || has_migration_hard_blocker
+        || has_contract_hard_blocker
+        || has_offline_sync_hard_blocker
+        || has_large_failed_chunks_with_high_or_critical;
 
-    if !has_critical && !has_high && !has_policy_hard_blocker {
+    if !score_100_allowed {
+        assessment.score = if has_high {
+            assessment.score.min(89)
+        } else if has_medium(analysis) {
+            assessment
+                .score
+                .min(medium_only_score_cap(analysis, &assessment))
+        } else {
+            assessment
+                .score
+                .min(low_or_note_score_cap(analysis, &assessment))
+        };
+    }
+
+    if !has_critical
+        && !has_high
+        && !has_policy_hard_blocker
+        && !has_migration_hard_blocker
+        && !has_contract_hard_blocker
+        && !has_offline_sync_hard_blocker
+    {
         assessment.score = assessment
             .score
             .min(medium_only_score_cap(analysis, &assessment));
@@ -59,9 +101,26 @@ pub fn sanitize_merge_risk_assessment(
         }
     }
 
+    if assessment.decision == MergeDecision::Blocked
+        && !has_critical
+        && !has_high_severe
+        && !has_policy_hard_blocker
+        && !has_migration_hard_blocker
+        && !has_contract_hard_blocker
+        && !has_offline_sync_hard_blocker
+    {
+        assessment.decision = if should_need_human(analysis, &assessment) || has_high {
+            MergeDecision::NeedsHuman
+        } else {
+            MergeDecision::Pass
+        };
+    }
+
     if assessment.decision == MergeDecision::Pass && should_need_human(analysis, &assessment) {
         assessment.decision = MergeDecision::NeedsHuman;
     }
+
+    add_calibrated_why_factors(analysis, &mut assessment);
 
     assessment
 }
@@ -305,7 +364,10 @@ fn finding_required_action(finding: &ReviewFinding) -> String {
             &text,
             &["antiinstrumentation", "native security", "security check"],
         ) {
-            return "Surface or log native security check failures without silently swallowing diagnostic details.".to_string();
+            return format!(
+                "Surface or log native security check failures in {}.",
+                finding_file_path(finding)
+            );
         }
         if contains_any(
             &text,
@@ -374,25 +436,76 @@ fn specific_suggested_fix(fix: &str) -> bool {
         && !lower.starts_with("handle the validated")
 }
 
-fn true_policy_hard_blocker(item: &RiskGateItem) -> bool {
-    if item.label.contains("Modified offline sync")
-        || item.label.contains("Changed API response contract")
-        || item.label.contains("Added DB migration")
-        || item.label.contains("Touched protected module")
-    {
-        return hardcoded_item_has_matching_evidence(item);
-    }
+fn true_hard_blocker(analysis: &ReviewAnalysis, item: &RiskGateItem) -> bool {
+    matching_finding_for_item(analysis, item).is_some_and(|finding| {
+        validated_actionable_finding(finding)
+            && (finding.severity == Severity::Critical || severe_high_finding(finding))
+    }) || policy_hard_blocker(item)
+        || migration_hard_blocker(item)
+        || contract_hard_blocker(item)
+        || offline_sync_hard_blocker(item)
+}
+
+fn policy_hard_blocker(item: &RiskGateItem) -> bool {
     item.evidence.iter().any(|evidence| {
         evidence.rule_id.contains("protected_path")
-            || evidence.rule_id.contains("migration_or_schema")
-            || evidence.rule_id.contains("migration_missing_rollback")
-            || evidence.rule_id.contains("api_contract")
-            || evidence.rule_id.contains("api_contract_missing_snapshot")
-            || evidence.rule_id.contains("offline_sync")
-            || evidence
-                .rule_id
-                .contains("offline_sync_missing_recovery_test")
+            && evidence
+                .file_path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty())
     })
+}
+
+fn migration_hard_blocker(item: &RiskGateItem) -> bool {
+    item.evidence.iter().any(|evidence| {
+        evidence.rule_id.contains("migration_missing_rollback")
+            && evidence
+                .file_path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty())
+    })
+}
+
+fn contract_hard_blocker(item: &RiskGateItem) -> bool {
+    item.evidence.iter().any(|evidence| {
+        evidence.rule_id.contains("api_contract_missing_snapshot")
+            && evidence
+                .file_path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty())
+    })
+}
+
+fn offline_sync_hard_blocker(item: &RiskGateItem) -> bool {
+    item.evidence.iter().any(|evidence| {
+        evidence
+            .rule_id
+            .contains("offline_sync_missing_recovery_test")
+            && evidence
+                .file_path
+                .as_deref()
+                .is_some_and(offline_sync_path_signal)
+    })
+}
+
+fn severe_high_finding(finding: &ReviewFinding) -> bool {
+    finding.severity == Severity::High
+        && (matches!(
+            finding.category,
+            crate::review::types::ReviewCategory::Security
+                | crate::review::types::ReviewCategory::Privacy
+        ) || matches!(
+            finding.risk_code,
+            Some(
+                RiskCode::AuthBypass
+                    | RiskCode::MissingAuthorizationCheck
+                    | RiskCode::SecretLeak
+                    | RiskCode::PiiOrSecretLogging
+                    | RiskCode::SqlInjection
+                    | RiskCode::CommandInjection
+                    | RiskCode::DataIntegrityRisk
+            )
+        ))
 }
 
 fn medium_only_score_cap(analysis: &ReviewAnalysis, assessment: &MergeRiskAssessment) -> u8 {
@@ -421,6 +534,49 @@ fn medium_only_score_cap(analysis: &ReviewAnalysis, assessment: &MergeRiskAssess
         0
     };
     finding_score.saturating_add(partial_review_points).min(74)
+}
+
+fn low_or_note_score_cap(analysis: &ReviewAnalysis, assessment: &MergeRiskAssessment) -> u8 {
+    medium_only_score_cap(analysis, assessment).min(49)
+}
+
+fn has_medium(analysis: &ReviewAnalysis) -> bool {
+    analysis.findings.iter().any(|finding| {
+        validated_actionable_finding(finding) && finding.severity == Severity::Medium
+    })
+}
+
+fn add_calibrated_why_factors(analysis: &ReviewAnalysis, assessment: &mut MergeRiskAssessment) {
+    let medium_count = analysis
+        .findings
+        .iter()
+        .filter(|finding| {
+            validated_actionable_finding(finding) && finding.severity == Severity::Medium
+        })
+        .count();
+    if medium_count > 1
+        && !assessment
+            .risk_factors
+            .iter()
+            .any(|factor| factor.rule_id == "calibration.multiple_medium_findings")
+    {
+        assessment.risk_factors.insert(
+            0,
+            RiskFactor {
+                rule_id: "calibration.multiple_medium_findings".to_string(),
+                label: "Multiple medium-priority security/reliability findings remain open."
+                    .to_string(),
+                score: 1,
+                evidence: Vec::new(),
+                points: 1,
+            },
+        );
+    }
+    for factor in &mut assessment.risk_factors {
+        if factor.rule_id.contains("large_review") || factor.rule_id.contains("partial") {
+            factor.label = "Large MR review was partial or risk-prioritized.".to_string();
+        }
+    }
 }
 
 fn should_need_human(analysis: &ReviewAnalysis, assessment: &MergeRiskAssessment) -> bool {
@@ -825,7 +981,10 @@ mod tests {
             .contains(&"Add sync recovery test".to_string()));
         assert!(labels(&sanitized.required_before_merge).contains(&"Confirm the Google Maps API key is package/SHA restricted or move it to build-time configuration.".to_string()));
         assert!(labels(&sanitized.required_before_merge).contains(&"Replace transient Toast-only untrusted-build warning with a persistent blocking error state.".to_string()));
-        assert!(labels(&sanitized.required_before_merge).contains(&"Surface or log native security check failures without silently swallowing diagnostic details.".to_string()));
+        assert!(labels(&sanitized.required_before_merge).contains(
+            &"Surface or log native security check failures in AntiInstrumentationModule.kt."
+                .to_string()
+        ));
         assert!(labels(&sanitized.required_before_merge).contains(&"Log expected signature-verification exceptions without weakening fail-closed behavior.".to_string()));
         assert!(labels(&sanitized.required_before_merge).contains(
             &"Add monitoring or fallback behavior for WebView cleanup timeout during logout."

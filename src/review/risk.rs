@@ -121,6 +121,9 @@ pub fn assess_merge_risk(
     let mut has_high_actionable = false;
     let mut has_critical_actionable = false;
     let mut has_security_blocking_finding = false;
+    let mut has_migration_hard_blocker = false;
+    let mut has_contract_hard_blocker = false;
+    let mut has_offline_sync_hard_blocker = false;
 
     for finding in analysis.findings.iter().filter(|finding| {
         finding.actionable && finding.severity != Severity::Note && has_validated_evidence(finding)
@@ -128,7 +131,7 @@ pub fn assess_merge_risk(
         match finding.severity {
             Severity::Critical => {
                 has_critical_actionable = true;
-                builder.add(
+                let factor_index = builder.add(
                     35,
                     "finding.severity.critical",
                     "Validated critical actionable finding",
@@ -138,10 +141,19 @@ pub fn assess_merge_risk(
                         "Critical actionable finding validated in the current review.",
                     )],
                 );
+                push_blocker_for_factor(
+                    &mut blocking_issues,
+                    &builder.factors[factor_index],
+                    format!(
+                        "Critical finding in `{}`: {}",
+                        finding_file_path(finding),
+                        sentence_fragment(&finding.title)
+                    ),
+                );
             }
             Severity::High => {
                 has_high_actionable = true;
-                builder.add(
+                let factor_index = builder.add(
                     18,
                     "finding.severity.high",
                     "Validated high actionable finding",
@@ -151,6 +163,18 @@ pub fn assess_merge_risk(
                         "High actionable finding validated in the current review.",
                     )],
                 );
+                if severe_high_finding(finding) {
+                    has_security_blocking_finding = true;
+                    push_blocker_for_factor(
+                        &mut blocking_issues,
+                        &builder.factors[factor_index],
+                        format!(
+                            "High-risk finding in `{}`: {}",
+                            finding_file_path(finding),
+                            sentence_fragment(&finding.title)
+                        ),
+                    );
+                }
             }
             Severity::Medium => {
                 builder.add(
@@ -532,6 +556,7 @@ pub fn assess_merge_risk(
                 &sync_evidence,
                 "Modified offline sync layer without adding recovery test".to_string(),
             );
+            has_offline_sync_hard_blocker = true;
             push_requirement_for_evidence(
                 &mut required_before_merge,
                 &sync_evidence,
@@ -575,6 +600,7 @@ pub fn assess_merge_risk(
                 &migration_evidence,
                 "Added DB migration without rollback plan".to_string(),
             );
+            has_migration_hard_blocker = true;
             push_requirement_for_evidence(
                 &mut required_before_merge,
                 &migration_evidence,
@@ -604,6 +630,7 @@ pub fn assess_merge_risk(
                 &contract_evidence,
                 "Changed API response contract without updating contract snapshot".to_string(),
             );
+            has_contract_hard_blocker = true;
             push_requirement_for_evidence(
                 &mut required_before_merge,
                 &contract_evidence,
@@ -662,16 +689,16 @@ pub fn assess_merge_risk(
     push_combined_focused_test_requirement(&mut required_before_merge, &builder.factors);
 
     let mut score = builder.score();
-    let has_blocking_issues = blocking_issues
-        .iter()
-        .any(|issue| !issue.evidence.is_empty());
     let has_policy_hard_blocker = blocking_issues
         .iter()
         .any(gate_item_has_policy_hard_blocker_evidence);
-    let blocked = score >= config.block_threshold
-        || has_critical_actionable
+    let has_any_hard_blocker = has_critical_actionable
         || has_security_blocking_finding
-        || has_blocking_issues;
+        || has_policy_hard_blocker
+        || has_migration_hard_blocker
+        || has_contract_hard_blocker
+        || has_offline_sync_hard_blocker;
+    let blocked = has_any_hard_blocker;
     let needs_human = needs_human
         || score >= config.needs_human_threshold
         || has_high_actionable
@@ -685,7 +712,37 @@ pub fn assess_merge_risk(
     } else {
         MergeDecision::Pass
     };
-    if !has_critical_actionable && !has_high_actionable && !has_policy_hard_blocker {
+    let has_large_failed_chunks_with_high_or_critical = signals
+        .large_review
+        .is_some_and(|report| report.failed_chunks > 0)
+        && (has_high_actionable || has_critical_actionable);
+    let score_100_allowed = has_critical_actionable
+        || has_security_blocking_finding
+        || has_policy_hard_blocker
+        || has_migration_hard_blocker
+        || has_contract_hard_blocker
+        || has_offline_sync_hard_blocker
+        || has_large_failed_chunks_with_high_or_critical;
+    if !score_100_allowed {
+        score =
+            if has_high_actionable {
+                score.min(89)
+            } else if analysis.findings.iter().any(|finding| {
+                validated_actionable_finding_with_severity(finding, Severity::Medium)
+            }) {
+                score.min(74)
+            } else {
+                score.min(49)
+            };
+    }
+
+    if !has_critical_actionable
+        && !has_high_actionable
+        && !has_policy_hard_blocker
+        && !has_migration_hard_blocker
+        && !has_contract_hard_blocker
+        && !has_offline_sync_hard_blocker
+    {
         score = score.min(74);
         if decision == MergeDecision::Blocked {
             decision = if needs_human || score >= config.needs_human_threshold {
@@ -865,6 +922,31 @@ fn security_finding_signal(finding: &ReviewFinding, risk_codes: &[RiskCode]) -> 
     finding
         .risk_code
         .is_some_and(|risk_code| risk_codes.contains(&risk_code))
+}
+
+fn severe_high_finding(finding: &ReviewFinding) -> bool {
+    finding.severity == Severity::High
+        && finding.actionable
+        && has_validated_evidence(finding)
+        && (matches!(
+            finding.category,
+            ReviewCategory::Security | ReviewCategory::Privacy
+        ) || matches!(
+            finding.risk_code,
+            Some(
+                RiskCode::AuthBypass
+                    | RiskCode::MissingAuthorizationCheck
+                    | RiskCode::SecretLeak
+                    | RiskCode::PiiOrSecretLogging
+                    | RiskCode::SqlInjection
+                    | RiskCode::CommandInjection
+                    | RiskCode::DataIntegrityRisk
+            )
+        ))
+}
+
+fn validated_actionable_finding_with_severity(finding: &ReviewFinding, severity: Severity) -> bool {
+    finding.actionable && finding.severity == severity && has_validated_evidence(finding)
 }
 
 fn protected_path_matches(paths: &[String], config: &RiskGateConfig) -> Vec<ProtectedMatch> {
@@ -1460,28 +1542,21 @@ fn push_unique_item(values: &mut Vec<RiskGateItem>, label: String, evidence: Vec
 }
 
 fn gate_item_has_policy_hard_blocker_evidence(item: &RiskGateItem) -> bool {
-    if item.label.contains("Modified offline sync")
-        || item.label.contains("Changed API response contract")
-        || item.label.contains("Added DB migration")
-        || item.label.contains("Touched protected module")
-    {
+    if item.label.contains("Touched protected module") {
         return item.evidence.iter().any(|evidence| {
-            evidence
-                .file_path
-                .as_deref()
-                .is_some_and(|path| !path.trim().is_empty())
+            evidence.rule_id.contains("protected_path")
+                && evidence
+                    .file_path
+                    .as_deref()
+                    .is_some_and(|path| !path.trim().is_empty())
         });
     }
     item.evidence.iter().any(|evidence| {
         evidence.rule_id.contains("protected_path")
-            || evidence.rule_id.contains("migration_or_schema")
-            || evidence.rule_id.contains("migration_missing_rollback")
-            || evidence.rule_id.contains("api_contract")
-            || evidence.rule_id.contains("api_contract_missing_snapshot")
-            || evidence.rule_id.contains("offline_sync")
-            || evidence
-                .rule_id
-                .contains("offline_sync_missing_recovery_test")
+            && evidence
+                .file_path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty())
     })
 }
 
@@ -1602,7 +1677,7 @@ mod tests {
             },
         );
 
-        assert_eq!(assessment.score, 50);
+        assert_eq!(assessment.score, 49);
         assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
     }
 
@@ -2193,6 +2268,54 @@ mod tests {
 
         assert_eq!(assessment.score, 56);
         assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+    }
+
+    #[test]
+    fn medium_only_findings_cannot_block_or_exceed_74() {
+        let findings = (0..20)
+            .map(|_| finding(Severity::Medium, ReviewCategory::Reliability, None))
+            .collect::<Vec<_>>();
+        let assessment = assess(&findings, &[], stats(1, 100), RiskGateRunSignals::default());
+
+        assert_eq!(assessment.score, 74);
+        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+    }
+
+    #[test]
+    fn low_and_note_only_findings_cannot_exceed_49() {
+        let mut note = finding(Severity::Note, ReviewCategory::Correctness, None);
+        note.actionable = false;
+        let mut findings = (0..60)
+            .map(|_| finding(Severity::Low, ReviewCategory::Reliability, None))
+            .collect::<Vec<_>>();
+        findings.push(note);
+
+        let assessment = assess(&findings, &[], stats(1, 100), RiskGateRunSignals::default());
+
+        assert_eq!(assessment.score, 49);
+        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+    }
+
+    #[test]
+    fn high_non_severe_findings_are_capped_at_89_and_need_human() {
+        let findings = (0..6)
+            .map(|_| finding(Severity::High, ReviewCategory::Correctness, None))
+            .collect::<Vec<_>>();
+        let assessment = assess(&findings, &[], stats(1, 100), RiskGateRunSignals::default());
+
+        assert_eq!(assessment.score, 89);
+        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+    }
+
+    #[test]
+    fn critical_findings_can_block_and_reach_100() {
+        let findings = (0..3)
+            .map(|_| finding(Severity::Critical, ReviewCategory::Correctness, None))
+            .collect::<Vec<_>>();
+        let assessment = assess(&findings, &[], stats(1, 100), RiskGateRunSignals::default());
+
+        assert_eq!(assessment.score, 100);
+        assert_eq!(assessment.decision, MergeDecision::Blocked);
     }
 
     #[test]
