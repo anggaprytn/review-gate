@@ -14,6 +14,9 @@ use crate::{
 use std::collections::HashSet;
 
 const DECISION_NEEDS_HUMAN_SCORE: u8 = 25;
+const NO_PRIORITY_PASS_SCORE_CAP: u8 = 24;
+const NO_PRIORITY_UNCERTAINTY_CAP: u8 = 10;
+const NO_PRIORITY_LOW_AND_UNCERTAINTY_SCORE: u8 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeDecision {
@@ -84,6 +87,7 @@ pub struct BlastRadius {
     pub diff_bytes: usize,
     pub collapsed_files: usize,
     pub too_large_files: usize,
+    pub skipped_files: usize,
     pub failed_chunks: usize,
 }
 
@@ -530,13 +534,30 @@ pub fn assess_merge_risk(
 
     required_before_merge.truncate(6);
 
-    let mut score = builder.score();
     let blocked = has_critical_actionable || has_high_blocking_finding;
     let open_priority_findings = open_priority_finding_count(analysis);
     let has_open_priority_findings = open_priority_findings > 0;
+    let failed_chunks = signals
+        .large_review
+        .map(|report| report.failed_chunks)
+        .unwrap_or_default();
+    let skipped_files = signals
+        .large_review
+        .map(|report| report.skipped_files)
+        .unwrap_or_default();
+    let previous_still_detected = signals
+        .comparison
+        .is_some_and(|comparison| comparison.still_detected > 0);
+    let no_priority_pass_override =
+        !has_open_priority_findings && !blocked && failed_chunks == 0 && !previous_still_detected;
+    let mut score = if no_priority_pass_override {
+        calibrated_no_priority_score(analysis, &builder.factors)
+    } else {
+        builder.score()
+    };
     let large_review_partial = signals
         .large_review
-        .is_some_and(|report| report.failed_chunks > 0)
+        .is_some_and(|report| report.failed_chunks > 0 || report.skipped_files > 0)
         || stats.collapsed_file_count > 0
         || stats.too_large_file_count > 0;
     let large_review_partial_with_unresolved_findings =
@@ -548,12 +569,11 @@ pub fn assess_merge_risk(
         .iter()
         .any(|finding| validated_actionable_finding_with_severity(finding, Severity::Medium));
     let needs_human = has_open_priority_findings
+        || failed_chunks > 0
         || score >= DECISION_NEEDS_HUMAN_SCORE
         || large_review_partial_with_unresolved_findings
         || security_sensitive_with_open_findings
-        || signals
-            .comparison
-            .is_some_and(|comparison| comparison.still_detected > 0);
+        || previous_still_detected;
     let mut decision = if blocked {
         MergeDecision::Blocked
     } else if needs_human {
@@ -591,6 +611,10 @@ pub fn assess_merge_risk(
             decision = MergeDecision::Pass;
         }
     }
+    if no_priority_pass_override {
+        score = score.min(NO_PRIORITY_PASS_SCORE_CAP);
+        decision = MergeDecision::Pass;
+    }
 
     MergeRiskAssessment {
         score,
@@ -603,12 +627,57 @@ pub fn assess_merge_risk(
             diff_bytes: stats.total_diff_bytes,
             collapsed_files: stats.collapsed_file_count,
             too_large_files: stats.too_large_file_count,
-            failed_chunks: signals
-                .large_review
-                .map(|report| report.failed_chunks)
-                .unwrap_or_default(),
+            skipped_files,
+            failed_chunks,
         },
     }
+}
+
+fn calibrated_no_priority_score(analysis: &ReviewAnalysis, factors: &[RiskFactor]) -> u8 {
+    let uncertainty_score = factors
+        .iter()
+        .filter(|factor| factor.points > 0 && no_priority_uncertainty_factor(factor))
+        .map(|factor| factor.points as u16)
+        .sum::<u16>()
+        .min(NO_PRIORITY_UNCERTAINTY_CAP as u16) as u8;
+    let code_score = factors
+        .iter()
+        .filter(|factor| factor.points > 0 && !no_priority_uncertainty_factor(factor))
+        .map(|factor| factor.points as u16)
+        .sum::<u16>()
+        .min(u8::MAX as u16) as u8;
+    let low_count = analysis
+        .findings
+        .iter()
+        .filter(|finding| finding.severity == Severity::Low)
+        .count();
+    let has_low_or_note = analysis
+        .findings
+        .iter()
+        .any(|finding| matches!(finding.severity, Severity::Low | Severity::Note));
+    let score = code_score.saturating_add(uncertainty_score);
+
+    if has_low_or_note && uncertainty_score > 0 {
+        if low_count <= 1 {
+            NO_PRIORITY_LOW_AND_UNCERTAINTY_SCORE
+        } else {
+            score.max(NO_PRIORITY_LOW_AND_UNCERTAINTY_SCORE)
+        }
+    } else {
+        score
+    }
+    .min(NO_PRIORITY_PASS_SCORE_CAP)
+}
+
+fn no_priority_uncertainty_factor(factor: &RiskFactor) -> bool {
+    matches!(
+        factor.rule_id.as_str(),
+        "verification.large_mr.changed_files"
+            | "verification.large_mr.diff_bytes"
+            | "verification.gitlab.partial_diff"
+            | "changed_file.auth_security_area"
+    ) || factor.rule_id.contains("large")
+        || factor.rule_id.contains("partial")
 }
 
 fn open_priority_finding_count(analysis: &ReviewAnalysis) -> usize {
@@ -694,7 +763,9 @@ pub fn format_merge_risk_gate_markdown(assessment: &MergeRiskAssessment) -> Stri
 fn pass_why_reasons(assessment: &MergeRiskAssessment) -> Vec<&'static str> {
     let mut reasons = vec!["No priority findings remain open."];
     if large_review_context(assessment) {
-        reasons.push("Review was risk-prioritized because the MR is large.");
+        reasons.push(
+            "Review was large and risk-prioritized, so low-priority notes were summarized only.",
+        );
     }
     reasons.truncate(3);
     reasons
@@ -726,6 +797,7 @@ fn large_review_context(assessment: &MergeRiskAssessment) -> bool {
         || assessment.blast_radius.failed_chunks > 0
         || assessment.blast_radius.collapsed_files > 0
         || assessment.blast_radius.too_large_files > 0
+        || assessment.blast_radius.skipped_files > 0
         || assessment
             .risk_factors
             .iter()
@@ -1489,7 +1561,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_chunk_score_is_capped() {
+    fn failed_chunks_need_human_even_without_findings() {
         let report = large_report(9);
         let assessment = assess(
             &[],
@@ -1502,11 +1574,11 @@ mod tests {
         );
 
         assert_eq!(assessment.score, 20);
-        assert_eq!(assessment.decision, MergeDecision::Pass);
+        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
     }
 
     #[test]
-    fn score_20_with_no_priority_findings_passes() {
+    fn large_mr_alone_caps_uncertainty_and_passes() {
         let assessment = assess(
             &[],
             &[],
@@ -1518,12 +1590,105 @@ mod tests {
             RiskGateRunSignals::default(),
         );
 
-        assert_eq!(assessment.score, 20);
+        assert_eq!(assessment.score, 10);
         assert_eq!(assessment.decision, MergeDecision::Pass);
     }
 
     #[test]
-    fn offline_sync_without_recovery_test_needs_human_without_policy_blocker() {
+    fn no_priority_findings_cap_risk_score_at_24() {
+        let findings = (0..40)
+            .map(|_| finding(Severity::Low, ReviewCategory::Reliability, None))
+            .collect::<Vec<_>>();
+        let assessment = assess(
+            &findings,
+            &[diff("src/auth/session.rs", "+renew session")],
+            DiffStats {
+                changed_file_count: 31,
+                total_diff_bytes: 200_001,
+                collapsed_file_count: 1,
+                ..DiffStats::default()
+            },
+            RiskGateRunSignals::default(),
+        );
+
+        assert_eq!(assessment.score, 24);
+        assert_eq!(assessment.decision, MergeDecision::Pass);
+    }
+
+    #[test]
+    fn skipped_files_alone_do_not_need_human() {
+        let mut report = large_report(0);
+        report.skipped_files = 3;
+        let assessment = assess(
+            &[],
+            &[],
+            stats(1, 100),
+            RiskGateRunSignals {
+                large_review: Some(&report),
+                comparison: None,
+            },
+        );
+
+        assert_eq!(assessment.decision, MergeDecision::Pass);
+        assert!(assessment.score < super::DECISION_NEEDS_HUMAN_SCORE);
+        assert_eq!(assessment.blast_radius.skipped_files, 3);
+    }
+
+    #[test]
+    fn security_sensitive_touched_alone_does_not_need_human() {
+        let assessment = assess(
+            &[],
+            &[diff("src/security/session.rs", "+renew session")],
+            stats(1, 100),
+            RiskGateRunSignals::default(),
+        );
+
+        assert_eq!(assessment.decision, MergeDecision::Pass);
+        assert!(assessment.score < super::DECISION_NEEDS_HUMAN_SCORE);
+    }
+
+    #[test]
+    fn low_notes_and_large_review_match_expected_pass_sample() {
+        let mut note = finding(Severity::Note, ReviewCategory::Correctness, None);
+        note.actionable = false;
+        let mut report = large_report(0);
+        report.skipped_files = 3;
+        let assessment = assess(
+            &[
+                finding(Severity::Low, ReviewCategory::Correctness, None),
+                note.clone(),
+                note.clone(),
+                note,
+            ],
+            &[diff("src/security/session.rs", "+renew session")],
+            DiffStats {
+                changed_file_count: 31,
+                total_diff_bytes: 200_001,
+                collapsed_file_count: 1,
+                ..DiffStats::default()
+            },
+            RiskGateRunSignals {
+                large_review: Some(&report),
+                comparison: None,
+            },
+        );
+        let markdown = format_merge_risk_gate_markdown(&assessment);
+
+        assert_eq!(assessment.score, 20);
+        assert_eq!(assessment.decision, MergeDecision::Pass);
+        assert!(markdown.contains("Risk Score: 20/100"));
+        assert!(markdown.contains("Decision: PASS"));
+        assert!(markdown.contains("- No priority findings remain open."));
+        assert!(markdown.contains(
+            "- Review was large and risk-prioritized, so low-priority notes were summarized only."
+        ));
+        assert!(!markdown.contains("Required Before Merge:"));
+        assert!(!markdown.contains("Security-sensitive files were modified"));
+        assert!(!markdown.contains("Changed files exceed large MR threshold"));
+    }
+
+    #[test]
+    fn offline_sync_without_recovery_test_passes_without_priority_finding() {
         let assessment = assess(
             &[],
             &[diff("src/features/sync/worker.rs", "+retry queue")],
@@ -1531,7 +1696,7 @@ mod tests {
             RiskGateRunSignals::default(),
         );
 
-        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+        assert_eq!(assessment.decision, MergeDecision::Pass);
         assert!(!has_blocker(
             &assessment,
             "Modified offline sync layer without adding recovery test"
@@ -1683,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_sync_path_without_recovery_test_no_longer_blocks() {
+    fn offline_sync_path_without_recovery_test_passes_without_priority_finding() {
         let assessment = assess(
             &[],
             &[diff(
@@ -1694,7 +1859,7 @@ mod tests {
             RiskGateRunSignals::default(),
         );
 
-        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+        assert_eq!(assessment.decision, MergeDecision::Pass);
         assert!(!has_blocker(
             &assessment,
             "Modified offline sync layer without adding recovery test"
@@ -1703,7 +1868,7 @@ mod tests {
     }
 
     #[test]
-    fn api_contract_without_snapshot_needs_human_without_policy_blocker() {
+    fn api_contract_without_snapshot_passes_without_priority_finding() {
         let assessment = assess(
             &[],
             &[diff("src/api/user_dto.rs", "+api response changes")],
@@ -1711,7 +1876,7 @@ mod tests {
             RiskGateRunSignals::default(),
         );
 
-        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+        assert_eq!(assessment.decision, MergeDecision::Pass);
         assert!(!has_blocker(
             &assessment,
             "Changed API response contract without updating contract snapshot"
@@ -1752,7 +1917,7 @@ mod tests {
     }
 
     #[test]
-    fn db_migration_without_rollback_needs_human_without_policy_blocker() {
+    fn db_migration_without_rollback_passes_without_priority_finding() {
         let assessment = assess(
             &[],
             &[diff(
@@ -1763,7 +1928,7 @@ mod tests {
             RiskGateRunSignals::default(),
         );
 
-        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+        assert_eq!(assessment.decision, MergeDecision::Pass);
         assert!(!has_blocker(
             &assessment,
             "Added DB migration without rollback plan"
@@ -1807,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_path_touched_needs_human_without_policy_blocker() {
+    fn protected_path_touched_passes_without_priority_finding() {
         let assessment = assess(
             &[],
             &[diff("src/auth/session.rs", "+renew session")],
@@ -1815,7 +1980,7 @@ mod tests {
             RiskGateRunSignals::default(),
         );
 
-        assert_eq!(assessment.decision, MergeDecision::NeedsHuman);
+        assert_eq!(assessment.decision, MergeDecision::Pass);
         assert!(!has_blocker(
             &assessment,
             "Touched protected module: `src/auth/**`"
@@ -2138,7 +2303,7 @@ mod tests {
 
         let assessment = assess(&findings, &[], stats(1, 100), RiskGateRunSignals::default());
 
-        assert_eq!(assessment.score, 49);
+        assert_eq!(assessment.score, 24);
         assert_eq!(assessment.decision, MergeDecision::Pass);
     }
 

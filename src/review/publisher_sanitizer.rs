@@ -11,6 +11,9 @@ use crate::{
 use std::collections::HashSet;
 
 const DECISION_NEEDS_HUMAN_SCORE: u8 = 25;
+const NO_PRIORITY_PASS_SCORE_CAP: u8 = 24;
+const NO_PRIORITY_UNCERTAINTY_CAP: u8 = 10;
+const NO_PRIORITY_LOW_AND_UNCERTAINTY_SCORE: u8 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewReport {
@@ -74,6 +77,9 @@ pub fn sanitize_merge_risk_assessment(
             .score
             .min(medium_only_score_cap(analysis, &assessment));
     }
+    if no_priority_pass_override(analysis, &assessment) {
+        assessment.score = calibrated_no_priority_score(analysis, &assessment);
+    }
 
     assessment.decision = calibrated_merge_decision(analysis, &assessment);
     add_calibrated_why_factors(analysis, &mut assessment);
@@ -102,10 +108,10 @@ fn calibrated_merge_decision(
         return MergeDecision::Blocked;
     }
 
-    if counters.open_priority > 0
+    let has_priority_findings = counters.open_priority > 0;
+    if has_priority_findings
+        || assessment.blast_radius.failed_chunks > 0
         || assessment.score >= DECISION_NEEDS_HUMAN_SCORE
-        || (large_review_partial(assessment) && open_non_note_findings(analysis) > 0)
-        || (security_sensitive_modified(assessment) && open_non_note_findings(analysis) > 0)
     {
         return MergeDecision::NeedsHuman;
     }
@@ -121,6 +127,14 @@ fn calibrated_overall_risk(
     let Some(assessment) = assessment else {
         return finding_risk;
     };
+    if priority_findings(analysis).is_empty()
+        && !assessment
+            .blocking_issues
+            .iter()
+            .any(|item| !item.evidence.is_empty())
+    {
+        return OverallRisk::Low;
+    }
 
     match assessment.decision {
         MergeDecision::Blocked => stronger_risk(finding_risk, OverallRisk::High),
@@ -139,6 +153,72 @@ fn calibrated_overall_risk(
             }
         }
     }
+}
+
+fn no_priority_pass_override(analysis: &ReviewAnalysis, assessment: &MergeRiskAssessment) -> bool {
+    count_findings_from_analysis(analysis).open_priority == 0
+        && assessment.blast_radius.failed_chunks == 0
+        && !assessment
+            .blocking_issues
+            .iter()
+            .any(|item| !item.evidence.is_empty())
+        && !assessment
+            .risk_factors
+            .iter()
+            .any(|factor| factor.rule_id == "comparison.previous_finding_still_detected")
+}
+
+fn calibrated_no_priority_score(analysis: &ReviewAnalysis, assessment: &MergeRiskAssessment) -> u8 {
+    let uncertainty_score = assessment
+        .risk_factors
+        .iter()
+        .filter(|factor| factor.points > 0 && no_priority_uncertainty_factor(factor))
+        .map(|factor| factor.points as u16)
+        .sum::<u16>()
+        .min(NO_PRIORITY_UNCERTAINTY_CAP as u16) as u8;
+    let code_score = assessment
+        .risk_factors
+        .iter()
+        .filter(|factor| factor.points > 0 && !no_priority_uncertainty_factor(factor))
+        .map(|factor| factor.points as u16)
+        .sum::<u16>()
+        .min(u8::MAX as u16) as u8;
+    let score = if assessment.risk_factors.is_empty() {
+        assessment.score
+    } else {
+        code_score.saturating_add(uncertainty_score)
+    };
+    let low_count = analysis
+        .findings
+        .iter()
+        .filter(|finding| finding.severity == Severity::Low)
+        .count();
+    let has_low_or_note = analysis
+        .findings
+        .iter()
+        .any(|finding| matches!(finding.severity, Severity::Low | Severity::Note));
+
+    if has_low_or_note && uncertainty_score > 0 {
+        if low_count <= 1 {
+            NO_PRIORITY_LOW_AND_UNCERTAINTY_SCORE
+        } else {
+            score.max(NO_PRIORITY_LOW_AND_UNCERTAINTY_SCORE)
+        }
+    } else {
+        score
+    }
+    .min(NO_PRIORITY_PASS_SCORE_CAP)
+}
+
+fn no_priority_uncertainty_factor(factor: &RiskFactor) -> bool {
+    matches!(
+        factor.rule_id.as_str(),
+        "verification.large_mr.changed_files"
+            | "verification.large_mr.diff_bytes"
+            | "verification.gitlab.partial_diff"
+            | "changed_file.auth_security_area"
+    ) || factor.rule_id.contains("large")
+        || factor.rule_id.contains("partial")
 }
 
 fn strongest_actionable_risk(analysis: &ReviewAnalysis) -> Option<OverallRisk> {
@@ -533,7 +613,7 @@ fn public_why_factors(
             if large {
                 factors.push(public_why_factor(
                     "published.why.large_review",
-                    "Review was risk-prioritized because the MR is large.",
+                    "Review was large and risk-prioritized, so low-priority notes were summarized only.",
                 ));
             }
         }
@@ -572,7 +652,7 @@ fn public_why_factors(
             if large && factors.len() < 3 {
                 factors.push(public_why_factor(
                     "published.why.large_review",
-                    "Review was risk-prioritized because the MR is large.",
+                    "Review was large and risk-prioritized, so low-priority notes were summarized only.",
                 ));
             }
         }
@@ -671,20 +751,11 @@ fn public_why_factor(rule_id: &str, label: impl Into<String>) -> RiskFactor {
     }
 }
 
-fn open_non_note_findings(analysis: &ReviewAnalysis) -> usize {
-    analysis
-        .findings
-        .iter()
-        .filter(|finding| {
-            validated_actionable_finding(finding) && finding.severity != Severity::Note
-        })
-        .count()
-}
-
 fn large_review_partial(assessment: &MergeRiskAssessment) -> bool {
     assessment.blast_radius.failed_chunks > 0
         || assessment.blast_radius.collapsed_files > 0
         || assessment.blast_radius.too_large_files > 0
+        || assessment.blast_radius.skipped_files > 0
         || assessment
             .risk_factors
             .iter()
@@ -1456,11 +1527,11 @@ mod tests {
     }
 
     #[test]
-    fn final_calibration_passes_zero_priority_score_20_without_blockers() {
+    fn final_calibration_caps_large_mr_uncertainty_without_priority_findings() {
         let sanitized = sanitize_merge_risk_assessment(
             &analysis(vec![]),
             MergeRiskAssessment {
-                score: 20,
+                score: 49,
                 decision: MergeDecision::NeedsHuman,
                 blocking_issues: vec![],
                 required_before_merge: vec![],
@@ -1476,11 +1547,13 @@ mod tests {
         );
         let markdown = format_merge_risk_gate_markdown(&sanitized);
 
-        assert_eq!(sanitized.score, 20);
+        assert_eq!(sanitized.score, 8);
         assert_eq!(sanitized.decision, MergeDecision::Pass);
         assert!(markdown.contains("Decision: PASS"));
         assert!(markdown.contains("- No priority findings remain open."));
-        assert!(markdown.contains("- Review was risk-prioritized because the MR is large."));
+        assert!(markdown.contains(
+            "- Review was large and risk-prioritized, so low-priority notes were summarized only."
+        ));
         assert!(!markdown.contains("Changed files exceed large MR threshold"));
     }
 
@@ -1542,19 +1615,33 @@ mod tests {
         let report = sanitize_review_report(ReviewReport {
             analysis: ReviewAnalysis {
                 overall_risk: OverallRisk::High,
-                ..analysis(vec![])
+                ..analysis(vec![finding(
+                    Severity::Low,
+                    ReviewCategory::Reliability,
+                    None,
+                    "src/lib.rs",
+                    "Low-priority cleanup remains",
+                )])
             },
             risk_assessment: Some(MergeRiskAssessment {
-                score: 20,
+                score: 49,
                 decision: MergeDecision::NeedsHuman,
                 blocking_issues: vec![],
                 required_before_merge: vec![],
-                risk_factors: vec![risk_factor(
-                    "verification.large_mr.changed_files",
-                    "Changed files exceed large MR threshold",
-                )],
+                risk_factors: vec![
+                    risk_factor("finding.severity.low", "Validated low actionable finding"),
+                    risk_factor(
+                        "verification.large_mr.changed_files",
+                        "Changed files exceed large MR threshold",
+                    ),
+                    risk_factor(
+                        "verification.gitlab.partial_diff",
+                        "GitLab collapsed or too-large files are present",
+                    ),
+                ],
                 blast_radius: BlastRadius {
                     changed_files: 31,
+                    skipped_files: 3,
                     ..BlastRadius::default()
                 },
             }),
