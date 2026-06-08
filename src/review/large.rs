@@ -153,6 +153,8 @@ pub enum ChunkReviewProgress {
         chunk_index: usize,
         total_chunks: usize,
         serial: bool,
+        attempt: usize,
+        max_attempts: usize,
     },
     Retried {
         chunk_index: usize,
@@ -543,57 +545,29 @@ where
 {
     let total_chunks = chunks.len();
     let parallelism = execution.effective_parallelism(total_chunks);
-    let mut results = run_large_chunk_wave(
-        context,
-        chunks,
-        ChunkWaveOptions {
-            total_chunks,
-            parallelism,
-            show_prompt,
-        },
-        FirstPassProgress,
-        &mut progress,
-        &call_llm,
-    )
-    .await;
-
-    for retry_attempt in 1..=execution.chunk_retries {
-        let retryable_chunks = retryable_failed_chunks(chunks, &results);
-        if retryable_chunks.is_empty() {
-            break;
-        }
-
-        progress(ChunkReviewProgress::Retrying {
-            retryable_failures: retryable_chunks.len(),
-            attempt: retry_attempt,
-            max_attempts: execution.chunk_retries,
-        });
-        if execution.retry_backoff_ms > 0 {
-            sleep(Duration::from_millis(execution.retry_backoff_ms)).await;
-        }
-
-        let retry_parallelism = if execution.retry_serial {
-            1
-        } else {
-            execution.effective_parallelism(retryable_chunks.len())
-        };
-        let retry_results = run_large_chunk_wave(
+    let mut results = if parallelism == 1 {
+        review_large_chunks_serially(
             context,
-            &retryable_chunks,
-            ChunkWaveOptions {
-                total_chunks,
-                parallelism: retry_parallelism,
-                show_prompt,
-            },
-            RetryProgress {
-                serial: execution.retry_serial,
-            },
+            chunks,
+            execution,
+            total_chunks,
+            show_prompt,
             &mut progress,
             &call_llm,
         )
-        .await;
-        replace_retry_results(&mut results, retry_results);
-    }
+        .await
+    } else {
+        review_large_chunks_in_parallel(
+            context,
+            chunks,
+            execution,
+            total_chunks,
+            show_prompt,
+            &mut progress,
+            &call_llm,
+        )
+        .await
+    };
 
     results.sort_by_key(|result| result.chunk_index);
     let mut analyses = Vec::new();
@@ -616,14 +590,6 @@ where
             }
             ChunkReviewStatus::Failed => {
                 let message = result.error.unwrap_or_else(|| "unknown error".to_string());
-                if result.retried {
-                    progress(ChunkReviewProgress::RetryFailed {
-                        chunk_index: result.chunk_index,
-                        total_chunks,
-                        retries: result.attempts.saturating_sub(1),
-                        error: message.clone(),
-                    });
-                }
                 failures.push(ChunkFailure {
                     chunk_index: result.chunk_index,
                     message,
@@ -667,12 +633,198 @@ where
     })
 }
 
+async fn review_large_chunks_serially<F, Fut>(
+    context: LargeReviewRunContext<'_>,
+    chunks: &[ReviewChunk],
+    execution: LargeReviewExecutionOptions,
+    total_chunks: usize,
+    show_prompt: bool,
+    progress: &mut impl FnMut(ChunkReviewProgress),
+    call_llm: &F,
+) -> Vec<ChunkReviewResult>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<LlmReviewResponse>>,
+{
+    let mut results = Vec::new();
+
+    for chunk in chunks.iter().cloned() {
+        progress(ChunkReviewProgress::Started {
+            chunk_index: chunk.index,
+            total_chunks,
+        });
+        let mut result =
+            review_one_large_chunk(context, chunk.clone(), total_chunks, show_prompt, call_llm)
+                .await;
+        match result.status {
+            ChunkReviewStatus::Completed => progress(ChunkReviewProgress::Completed {
+                chunk_index: result.chunk_index,
+                total_chunks,
+                duration_ms: result.duration_ms,
+            }),
+            ChunkReviewStatus::Failed => progress(ChunkReviewProgress::Failed {
+                chunk_index: result.chunk_index,
+                total_chunks,
+                duration_ms: result.duration_ms,
+                error: result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".to_string()),
+            }),
+        }
+
+        for retry_attempt in 1..=execution.chunk_retries {
+            if result.status != ChunkReviewStatus::Failed || !result.retryable {
+                break;
+            }
+            if execution.retry_backoff_ms > 0 {
+                sleep(Duration::from_millis(execution.retry_backoff_ms)).await;
+            }
+
+            progress(ChunkReviewProgress::RetryStarted {
+                chunk_index: chunk.index,
+                total_chunks,
+                serial: true,
+                attempt: retry_attempt,
+                max_attempts: execution.chunk_retries,
+            });
+            let retry_result =
+                review_one_large_chunk(context, chunk.clone(), total_chunks, show_prompt, call_llm)
+                    .await;
+            merge_retry_result(&mut result, retry_result);
+
+            match result.status {
+                ChunkReviewStatus::Completed => {
+                    progress(ChunkReviewProgress::Retried {
+                        chunk_index: result.chunk_index,
+                        total_chunks,
+                        duration_ms: result.duration_ms,
+                    });
+                    break;
+                }
+                ChunkReviewStatus::Failed => {
+                    if retry_attempt == execution.chunk_retries || !result.retryable {
+                        progress(ChunkReviewProgress::RetryFailed {
+                            chunk_index: result.chunk_index,
+                            total_chunks,
+                            retries: result.attempts.saturating_sub(1),
+                            error: result
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "unknown error".to_string()),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+
+        results.push(result);
+    }
+
+    results
+}
+
+async fn review_large_chunks_in_parallel<F, Fut>(
+    context: LargeReviewRunContext<'_>,
+    chunks: &[ReviewChunk],
+    execution: LargeReviewExecutionOptions,
+    total_chunks: usize,
+    show_prompt: bool,
+    progress: &mut impl FnMut(ChunkReviewProgress),
+    call_llm: &F,
+) -> Vec<ChunkReviewResult>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<LlmReviewResponse>>,
+{
+    let parallelism = execution.effective_parallelism(total_chunks);
+    let mut results = run_large_chunk_wave(
+        context,
+        chunks,
+        ChunkWaveOptions {
+            total_chunks,
+            parallelism,
+            show_prompt,
+        },
+        FirstPassProgress,
+        progress,
+        call_llm,
+    )
+    .await;
+
+    for retry_attempt in 1..=execution.chunk_retries {
+        let retryable_chunks = retryable_failed_chunks(chunks, &results);
+        if retryable_chunks.is_empty() {
+            break;
+        }
+
+        progress(ChunkReviewProgress::Retrying {
+            retryable_failures: retryable_chunks.len(),
+            attempt: retry_attempt,
+            max_attempts: execution.chunk_retries,
+        });
+        if execution.retry_backoff_ms > 0 {
+            sleep(Duration::from_millis(execution.retry_backoff_ms)).await;
+        }
+
+        let retry_parallelism = if execution.retry_serial {
+            1
+        } else {
+            execution.effective_parallelism(retryable_chunks.len())
+        };
+        let retry_results = run_large_chunk_wave(
+            context,
+            &retryable_chunks,
+            ChunkWaveOptions {
+                total_chunks,
+                parallelism: retry_parallelism,
+                show_prompt,
+            },
+            RetryProgress {
+                serial: execution.retry_serial,
+                attempt: retry_attempt,
+                max_attempts: execution.chunk_retries,
+            },
+            progress,
+            call_llm,
+        )
+        .await;
+        replace_retry_results(&mut results, retry_results);
+    }
+
+    emit_retry_failures(&results, total_chunks, progress);
+    results
+}
+
+fn emit_retry_failures(
+    results: &[ChunkReviewResult],
+    total_chunks: usize,
+    progress: &mut impl FnMut(ChunkReviewProgress),
+) {
+    for result in results {
+        if result.status == ChunkReviewStatus::Failed && result.retried {
+            progress(ChunkReviewProgress::RetryFailed {
+                chunk_index: result.chunk_index,
+                total_chunks,
+                retries: result.attempts.saturating_sub(1),
+                error: result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".to_string()),
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FirstPassProgress;
 
 #[derive(Debug, Clone, Copy)]
 struct RetryProgress {
     serial: bool,
+    attempt: usize,
+    max_attempts: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -742,6 +894,8 @@ impl ChunkWaveProgress for RetryProgress {
             chunk_index,
             total_chunks,
             serial: self.serial,
+            attempt: self.attempt,
+            max_attempts: self.max_attempts,
         }
     }
 
@@ -856,19 +1010,23 @@ fn retryable_failed_chunks(
 }
 
 fn replace_retry_results(results: &mut [ChunkReviewResult], retry_results: Vec<ChunkReviewResult>) {
-    for mut retry_result in retry_results {
+    for retry_result in retry_results {
         let Some(existing) = results
             .iter_mut()
             .find(|result| result.chunk_index == retry_result.chunk_index)
         else {
             continue;
         };
-        retry_result.attempts = existing.attempts + 1;
-        retry_result.retried = true;
-        retry_result.prompt_token_estimate += existing.prompt_token_estimate;
-        retry_result.duration_ms = sum_duration(existing.duration_ms, retry_result.duration_ms);
-        *existing = retry_result;
+        merge_retry_result(existing, retry_result);
     }
+}
+
+fn merge_retry_result(existing: &mut ChunkReviewResult, mut retry_result: ChunkReviewResult) {
+    retry_result.attempts = existing.attempts + 1;
+    retry_result.retried = true;
+    retry_result.prompt_token_estimate += existing.prompt_token_estimate;
+    retry_result.duration_ms = sum_duration(existing.duration_ms, retry_result.duration_ms);
+    *existing = retry_result;
 }
 
 async fn review_one_large_chunk<F, Fut>(
@@ -1000,6 +1158,8 @@ fn retryable_message_marker(message: &str) -> bool {
         || message.contains("empty response")
         || message.contains("malformed json")
         || message.contains("json review object")
+        || message.contains("provider transient failure")
+        || message.contains("transient failure")
         || retryable_command_failure_marker(message)
 }
 
@@ -1013,6 +1173,8 @@ fn retryable_command_failure_marker(message: &str) -> bool {
             || message.contains("temporary unavailable")
             || message.contains("server error")
             || message.contains("service unavailable")
+            || message.contains("provider transient failure")
+            || message.contains("transient failure")
             || message.contains("try again")
             || message.contains("429")
             || message.contains("503"))
@@ -1967,6 +2129,9 @@ mod tests {
                 "provider command failed: temporarily unavailable".to_string()
             )
         ));
+        assert!(is_retryable_chunk_error_message(
+            "provider transient failure"
+        ));
     }
 
     #[test]
@@ -2157,6 +2322,195 @@ mod tests {
         assert!(preview.markdown.contains("Reviewed chunks: 1"));
         assert!(preview.markdown.contains("Retried chunks: 1"));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_json_with_null_overall_risk_is_retryable() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        assert!(is_retryable_chunk_error_message(
+            "malformed JSON review output: unknown overall risk 'null'"
+        ));
+
+        let (selection, chunks, anchors, metadata) = run_fixture(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let preview = review_large_chunks_with_llm(
+            LargeReviewRunContext {
+                metadata: &metadata,
+                selection: &selection,
+                anchors: &anchors,
+            },
+            &chunks,
+            execution_with_retries(false, 1, 1, true),
+            MarkdownRenderMode::Preview,
+            false,
+            |_| {},
+            {
+                let calls = Arc::clone(&calls);
+                move |_| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        let call = calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(LlmReviewResponse {
+                            text: if call == 0 {
+                                r#"{
+                                    "summary": "Chunk failed.",
+                                    "overall_risk": "null",
+                                    "findings": [],
+                                    "test_coverage_note": null,
+                                    "privacy_note": null
+                                }"#
+                                .to_string()
+                            } else {
+                                chunk_json("Chunk passed", None)
+                            },
+                            metadata: LlmRunMetadata::default(),
+                        })
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(preview.markdown.contains("Reviewed chunks: 1"));
+        assert!(preview.markdown.contains("Retried chunks: 1"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn serial_retry_runs_same_chunk_before_next_chunk_starts() {
+        use std::sync::{Arc, Mutex};
+
+        let (selection, chunks, anchors, metadata) = run_fixture(2);
+        let calls = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let mut events = Vec::new();
+
+        let preview = review_large_chunks_with_llm(
+            LargeReviewRunContext {
+                metadata: &metadata,
+                selection: &selection,
+                anchors: &anchors,
+            },
+            &chunks,
+            execution_with_retries(true, 1, 1, true),
+            MarkdownRenderMode::Preview,
+            false,
+            |progress| events.push(progress),
+            {
+                let calls = Arc::clone(&calls);
+                move |prompt| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        let chunk_index = prompt_chunk_index(&prompt);
+                        let call_count_for_chunk = {
+                            let mut calls = calls.lock().unwrap();
+                            calls.push(chunk_index);
+                            calls.iter().filter(|index| **index == chunk_index).count()
+                        };
+                        if chunk_index == 1 && call_count_for_chunk == 1 {
+                            return Err(ReviewGateError::GeminiTimeout { seconds: 240 });
+                        }
+                        Ok(LlmReviewResponse {
+                            text: chunk_json("Chunk passed", None),
+                            metadata: LlmRunMetadata::default(),
+                        })
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(preview.markdown.contains("Reviewed chunks: 2"));
+        assert_eq!(*calls.lock().unwrap(), vec![1, 1, 2]);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ChunkReviewProgress::Started { chunk_index: 1, .. },
+                ChunkReviewProgress::Failed { chunk_index: 1, .. },
+                ChunkReviewProgress::RetryStarted {
+                    chunk_index: 1,
+                    attempt: 1,
+                    max_attempts: 1,
+                    ..
+                },
+                ChunkReviewProgress::Retried { chunk_index: 1, .. },
+                ChunkReviewProgress::Started { chunk_index: 2, .. },
+                ChunkReviewProgress::Completed { chunk_index: 2, .. },
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn serial_retry_failure_is_reported_before_next_chunk_starts() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let (selection, chunks, anchors, metadata) = run_fixture(2);
+        let chunk_one_calls = Arc::new(AtomicUsize::new(0));
+        let mut events = Vec::new();
+
+        let preview = review_large_chunks_with_llm(
+            LargeReviewRunContext {
+                metadata: &metadata,
+                selection: &selection,
+                anchors: &anchors,
+            },
+            &chunks,
+            execution_with_retries(true, 1, 2, true),
+            MarkdownRenderMode::Preview,
+            false,
+            |progress| events.push(progress),
+            {
+                let chunk_one_calls = Arc::clone(&chunk_one_calls);
+                move |prompt| {
+                    let chunk_one_calls = Arc::clone(&chunk_one_calls);
+                    async move {
+                        if prompt.contains("This is chunk 1 of 2") {
+                            chunk_one_calls.fetch_add(1, Ordering::SeqCst);
+                            return Err(ReviewGateError::GeminiTimeout { seconds: 240 });
+                        }
+                        Ok(LlmReviewResponse {
+                            text: chunk_json("Chunk passed", None),
+                            metadata: LlmRunMetadata::default(),
+                        })
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        let report = preview.large_report.unwrap();
+        assert_eq!(report.reviewed_chunks, 1);
+        assert_eq!(report.retried_chunks, 1);
+        assert_eq!(report.failed_chunks, 1);
+        assert_eq!(chunk_one_calls.load(Ordering::SeqCst), 3);
+        let retry_failed = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    ChunkReviewProgress::RetryFailed {
+                        chunk_index: 1,
+                        retries: 2,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let chunk_two_started = events
+            .iter()
+            .position(|event| matches!(event, ChunkReviewProgress::Started { chunk_index: 2, .. }))
+            .unwrap();
+        assert!(retry_failed < chunk_two_started);
     }
 
     #[tokio::test]

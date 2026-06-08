@@ -520,13 +520,13 @@ async fn run_large_review(
             ChunkReviewProgress::RetryStarted {
                 chunk_index,
                 total_chunks,
-                serial,
+                serial: _,
+                attempt,
+                max_attempts,
             } => {
-                if serial {
-                    println!("Retrying chunk {chunk_index}/{total_chunks} serially...");
-                } else {
-                    println!("Retrying chunk {chunk_index}/{total_chunks}...");
-                }
+                println!(
+                    "Retrying chunk {chunk_index}/{total_chunks} attempt {attempt}/{max_attempts}..."
+                );
             }
             ChunkReviewProgress::Retried {
                 chunk_index,
@@ -541,7 +541,7 @@ async fn run_large_review(
                 retries,
                 ..
             } => {
-                let label = if retries == 1 { "retry" } else { "retries" };
+                let label = if retries == 1 { "attempt" } else { "attempts" };
                 println!(
                     "Chunk {chunk_index}/{total_chunks} failed after {retries} {label}. Findings may be incomplete."
                 );
