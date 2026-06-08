@@ -1130,17 +1130,17 @@ pub fn format_large_review_markdown_with_risk_gate(
         None => format_review_markdown_for_mode(analysis, mode),
     };
     let mut section = format!(
-        "## Large MR Review Plan\n\nPlanned chunks: {}\nReviewed chunks: {}\n",
+        "## Large MR Review Plan\n\n- Planned chunks: {}\n- Reviewed chunks: {}\n",
         report.total_chunks, report.reviewed_chunks
     );
     if report.retried_chunks > 0 {
-        section.push_str(&format!("Retried chunks: {}\n", report.retried_chunks));
+        section.push_str(&format!("- Retried chunks: {}\n", report.retried_chunks));
     }
     if report.failed_chunks > 0 {
-        section.push_str(&format!("Failed chunks: {}\n", report.failed_chunks));
+        section.push_str(&format!("- Failed chunks: {}\n", report.failed_chunks));
     }
     section.push_str(&format!(
-        "Reviewed files: {}\nSkipped files: {}\nReview mode: risk-prioritized partial review\n\nThis is not a full-file exhaustive review. ReviewGate prioritized high-risk changed files.\n\n",
+        "- Reviewed files: {}\n- Skipped files: {}\n- Review mode: risk-prioritized partial review\n\nThis is not a full-file exhaustive review. ReviewGate prioritized high-risk changed files.\n\n",
         report.reviewed_files, report.skipped_files
     ));
 
@@ -2549,10 +2549,10 @@ mod tests {
 
         assert!(markdown.contains("## Large MR Review Plan"));
         assert!(markdown.contains("## Finding Summary"));
-        assert!(markdown.contains("Planned chunks: 3"));
-        assert!(markdown.contains("Reviewed chunks: 3"));
-        assert!(!markdown.contains("Failed chunks:"));
-        assert!(markdown.contains("Review mode: risk-prioritized partial review"));
+        assert!(markdown.contains("- Planned chunks: 3"));
+        assert!(markdown.contains("- Reviewed chunks: 3"));
+        assert!(!markdown.contains("- Failed chunks:"));
+        assert!(markdown.contains("- Review mode: risk-prioritized partial review"));
     }
 
     #[test]
@@ -2563,9 +2563,9 @@ mod tests {
             MarkdownRenderMode::Publish,
         );
 
-        assert!(markdown.contains("Planned chunks: 9"));
-        assert!(markdown.contains("Reviewed chunks: 8"));
-        assert!(markdown.contains("Failed chunks: 1"));
+        assert!(markdown.contains("- Planned chunks: 9"));
+        assert!(markdown.contains("- Reviewed chunks: 8"));
+        assert!(markdown.contains("- Failed chunks: 1"));
         assert_eq!(markdown.matches("review chunks failed").count(), 0);
     }
 
