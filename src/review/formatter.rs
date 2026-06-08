@@ -3,9 +3,12 @@ use crate::{
     counters::{count_findings_from_analysis, emoji_enabled, format_finding_counters_markdown},
     review::{
         parser::ReviewParseError,
-        publisher_sanitizer::{sanitize_review_report, ReviewReport},
+        publisher_sanitizer::{is_engineish_phrase, sanitize_review_report, ReviewReport},
         risk::{format_merge_risk_gate_markdown, MergeRiskAssessment},
-        types::{EvidenceValidationStatus, ReviewAnalysis, ReviewFinding, RiskCode, Severity},
+        types::{
+            EvidenceValidationStatus, ReviewAnalysis, ReviewCategory, ReviewFinding, RiskCode,
+            Severity,
+        },
     },
 };
 use regex::Regex;
@@ -338,17 +341,18 @@ fn format_summary_note(summary: &str, mode: MarkdownRenderMode) -> String {
         let stripped = line
             .trim_start_matches(|ch: char| ch == '-' || ch == '*' || ch.is_whitespace())
             .trim();
-        if stripped.is_empty() || stripped.eq_ignore_ascii_case("main risks found:") {
+        if stripped.is_empty()
+            || stripped.eq_ignore_ascii_case("main risks found:")
+            || is_engineish_phrase(stripped)
+        {
             continue;
         }
-        if line.starts_with('-') || line.starts_with('*') {
-            if is_summary_point(stripped) {
-                let key = normalize_sentence_key(stripped);
-                if !key.is_empty() && seen_summary_points.insert(key) {
-                    summary_points.push(stripped.to_string());
-                }
-                continue;
+        if (line.starts_with('-') || line.starts_with('*')) && is_summary_point(stripped) {
+            let key = normalize_sentence_key(stripped);
+            if !key.is_empty() && seen_summary_points.insert(key) {
+                summary_points.push(stripped.to_string());
             }
+            continue;
         }
         let sentence = sentence_from_text(stripped);
         let lower = sentence.to_ascii_lowercase();
@@ -362,14 +366,14 @@ fn format_summary_note(summary: &str, mode: MarkdownRenderMode) -> String {
         }
         if line.starts_with('-') || line.starts_with('*') {
             let key = normalize_sentence_key(&sentence);
-            if !key.is_empty() && seen_bullets.insert(key) && bullets.len() < 5 {
+            if !key.is_empty() && seen_bullets.insert(key) && bullets.len() < 3 {
                 bullets.push(sentence);
             }
             continue;
         }
         if overview.is_none() {
             overview = Some(sentence);
-        } else if bullets.len() < 5 {
+        } else if bullets.len() < 3 {
             let key = normalize_sentence_key(&sentence);
             if !key.is_empty() && seen_bullets.insert(key) {
                 bullets.push(sentence);
@@ -378,7 +382,13 @@ fn format_summary_note(summary: &str, mode: MarkdownRenderMode) -> String {
     }
 
     let mut output = if summary_points.is_empty() {
-        overview.unwrap_or_else(|| "No summary returned.".to_string())
+        overview.unwrap_or_else(|| {
+            if bullets.is_empty() {
+                "No summary returned.".to_string()
+            } else {
+                String::new()
+            }
+        })
     } else {
         let mut output = String::new();
         for point in summary_points {
@@ -386,10 +396,18 @@ fn format_summary_note(summary: &str, mode: MarkdownRenderMode) -> String {
             output.push_str(&point);
             output.push('\n');
         }
-        output.trim_end().to_string()
+        let mut output = output.trim_end().to_string();
+        if let Some(overview) = overview {
+            output.push_str("\n\n");
+            output.push_str(&overview);
+        }
+        output
     };
     if !bullets.is_empty() {
-        output.push_str("\n\nMain risks found:\n");
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        output.push_str("Main risks found:\n");
         for bullet in bullets {
             output.push_str("- ");
             output.push_str(&bullet);
@@ -531,7 +549,7 @@ fn format_test_coverage_note(
     let concrete_gaps = concrete_coverage_gaps(&analysis.findings);
     if !concrete_gaps.is_empty() {
         let mut output = String::from("Coverage gaps:\n");
-        for gap in concrete_gaps {
+        for gap in concrete_gaps.into_iter().take(3) {
             output.push_str("- ");
             output.push_str(&gap);
             output.push('\n');
@@ -539,50 +557,8 @@ fn format_test_coverage_note(
         return output.trim_end().to_string();
     }
 
-    let text = note.unwrap_or_default();
-    let raw_items = split_note_items(text);
-    let _has_generic_no_tests = raw_items
-        .iter()
-        .map(|item| sentence_from_text(item))
-        .any(|item| is_generic_no_tests_item(&item));
-    let items = useful_note_items(text, 8, is_generic_test_coverage_item);
-    if items.is_empty() {
-        return "No specific test coverage gaps were detected from the reviewed diff.".to_string();
-    }
-
-    let mut gaps = Vec::new();
-    let mut positives = Vec::new();
-    for item in items {
-        if is_positive_test_coverage_item(&item) {
-            positives.push(item);
-        } else {
-            gaps.push(item);
-        }
-    }
-    gaps = normalize_test_coverage_gaps(gaps);
-
-    let mut output = String::new();
-    if !gaps.is_empty() {
-        output.push_str("Coverage gaps:\n");
-        for gap in gaps.into_iter().take(4) {
-            output.push_str("- ");
-            output.push_str(&gap);
-            output.push('\n');
-        }
-    }
-    if !positives.is_empty() {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        output.push_str("Positive:\n");
-        for positive in positives.into_iter().take(2) {
-            output.push_str("- ");
-            output.push_str(&positive);
-            output.push('\n');
-        }
-    }
-
-    output.trim_end().to_string()
+    let _ = note;
+    "No specific test coverage gaps were detected from the reviewed diff.".to_string()
 }
 
 fn format_privacy_note(
@@ -667,7 +643,7 @@ fn useful_note_items(text: &str, limit: usize, is_generic: impl Fn(&str) -> bool
         if !renderable_note_item(&sentence) {
             continue;
         }
-        if is_generic(&sentence) {
+        if is_engineish_phrase(&sentence) || is_generic(&sentence) {
             continue;
         }
         let key = normalize_sentence_key(&sentence);
@@ -799,147 +775,167 @@ fn negative_positive_note_text(finding: &ReviewFinding) -> bool {
 }
 
 fn concrete_coverage_gaps(findings: &[ReviewFinding]) -> Vec<String> {
-    let mut gaps = Vec::new();
     let validated = findings
         .iter()
-        .filter(|finding| validated_finding(finding))
+        .filter(|finding| validated_priority_finding(finding))
         .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    let mut gaps = Vec::new();
 
-    if validated
-        .iter()
-        .any(|finding| finding.risk_code == Some(RiskCode::SqlInjection))
-    {
-        gaps.push(
-            "Add a test proving `findPaymentsByCustomer` uses parameterized queries.".to_string(),
-        );
-    }
-    if validated.iter().any(|finding| {
-        finding.risk_code == Some(RiskCode::SecretLeak)
-            && contains_any_text(
-                &format!(
-                    "{} {}",
-                    finding.file_path.as_deref().unwrap_or_default(),
-                    finding_text(finding)
-                ),
-                &["google maps", "maps api key", "androidmanifest.xml"],
-            )
-    }) {
-        gaps.push("Add a release/configuration check proving the Google Maps API key is package/SHA restricted.".to_string());
-    }
-    if validated.iter().any(|finding| {
-        matches!(
-            finding.risk_code,
-            Some(RiskCode::SecretLeak | RiskCode::PiiOrSecretLogging)
-        ) && contains_any_text(
-            &finding_text(finding),
-            &["authorization", "header", "token", "password", "cookie"],
-        ) && contains_any_text(&finding_text(finding), &["log", "logged", "logging"])
-    }) {
-        gaps.push("Add a test ensuring Authorization headers are not logged.".to_string());
-    }
-    if validated.iter().any(|finding| {
-        finding.risk_code == Some(RiskCode::WeakErrorHandling)
-            && contains_any_text(
-                &format!(
-                    "{} {}",
-                    finding.file_path.as_deref().unwrap_or_default(),
-                    finding_text(finding)
-                ),
-                &["webhook", "json", "parse", "payload", "malformed"],
-            )
-    }) {
-        gaps.push("Add a test for malformed webhook JSON handling.".to_string());
-    }
-    if validated.iter().any(|finding| {
-        finding.risk_code == Some(RiskCode::WeakErrorHandling)
-            && contains_any_text(
-                &format!(
-                    "{} {}",
-                    finding.file_path.as_deref().unwrap_or_default(),
-                    finding_text(finding)
-                ),
-                &[
-                    "antiinstrumentation",
-                    "native security",
-                    "security check",
-                    "signature verification",
-                    "broad exception",
-                ],
-            )
-    }) {
-        gaps.push("Add tests for native security modules and their failure modes.".to_string());
-    }
-    if validated.iter().any(|finding| {
-        finding.risk_code == Some(RiskCode::DataIntegrityRisk)
-            && contains_any_text(&finding_text(finding), &["wipe", "delete", "local data"])
-    }) {
-        gaps.push("Add a regression test for local data wipe behavior.".to_string());
-    }
-    if validated.iter().any(|finding| {
-        contains_any_text(
-            &format!(
-                "{} {}",
-                finding.file_path.as_deref().unwrap_or_default(),
-                finding_text(finding)
-            ),
-            &["webview", "logout", "fixed timeout", "cleanup timeout"],
-        )
-    }) {
-        gaps.push(
-            "Add a test or monitor for WebView cleanup timeout behavior during logout.".to_string(),
-        );
+    for finding in validated {
+        let Some((family, gap)) = coverage_gap_for_finding(finding) else {
+            continue;
+        };
+        let module = finding_module(finding);
+        let key = format!("{family}:{module}");
+        if !seen.insert(key) {
+            continue;
+        }
+        gaps.push(gap);
+        if gaps.len() >= 3 {
+            break;
+        }
     }
 
     gaps
 }
 
-fn normalize_test_coverage_gaps(gaps: Vec<String>) -> Vec<String> {
-    let mut output = Vec::new();
-    let mut seen = HashSet::new();
-    let mut native_security_gap = false;
-    for gap in gaps {
-        if native_security_test_gap(&gap) {
-            native_security_gap = true;
-            continue;
-        }
-        let key = normalize_sentence_key(&gap);
-        if !key.is_empty() && seen.insert(key) {
-            output.push(gap);
-        }
+fn coverage_gap_for_finding(finding: &ReviewFinding) -> Option<(String, String)> {
+    let text = format!(
+        "{} {} {}",
+        finding.file_path.as_deref().unwrap_or_default(),
+        finding.title,
+        finding.body
+    )
+    .to_ascii_lowercase();
+    let module = finding_module(finding);
+    let in_module = format!("in `{module}`");
+
+    if contains_any_text(&text, &["timeout", "fallback"]) {
+        return Some((
+            "timeout".to_string(),
+            format!("Add tests for timeout and fallback behavior {in_module}."),
+        ));
     }
-    if native_security_gap {
-        let gap = "Add tests for native security modules and their failure modes.".to_string();
-        let key = normalize_sentence_key(&gap);
-        if seen.insert(key) {
-            output.insert(0, gap);
-        }
+    if contains_any_text(
+        &text,
+        &[
+            "parse",
+            "parsing",
+            "parser",
+            "json",
+            "malformed",
+            "deserialize",
+            "deserialization",
+        ],
+    ) {
+        return Some((
+            "parsing".to_string(),
+            format!("Add tests for malformed input handling {in_module}."),
+        ));
     }
-    output
+    if matches!(finding.risk_code, Some(RiskCode::WeakErrorHandling)) {
+        if finding.category == ReviewCategory::Security
+            || contains_any_text(
+                &text,
+                &[
+                    "security",
+                    "signature",
+                    "certificate",
+                    "auth",
+                    "permission",
+                    "token",
+                    "fail-closed",
+                    "native",
+                ],
+            )
+        {
+            return Some((
+                "security_failure".to_string(),
+                format!(
+                    "Add tests for security check failure and fail-closed behavior {in_module}."
+                ),
+            ));
+        }
+        return Some((
+            "failure_path".to_string(),
+            format!("Add tests for failure-path handling {in_module}."),
+        ));
+    }
+    if finding.category == ReviewCategory::Security
+        || matches!(
+            finding.risk_code,
+            Some(
+                RiskCode::AuthBypass
+                    | RiskCode::MissingAuthorizationCheck
+                    | RiskCode::SecretLeak
+                    | RiskCode::PiiOrSecretLogging
+                    | RiskCode::SqlInjection
+                    | RiskCode::CommandInjection
+                    | RiskCode::UnsafeDeserialization
+            )
+        )
+    {
+        return Some((
+            "security".to_string(),
+            format!("Add tests for security check failure and fail-closed behavior {in_module}."),
+        ));
+    }
+    if matches!(
+        finding.risk_code,
+        Some(
+            RiskCode::MissingTimeout
+                | RiskCode::UnboundedRetry
+                | RiskCode::DataIntegrityRisk
+                | RiskCode::ApiContractBreak
+                | RiskCode::MissingTestCoverage
+        )
+    ) {
+        return Some((
+            "regression".to_string(),
+            format!(
+                "Add regression tests for {} {in_module}.",
+                finding_title_fragment(finding)
+            ),
+        ));
+    }
+    None
 }
 
-fn native_security_test_gap(item: &str) -> bool {
-    let lower = item.to_ascii_lowercase();
-    contains_any_text(
-        &lower,
-        &[
-            "native security module",
-            "native security modules",
-            "runtimesecurityguard",
-            "deviceintegritymodule",
-            "screensecuritymodule",
-            "appsignatureverifier",
-            "antiinstrumentation",
-        ],
-    ) && contains_any_text(&lower, &["test", "tests", "coverage", "failure mode"])
+fn validated_priority_finding(finding: &ReviewFinding) -> bool {
+    finding.actionable
+        && matches!(
+            finding.severity,
+            Severity::Critical | Severity::High | Severity::Medium
+        )
+        && validated_finding(finding)
+}
+
+fn finding_module(finding: &ReviewFinding) -> String {
+    finding
+        .file_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or("the affected module")
+        .to_string()
+}
+
+fn finding_title_fragment(finding: &ReviewFinding) -> String {
+    finding
+        .title
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .to_ascii_lowercase()
 }
 
 fn has_validated_privacy_risk_finding(findings: &[ReviewFinding]) -> bool {
     findings.iter().any(|finding| {
-        validated_finding(finding)
-            && matches!(
-                finding.risk_code,
-                Some(RiskCode::SecretLeak | RiskCode::PiiOrSecretLogging)
-            )
+        validated_priority_finding(finding)
+            && (finding.category == ReviewCategory::Privacy
+                || matches!(
+                    finding.risk_code,
+                    Some(RiskCode::SecretLeak | RiskCode::PiiOrSecretLogging)
+                ))
     })
 }
 
@@ -947,11 +943,12 @@ fn privacy_risks_from_findings(findings: &[ReviewFinding]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut risks = Vec::new();
     for finding in findings.iter().filter(|finding| {
-        validated_finding(finding)
-            && matches!(
-                finding.risk_code,
-                Some(RiskCode::SecretLeak | RiskCode::PiiOrSecretLogging)
-            )
+        validated_priority_finding(finding)
+            && (finding.category == ReviewCategory::Privacy
+                || matches!(
+                    finding.risk_code,
+                    Some(RiskCode::SecretLeak | RiskCode::PiiOrSecretLogging)
+                ))
     }) {
         let text = format!(
             "{} {}",
@@ -1025,18 +1022,6 @@ fn contains_any_text(value: &str, terms: &[&str]) -> bool {
         .any(|term| value.contains(&term.to_ascii_lowercase()))
 }
 
-fn is_generic_test_coverage_item(item: &str) -> bool {
-    let lower = item.to_ascii_lowercase();
-    is_generic_no_tests_item(item)
-        || lower.contains("cannot be assessed")
-        || lower.contains("test coverage insufficient")
-        || lower.contains("test coverage is insufficient")
-        || lower.contains("no tests visible in this chunk")
-        || lower.contains("should be thoroughly tested")
-        || lower == "recommended to add tests."
-        || lower == "add tests."
-}
-
 fn is_positive_test_coverage_item(item: &str) -> bool {
     let lower = item.to_ascii_lowercase();
     let uncertain_or_negative = [
@@ -1062,13 +1047,6 @@ fn is_positive_test_coverage_item(item: &str) -> bool {
             || lower.contains("unit tests cover")
             || lower.contains("integration tests cover")
             || lower.contains("covered by"))
-}
-
-fn is_generic_no_tests_item(item: &str) -> bool {
-    let lower = item.to_ascii_lowercase();
-    lower.contains("no tests are visible in this chunk")
-        || lower.contains("no tests are visible")
-        || lower.contains("did not find visible tests")
 }
 
 fn is_no_secret_or_pii_item(item: &str) -> bool {
@@ -1527,14 +1505,10 @@ mod tests {
             false,
         );
 
-        assert!(markdown.contains("Coverage gaps:\n- Device integrity flows need tests."));
-        assert_eq!(
-            markdown
-                .matches("Device integrity flows need tests.")
-                .count(),
-            1
-        );
-        assert!(markdown.contains("Positive:\n- authTokenStorage has unit tests."));
+        assert!(markdown
+            .contains("No specific test coverage gaps were detected from the reviewed diff."));
+        assert!(!markdown.contains("Device integrity flows need tests."));
+        assert!(!markdown.contains("authTokenStorage has unit tests."));
         assert!(!markdown.contains("No tests are visible in this chunk"));
         assert!(!markdown.contains("cannot be assessed"));
     }
@@ -1557,13 +1531,12 @@ mod tests {
         );
         let section = markdown_section(&markdown, "## Test Coverage");
 
-        assert!(section.contains("Coverage gaps:"));
-        assert!(
-            section.contains("- Add tests for native security modules and their failure modes.")
-        );
-        assert!(section.contains("- Upload cleanup needs regression tests."));
-        assert!(section.contains("Positive:\n- authTokenStorage has unit tests."));
-        assert!(section.contains("- Token rotation has tests."));
+        assert!(section
+            .contains("No specific test coverage gaps were detected from the reviewed diff."));
+        assert!(!section.contains("Coverage gaps:"));
+        assert!(!section.contains("authTokenStorage has unit tests."));
+        assert!(!section.contains("Upload cleanup needs regression tests."));
+        assert!(!section.contains("- Token rotation has tests."));
         assert!(!section.contains("- Another module has tests."));
     }
 
@@ -1586,7 +1559,8 @@ mod tests {
         let section = markdown_section(&markdown, "## Test Coverage");
 
         assert!(!section.contains("The core native security features in DeviceIntegrityModule"));
-        assert!(section.contains("- Upload cleanup needs regression tests."));
+        assert!(section
+            .contains("No specific test coverage gaps were detected from the reviewed diff."));
     }
 
     #[test]
@@ -1634,10 +1608,9 @@ mod tests {
         );
         let section = markdown_section(&markdown, "## Test Coverage");
 
-        assert!(section.contains(
-            "Coverage gaps:\n- Add tests for native security modules and their failure modes."
-        ));
-        assert_eq!(section.matches("native security modules").count(), 1);
+        assert!(section
+            .contains("No specific test coverage gaps were detected from the reviewed diff."));
+        assert_eq!(section.matches("native security modules").count(), 0);
         assert!(!section.contains("RuntimeSecurityGuard needs exception tests"));
         assert!(!section.contains("DeviceIntegrityModule needs failure tests"));
         assert!(!section.contains("ScreenSecurityModule needs coverage"));
@@ -1813,12 +1786,11 @@ mod tests {
         );
         let section = markdown_section(&markdown, "## Test Coverage");
 
-        assert!(
-            section.contains("- Add tests for native security modules and their failure modes.")
-        );
         assert!(section.contains(
-            "- Add a test or monitor for WebView cleanup timeout behavior during logout."
+            "- Add tests for security check failure and fail-closed behavior in `AntiInstrumentationModule.kt`."
         ));
+        assert!(section
+            .contains("- Add tests for timeout and fallback behavior in `Profile/index.tsx`."));
         assert!(!section.contains("Test coverage is insufficient"));
     }
 
@@ -1975,10 +1947,11 @@ mod tests {
         );
         let section = markdown_section(&markdown, "## Test Coverage");
 
-        assert!(section
-            .contains("- Add a test proving `findPaymentsByCustomer` uses parameterized queries."));
-        assert!(section.contains("- Add a test ensuring Authorization headers are not logged."));
-        assert!(section.contains("- Add a test for malformed webhook JSON handling."));
+        assert!(section.contains(
+            "- Add tests for security check failure and fail-closed behavior in `src/paymentClient.ts`."
+        ));
+        assert!(section.contains("- Add tests for malformed input handling in `src/webhook.ts`."));
+        assert_eq!(section.matches("\n- ").count(), 2);
         assert!(!section.contains("Test coverage is insufficient."));
     }
 
@@ -2030,13 +2003,77 @@ mod tests {
         assert!(section.starts_with("- Reviewed files: 64 risk-prioritized files"));
         assert!(section.contains("- Reviewed chunks: 8"));
         assert!(section.contains("- Skipped files: 25 (collapsed by GitLab)"));
-        assert!(section.contains("Main risks found:\n- First security risk."));
-        assert!(section.contains("- Fifth coverage risk."));
+        assert!(!section.contains("Main risks found:"));
+        assert!(section.contains("No priority risks remain open from the reviewed chunks."));
         assert!(!section.contains("- Sixth deployment risk."));
         assert!(section.contains(
             "- Scope: This is a partial risk-prioritized review, not a full exhaustive review."
         ));
         assert!(!section.contains("Extra trailing sentence"));
+    }
+
+    #[test]
+    fn summary_main_risks_match_final_priority_finding_titles() {
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &ReviewAnalysis {
+                summary: "Main risks found:\n- Raw chunk-only cache migration risk.\n- Authentication callback drops errors."
+                    .to_string(),
+                findings: vec![
+                    finding(Severity::Medium, "Authentication callback drops errors"),
+                    finding(Severity::Medium, "Token refresh timeout has no fallback"),
+                    finding(Severity::Low, "Low-priority logging cleanup"),
+                ],
+                test_coverage_note: None,
+                privacy_note: None,
+                overall_risk: OverallRisk::Medium,
+            },
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        let section = markdown_section(&markdown, "## Summary");
+
+        assert!(section.contains("Main risks found:\n- Authentication callback drops errors."));
+        assert!(section.contains("- Token refresh timeout has no fallback."));
+        assert!(!section.contains("Raw chunk-only cache migration risk"));
+        assert!(!section.contains("Low-priority logging cleanup"));
+    }
+
+    #[test]
+    fn finding_specific_coverage_dedupes_and_caps_at_three_bullets() {
+        let mut first_security = finding(Severity::Medium, "Security check fails open");
+        first_security.category = ReviewCategory::Security;
+        first_security.risk_code = Some(RiskCode::WeakErrorHandling);
+        first_security.file_path = Some("src/security/guard.rs".to_string());
+        let mut duplicate_security = finding(Severity::Medium, "Security check logs then allows");
+        duplicate_security.category = ReviewCategory::Security;
+        duplicate_security.risk_code = Some(RiskCode::WeakErrorHandling);
+        duplicate_security.file_path = Some("src/security/guard.rs".to_string());
+        let mut timeout = finding(Severity::Medium, "Token refresh timeout has no fallback");
+        timeout.risk_code = Some(RiskCode::MissingTimeout);
+        timeout.file_path = Some("src/auth/token.rs".to_string());
+        let mut parse = finding(Severity::Medium, "Webhook JSON parse errors are swallowed");
+        parse.risk_code = Some(RiskCode::WeakErrorHandling);
+        parse.file_path = Some("src/webhook.rs".to_string());
+        let mut retry = finding(Severity::Medium, "Retry queue can grow without bound");
+        retry.risk_code = Some(RiskCode::UnboundedRetry);
+        retry.file_path = Some("src/retry.rs".to_string());
+
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![first_security, duplicate_security, timeout, parse, retry],
+                test_coverage_note: Some("No tests are visible in this chunk.".to_string()),
+                privacy_note: None,
+                overall_risk: OverallRisk::Medium,
+            },
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        let section = markdown_section(&markdown, "## Test Coverage");
+
+        assert_eq!(section.matches("\n- ").count(), 3);
+        assert_eq!(section.matches("src/security/guard.rs").count(), 1);
+        assert!(!section.contains("No tests are visible in this chunk"));
     }
 
     fn finding(severity: Severity, title: &str) -> ReviewFinding {

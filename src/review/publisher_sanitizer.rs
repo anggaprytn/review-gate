@@ -40,7 +40,7 @@ pub fn sanitize_merge_risk_assessment(
     add_missing_finding_actions(analysis, &mut assessment.required_before_merge);
     dedupe_gate_items(&mut assessment.blocking_issues);
     dedupe_gate_items(&mut assessment.required_before_merge);
-    assessment.required_before_merge.truncate(6);
+    assessment.required_before_merge.truncate(5);
 
     let has_critical = analysis.findings.iter().any(|finding| {
         validated_actionable_finding(finding) && finding.severity == Severity::Critical
@@ -175,42 +175,79 @@ fn risk_sort_key(risk: OverallRisk) -> u8 {
 }
 
 fn sanitize_review_analysis(mut analysis: ReviewAnalysis) -> ReviewAnalysis {
-    analysis.summary = sanitize_summary(&analysis.summary, &analysis.findings);
-    analysis.test_coverage_note =
-        sanitize_optional_note(analysis.test_coverage_note, &analysis.findings);
-    analysis.privacy_note = sanitize_optional_note(analysis.privacy_note, &analysis.findings);
     for finding in &mut analysis.findings {
         sanitize_security_exception_fix(finding);
     }
     analysis.findings.retain(renderable_final_finding);
+    analysis.summary = sanitize_summary(&analysis.summary, &analysis.findings);
+    analysis.test_coverage_note =
+        sanitize_optional_note(analysis.test_coverage_note, &analysis.findings);
+    analysis.privacy_note = sanitize_optional_note(analysis.privacy_note, &analysis.findings);
     analysis
 }
 
 fn sanitize_summary(summary: &str, findings: &[ReviewFinding]) -> String {
-    let mut output = Vec::new();
+    let mut metadata = Vec::new();
+    let mut caveat = None;
+    let mut overview = None;
     for line in summary.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            output.push(String::new());
             continue;
         }
         if is_bullet(trimmed) {
             let item = bullet_text(trimmed);
-            if is_review_summary_metadata(item) || has_item_evidence(item, findings) {
-                output.push(trimmed.to_string());
+            if is_review_summary_metadata(item) && !is_engineish_phrase(item) {
+                metadata.push(trimmed.to_string());
             }
             continue;
         }
-        if !policy_template_without_finding_evidence(trimmed, findings) {
-            output.push(trimmed.to_string());
+        let lower = trimmed.to_ascii_lowercase();
+        if is_engineish_phrase(trimmed)
+            || policy_template_without_finding_evidence(trimmed, findings)
+        {
+            continue;
+        }
+        if lower.contains("partial")
+            || lower.contains("risk-prioritized")
+            || lower.contains("not a full exhaustive review")
+            || lower.contains("not a full-file exhaustive review")
+        {
+            caveat.get_or_insert(sentence_from_suggested_fix(trimmed));
+        } else if overview.is_none() {
+            overview = Some(sentence_from_suggested_fix(trimmed));
         }
     }
-    let sanitized = output.join("\n").trim().to_string();
-    if sanitized.is_empty() {
-        "ReviewGate found no evidence-backed summary bullets to publish.".to_string()
+
+    let mut output = metadata.join("\n");
+    let titles = priority_finding_titles(findings, 3);
+    if titles.is_empty() {
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        output.push_str(
+            overview
+                .as_deref()
+                .filter(|_| metadata.is_empty())
+                .unwrap_or("No priority risks remain open from the reviewed chunks."),
+        );
     } else {
-        sanitized
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        output.push_str("Main risks found:\n");
+        for title in titles {
+            output.push_str("- ");
+            output.push_str(&title);
+            output.push('\n');
+        }
+        output = output.trim_end().to_string();
     }
+    if let Some(caveat) = caveat {
+        output.push_str("\n\n");
+        output.push_str(&caveat);
+    }
+    output
 }
 
 fn sanitize_optional_note(note: Option<String>, findings: &[ReviewFinding]) -> Option<String> {
@@ -219,6 +256,9 @@ fn sanitize_optional_note(note: Option<String>, findings: &[ReviewFinding]) -> O
             .filter(|line| {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
+                    return false;
+                }
+                if is_engineish_phrase(trimmed) {
                     return false;
                 }
                 if is_bullet(trimmed) {
@@ -350,12 +390,20 @@ fn finding_required_action(finding: &ReviewFinding) -> String {
         .map(str::trim)
         .filter(|fix| specific_suggested_fix(fix))
     {
-        return sentence_from_suggested_fix(fix);
+        let action = sentence_from_suggested_fix(fix);
+        if !weakens_security_posture(&action) {
+            return action;
+        }
     }
     format!(
-        "Address \"{}\" in {}.",
+        "Address \"{}\" in {}{}.",
         sentence_fragment(&finding.title),
-        finding_file_path(finding)
+        finding_file_path(finding),
+        if security_sensitive_finding(finding) {
+            " while preserving the existing security posture"
+        } else {
+            ""
+        }
     )
 }
 
@@ -377,6 +425,9 @@ fn specific_suggested_fix(fix: &str) -> bool {
                 | "address this"
         )
         && !generic_placeholder_fix(&lower)
+        && !is_engineish_phrase(fix)
+        && !lower.contains("handle the issue")
+        && !lower.contains("handle this issue")
 }
 
 fn high_blocking_finding(finding: &ReviewFinding) -> bool {
@@ -455,20 +506,10 @@ fn has_medium(analysis: &ReviewAnalysis) -> bool {
 }
 
 fn add_calibrated_why_factors(analysis: &ReviewAnalysis, assessment: &mut MergeRiskAssessment) {
+    let mut original_factors = std::mem::take(&mut assessment.risk_factors);
     let mut public_reasons = public_why_factors(analysis, assessment);
-    public_reasons.append(&mut assessment.risk_factors);
+    public_reasons.append(&mut original_factors);
     assessment.risk_factors = public_reasons;
-
-    for factor in &mut assessment.risk_factors {
-        if generic_why_label(&factor.label) {
-            if let Some(label) = finding_why_label_for_factor(analysis, factor) {
-                factor.label = label;
-            }
-        }
-        if factor.rule_id.contains("large_review") || factor.rule_id.contains("partial") {
-            factor.label = "Large MR review was partial or risk-prioritized.".to_string();
-        }
-    }
     dedupe_risk_factors_by_label(&mut assessment.risk_factors);
 }
 
@@ -477,43 +518,61 @@ fn public_why_factors(
     assessment: &MergeRiskAssessment,
 ) -> Vec<RiskFactor> {
     let mut factors = Vec::new();
+    let priority = priority_findings(analysis);
+    let large = large_review_partial(assessment);
+    let high_risk = security_sensitive_modified(assessment)
+        || priority
+            .iter()
+            .any(|finding| security_sensitive_finding(finding));
     match assessment.decision {
-        MergeDecision::Pass => {}
-        MergeDecision::Blocked => {
+        MergeDecision::Pass => {
             factors.push(public_why_factor(
-                "published.why.blocking_findings",
-                "Validated blocking findings remain open.",
+                "published.why.no_priority",
+                "No priority findings remain open.",
             ));
+            if large {
+                factors.push(public_why_factor(
+                    "published.why.large_review",
+                    "Review was risk-prioritized because the MR is large.",
+                ));
+            }
         }
-        MergeDecision::NeedsHuman => {
-            if has_open_severity(analysis, Severity::Medium) {
+        MergeDecision::Blocked | MergeDecision::NeedsHuman => {
+            if priority.len() == 1 {
                 factors.push(public_why_factor(
-                    "published.why.medium_open",
-                    "Medium-priority findings remain open.",
+                    "published.why.single_finding",
+                    format!(
+                        "{} remains open.",
+                        clean_finding_title(priority[0]).trim_end_matches(['.', '!', '?'])
+                    ),
+                ));
+                if high_risk {
+                    factors.push(public_why_factor(
+                        "published.why.high_risk_code",
+                        "Review touched security-sensitive or high-risk code.",
+                    ));
+                }
+            } else if priority.len() > 1 {
+                factors.push(public_why_factor(
+                    "published.why.multiple_findings",
+                    multiple_findings_why(&priority),
+                ));
+                if high_risk {
+                    factors.push(public_why_factor(
+                        "published.why.high_risk_paths",
+                        "Review touched high-risk code paths.",
+                    ));
+                }
+            } else {
+                factors.push(public_why_factor(
+                    "published.why.no_priority",
+                    "No priority findings remain open.",
                 ));
             }
-            if has_open_severity(analysis, Severity::High) {
+            if large && factors.len() < 3 {
                 factors.push(public_why_factor(
-                    "published.why.high_open",
-                    "High-priority findings remain open.",
-                ));
-            }
-            if security_sensitive_modified(assessment) && open_non_note_findings(analysis) > 0 {
-                factors.push(public_why_factor(
-                    "published.why.security_sensitive_files",
-                    "Security-sensitive files were modified.",
-                ));
-            }
-            if large_review_partial(assessment) && open_non_note_findings(analysis) > 0 {
-                factors.push(public_why_factor(
-                    "published.why.large_partial",
-                    "Large MR review was partial or risk-prioritized.",
-                ));
-            }
-            if factors.is_empty() && assessment.score >= DECISION_NEEDS_HUMAN_SCORE {
-                factors.push(public_why_factor(
-                    "published.why.score",
-                    format!("Review risk score is {}/100.", assessment.score),
+                    "published.why.large_review",
+                    "Review was risk-prioritized because the MR is large.",
                 ));
             }
         }
@@ -522,11 +581,84 @@ fn public_why_factors(
     factors
 }
 
-fn has_open_severity(analysis: &ReviewAnalysis, severity: Severity) -> bool {
-    analysis
+fn priority_findings(analysis: &ReviewAnalysis) -> Vec<&ReviewFinding> {
+    let mut findings = analysis
         .findings
         .iter()
-        .any(|finding| validated_actionable_finding(finding) && finding.severity == severity)
+        .filter(|finding| validated_actionable_finding(finding))
+        .filter(|finding| {
+            matches!(
+                finding.severity,
+                Severity::Critical | Severity::High | Severity::Medium
+            )
+        })
+        .collect::<Vec<_>>();
+    findings.sort_by(|left, right| {
+        left.severity
+            .sort_key()
+            .cmp(&right.severity.sort_key())
+            .then_with(|| left.file_path.cmp(&right.file_path))
+            .then_with(|| left.title.cmp(&right.title))
+    });
+    findings
+}
+
+fn priority_finding_titles(findings: &[ReviewFinding], limit: usize) -> Vec<String> {
+    let analysis = ReviewAnalysis {
+        summary: String::new(),
+        findings: findings.to_vec(),
+        test_coverage_note: None,
+        privacy_note: None,
+        overall_risk: OverallRisk::Low,
+    };
+    let mut seen = HashSet::new();
+    priority_findings(&analysis)
+        .into_iter()
+        .filter_map(|finding| {
+            let title = clean_finding_title(finding);
+            let key = normalize_key(&title);
+            if key.is_empty() || is_engineish_phrase(&title) || !seen.insert(key) {
+                return None;
+            }
+            Some(title)
+        })
+        .take(limit)
+        .collect()
+}
+
+fn multiple_findings_why(findings: &[&ReviewFinding]) -> String {
+    let mut areas = findings
+        .iter()
+        .map(|finding| finding.category.display_lower().replace('_', " "))
+        .filter(|area| !area.trim().is_empty())
+        .collect::<Vec<_>>();
+    areas.sort();
+    areas.dedup();
+    let areas = areas.into_iter().take(2).collect::<Vec<_>>();
+    if areas.is_empty() {
+        "Multiple priority findings remain open.".to_string()
+    } else {
+        format!(
+            "Multiple priority findings remain open across {} areas.",
+            areas.join("/")
+        )
+    }
+}
+
+fn clean_finding_title(finding: &ReviewFinding) -> String {
+    let mut title = finding.title.trim().trim_end_matches(['.', '!', '?']);
+    if title.is_empty() {
+        title = finding.body.trim().trim_end_matches(['.', '!', '?']);
+    }
+    let mut title = if title.chars().count() > 140 {
+        truncate_at_word(title, 140)
+    } else {
+        title.to_string()
+    };
+    if !matches!(title.chars().last(), Some('.') | Some('!') | Some('?')) {
+        title.push('.');
+    }
+    title
 }
 
 fn public_why_factor(rule_id: &str, label: impl Into<String>) -> RiskFactor {
@@ -717,57 +849,13 @@ fn localhost_port_probe_context(value: &str) -> bool {
     )
 }
 
-fn generic_why_label(label: &str) -> bool {
-    matches!(
-        label.trim(),
-        "Validated medium actionable finding"
-            | "Validated high actionable finding"
-            | "Validated low actionable finding"
-            | "Validated critical actionable finding"
-            | "Weak error handling finding"
-    )
-}
-
-fn finding_why_label_for_factor(analysis: &ReviewAnalysis, factor: &RiskFactor) -> Option<String> {
-    let mut candidates = analysis
-        .findings
-        .iter()
-        .filter(|finding| validated_actionable_finding(finding))
-        .filter(|finding| match factor.rule_id.as_str() {
-            "finding.severity.critical" => finding.severity == Severity::Critical,
-            "finding.severity.high" => finding.severity == Severity::High,
-            "finding.severity.medium" => finding.severity == Severity::Medium,
-            "finding.severity.low" => finding.severity == Severity::Low,
-            "finding.weak_error_handling" => finding.risk_code == Some(RiskCode::WeakErrorHandling),
-            _ => false,
-        });
-    candidates.next().map(finding_why_label)
-}
-
-fn finding_why_label(finding: &ReviewFinding) -> String {
-    let source = finding
-        .title
-        .trim()
-        .trim_end_matches(['.', '!', '?'])
-        .to_string();
-    let mut sentence = if source.is_empty() {
-        sentence_fragment(&finding.body)
-    } else {
-        source
-    };
-    if sentence.chars().count() > 140 {
-        sentence = truncate_at_word(&sentence, 140);
-    }
-    if !matches!(sentence.chars().last(), Some('.') | Some('!') | Some('?')) {
-        sentence.push('.');
-    }
-    sentence
-}
-
 fn dedupe_risk_factors_by_label(factors: &mut Vec<RiskFactor>) {
     let mut seen = HashSet::new();
     factors.retain(|factor| {
         if factor.points <= 0 {
+            return true;
+        }
+        if !factor.rule_id.starts_with("published.why.") && is_engineish_phrase(&factor.label) {
             return true;
         }
         let key = normalize_key(&factor.label);
@@ -892,6 +980,55 @@ fn generic_placeholder_fix(lower: &str) -> bool {
     mentions_validated_placeholder || generic_failure_acceptance
 }
 
+fn weakens_security_posture(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "disable certificate validation",
+            "disable cert validation",
+            "skip certificate validation",
+            "turn off certificate validation",
+            "disable signature verification",
+            "skip signature verification",
+            "disable auth",
+            "bypass auth",
+            "remove authorization",
+            "log the token",
+            "log tokens",
+            "return true on exception",
+            "return true for every exception",
+            "treat all exceptions as safe",
+            "ignore security exception",
+            "ignore security exceptions",
+        ],
+    )
+}
+
+pub fn is_engineish_phrase(text: &str) -> bool {
+    let lower = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|ch: char| ch.is_ascii_punctuation() || ch.is_whitespace())
+        .to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "validated",
+            "actionable finding",
+            "weak error handling finding",
+            "changed files exceed",
+            "diff bytes exceed",
+            "architecture-sensitive",
+            "partial or risk-prioritized",
+            "no tests are visible",
+            "visible in this chunk",
+            "test coverage is insufficient",
+        ],
+    )
+}
+
 fn significant_words(value: &str) -> Vec<String> {
     value
         .split(|ch: char| !ch.is_ascii_alphanumeric())
@@ -944,15 +1081,38 @@ fn finding_file_path(finding: &ReviewFinding) -> String {
 fn sentence_from_suggested_fix(text: &str) -> String {
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let first_sentence = first_sentence(&compact);
-    let mut sentence = if first_sentence.chars().count() > 180 {
-        truncate_at_word(first_sentence, 180)
+    let cleaned = strip_action_filler(first_sentence);
+    let mut sentence = if cleaned.chars().count() > 180 {
+        truncate_at_word(&cleaned, 180)
     } else {
-        first_sentence.to_string()
+        cleaned
     };
     if !matches!(sentence.chars().last(), Some('.') | Some('!') | Some('?')) {
         sentence.push('.');
     }
     sentence
+}
+
+fn strip_action_filler(value: &str) -> String {
+    let trimmed = value.trim();
+    for prefix in [
+        "Please consider ",
+        "please consider ",
+        "Consider ",
+        "consider ",
+        "Maybe ",
+        "maybe ",
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let mut chars = rest.chars();
+            if let Some(first) = chars.next() {
+                let mut output = first.to_uppercase().collect::<String>();
+                output.push_str(chars.as_str());
+                return output;
+            }
+        }
+    }
+    trimmed.to_string()
 }
 
 fn first_sentence(value: &str) -> &str {
@@ -1320,7 +1480,7 @@ mod tests {
         assert_eq!(sanitized.decision, MergeDecision::Pass);
         assert!(markdown.contains("Decision: PASS"));
         assert!(markdown.contains("- No priority findings remain open."));
-        assert!(markdown.contains("- Review completed using risk-prioritized large MR analysis."));
+        assert!(markdown.contains("- Review was risk-prioritized because the MR is large."));
         assert!(!markdown.contains("Changed files exceed large MR threshold"));
     }
 
@@ -1499,9 +1659,10 @@ mod tests {
         );
         let markdown = format_merge_risk_gate_markdown(&sanitized);
 
-        assert!(markdown.contains(
-            "- Runtime instrumentation port checks treat unexpected socket failures as safe."
-        ));
+        assert!(
+            markdown.contains("- Multiple priority findings remain open across security areas.")
+        );
+        assert!(markdown.contains("- Review touched high-risk code paths."));
         assert!(!markdown.contains("Validated medium actionable finding"));
         assert!(!markdown.contains("Weak error handling finding"));
         assert!(
@@ -1513,6 +1674,82 @@ mod tests {
                 .count()
                 <= 3
         );
+    }
+
+    #[test]
+    fn one_priority_finding_creates_finding_specific_why() {
+        let analysis = analysis(vec![finding(
+            Severity::Medium,
+            ReviewCategory::Reliability,
+            Some(RiskCode::WeakErrorHandling),
+            "src/upload.rs",
+            "Upload failure path drops retry errors",
+        )]);
+        let sanitized = sanitize_merge_risk_assessment(
+            &analysis,
+            MergeRiskAssessment {
+                score: 42,
+                decision: MergeDecision::NeedsHuman,
+                blocking_issues: vec![],
+                required_before_merge: vec![],
+                risk_factors: vec![risk_factor(
+                    "finding.severity.medium",
+                    "Validated medium actionable finding",
+                )],
+                blast_radius: BlastRadius::default(),
+            },
+        );
+        let markdown = format_merge_risk_gate_markdown(&sanitized);
+
+        assert!(markdown.contains("- Upload failure path drops retry errors remains open."));
+        assert!(!markdown.contains("Validated medium actionable finding"));
+        assert!(!markdown.contains("Weak error handling finding"));
+    }
+
+    #[test]
+    fn required_action_rewrites_security_weakening_fix() {
+        let analysis = analysis(vec![finding_with_fix(
+            Severity::High,
+            ReviewCategory::Security,
+            Some(RiskCode::MissingAuthorizationCheck),
+            "src/auth/session.rs",
+            "Admin route misses authorization check",
+            "Disable auth for this route until clients are migrated.",
+        )]);
+        let sanitized = sanitize_merge_risk_assessment(
+            &analysis,
+            MergeRiskAssessment {
+                score: 80,
+                decision: MergeDecision::NeedsHuman,
+                blocking_issues: vec![],
+                required_before_merge: vec![],
+                risk_factors: vec![],
+                blast_radius: BlastRadius::default(),
+            },
+        );
+        let labels = labels(&sanitized.required_before_merge);
+
+        assert!(labels
+            .iter()
+            .any(|label| label.contains("Admin route misses authorization check")));
+        assert!(labels
+            .iter()
+            .any(|label| label.contains("preserving the existing security posture")));
+        assert!(!labels.iter().any(|label| label.contains("Disable auth")));
+    }
+
+    #[test]
+    fn engineish_phrase_filter_catches_public_leak_patterns() {
+        for phrase in [
+            "Validated medium actionable finding",
+            "Weak error handling finding",
+            "Changed files exceed large MR threshold",
+            "Architecture-sensitive auth or security area touched",
+            "No tests are visible in this chunk",
+            "Test coverage is insufficient",
+        ] {
+            assert!(super::is_engineish_phrase(phrase), "{phrase}");
+        }
     }
 
     fn analysis(findings: Vec<ReviewFinding>) -> ReviewAnalysis {

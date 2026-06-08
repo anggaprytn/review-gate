@@ -11,6 +11,7 @@ use reviewgate::{
             format_review_markdown_for_mode_with_risk_gate, format_review_markdown_with_emoji,
             MarkdownRenderMode,
         },
+        publisher_sanitizer::is_engineish_phrase,
         risk::{
             BlastRadius, MergeDecision, MergeRiskAssessment, RiskEvidence, RiskEvidenceSource,
             RiskFactor, RiskGateItem,
@@ -239,6 +240,34 @@ fn final_markdown_sanitizes_medium_only_bad_risk_gate() {
     assert!(markdown.contains("Add monitoring or fallback behavior for WebView cleanup timeout"));
     assert!(markdown.contains(REVIEWGATE_ATTRIBUTION));
     assert!(!markdown.contains("reviewgate:inline"));
+    for phrase in [
+        "Validated medium actionable finding",
+        "Weak error handling finding",
+        "Changed files exceed large MR threshold",
+        "Large MR review was partial or risk-prioritized",
+        "Architecture-sensitive auth or security area touched",
+        "Test coverage is insufficient",
+        "No tests are visible in this chunk",
+    ] {
+        assert!(!markdown.contains(phrase), "{phrase}");
+        assert!(is_engineish_phrase(phrase), "{phrase}");
+    }
+
+    let body = build_summary_note_body(
+        &markdown,
+        "group/repo",
+        59,
+        "gemini_cli/gemini-2.5-pro",
+        false,
+        "enabled through Gemini CLI",
+        "abc123",
+        "disabled",
+        20_000,
+    )
+    .unwrap();
+    assert!(body.contains(REVIEWGATE_ATTRIBUTION));
+    assert!(body.contains("reviewgate:summary"));
+    assert!(!body.contains("reviewgate:inline"));
 }
 
 #[test]

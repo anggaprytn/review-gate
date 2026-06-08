@@ -694,7 +694,7 @@ pub fn format_merge_risk_gate_markdown(assessment: &MergeRiskAssessment) -> Stri
 fn pass_why_reasons(assessment: &MergeRiskAssessment) -> Vec<&'static str> {
     let mut reasons = vec!["No priority findings remain open."];
     if large_review_context(assessment) {
-        reasons.push("Review completed using risk-prioritized large MR analysis.");
+        reasons.push("Review was risk-prioritized because the MR is large.");
     }
     reasons.truncate(3);
     reasons
@@ -705,6 +705,7 @@ fn decision_why_factors(assessment: &MergeRiskAssessment) -> Vec<&RiskFactor> {
         .risk_factors
         .iter()
         .filter(|factor| factor.points > 0)
+        .filter(|factor| factor.rule_id.starts_with("published.why."))
         .filter(|factor| !engine_internal_why_factor(factor))
         .take(3)
         .collect()
