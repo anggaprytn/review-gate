@@ -1,6 +1,8 @@
 use crate::review::{
     risk::{MergeDecision, MergeRiskAssessment, RiskEvidence, RiskFactor, RiskGateItem},
-    types::{EvidenceValidationStatus, ReviewAnalysis, ReviewFinding, RiskCode, Severity},
+    types::{
+        EvidenceValidationStatus, ReviewAnalysis, ReviewCategory, ReviewFinding, RiskCode, Severity,
+    },
 };
 use std::collections::HashSet;
 
@@ -96,6 +98,9 @@ fn sanitize_review_analysis(mut analysis: ReviewAnalysis) -> ReviewAnalysis {
     analysis.test_coverage_note =
         sanitize_optional_note(analysis.test_coverage_note, &analysis.findings);
     analysis.privacy_note = sanitize_optional_note(analysis.privacy_note, &analysis.findings);
+    for finding in &mut analysis.findings {
+        sanitize_security_exception_fix(finding);
+    }
     analysis.findings.retain(renderable_final_finding);
     analysis
 }
@@ -375,10 +380,16 @@ fn add_calibrated_why_factors(analysis: &ReviewAnalysis, assessment: &mut MergeR
         );
     }
     for factor in &mut assessment.risk_factors {
+        if generic_why_label(&factor.label) {
+            if let Some(label) = finding_why_label_for_factor(analysis, factor) {
+                factor.label = label;
+            }
+        }
         if factor.rule_id.contains("large_review") || factor.rule_id.contains("partial") {
             factor.label = "Large MR review was partial or risk-prioritized.".to_string();
         }
     }
+    dedupe_risk_factors_by_label(&mut assessment.risk_factors);
 }
 
 fn should_need_human(analysis: &ReviewAnalysis, assessment: &MergeRiskAssessment) -> bool {
@@ -413,6 +424,201 @@ fn validated_actionable_finding(finding: &ReviewFinding) -> bool {
                     | EvidenceValidationStatus::PositiveChange
             )
         )
+}
+
+fn sanitize_security_exception_fix(finding: &mut ReviewFinding) {
+    if !finding.actionable || !security_sensitive_finding(finding) {
+        return;
+    }
+    let Some(fix) = finding.suggested_fix.as_deref() else {
+        return;
+    };
+    if !broad_security_exception_fix(fix) {
+        return;
+    }
+
+    let text = format!(
+        "{} {} {}",
+        finding.file_path.as_deref().unwrap_or_default(),
+        finding.title,
+        finding.body
+    );
+    let replacement = if localhost_port_probe_context(&text) {
+        "Distinguish expected closed-port failures from suspicious failures: treat connection-refused/closed port as no threat, but treat timeouts, security exceptions, and unexpected I/O errors as unsafe or at least emit explicit telemetry/reason codes."
+    } else {
+        "Distinguish expected benign probe failures from suspicious failures: preserve the current safe interpretation for known harmless outcomes, but log and handle timeouts, permission/security failures, and unexpected errors conservatively with explicit telemetry/reason codes. Do not blanket allow or blanket block every exception unless evidence proves that behavior is safe."
+    };
+    finding.suggested_fix = Some(replacement.to_string());
+}
+
+fn security_sensitive_finding(finding: &ReviewFinding) -> bool {
+    matches!(
+        finding.category,
+        ReviewCategory::Security | ReviewCategory::Privacy | ReviewCategory::DataIntegrity
+    ) || matches!(
+        finding.risk_code,
+        Some(
+            RiskCode::AuthBypass
+                | RiskCode::MissingAuthorizationCheck
+                | RiskCode::SecretLeak
+                | RiskCode::PiiOrSecretLogging
+                | RiskCode::SqlInjection
+                | RiskCode::CommandInjection
+                | RiskCode::UnsafeDeserialization
+                | RiskCode::DataIntegrityRisk
+                | RiskCode::WeakErrorHandling
+        )
+    ) || contains_any(
+        &format!(
+            "{} {} {}",
+            finding.file_path.as_deref().unwrap_or_default(),
+            finding.title,
+            finding.body
+        ),
+        &[
+            "security",
+            "integrity",
+            "instrumentation",
+            "tamper",
+            "root",
+            "jailbreak",
+            "signature",
+            "certificate",
+            "auth",
+            "permission",
+            "token",
+            "runtime guard",
+            "compromised",
+        ],
+    )
+}
+
+fn broad_security_exception_fix(fix: &str) -> bool {
+    let lower = fix
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let mentions_exception = contains_any(
+        &lower,
+        &[
+            "exception",
+            "exceptions",
+            "throwable",
+            "error",
+            "errors",
+            "ioexception",
+            "securityexception",
+        ],
+    );
+    mentions_exception
+        && (contains_any(
+            &lower,
+            &[
+                "return true on exception",
+                "return true for exception",
+                "return true for every exception",
+                "return true on any exception",
+                "return true when",
+                "return true if",
+            ],
+        ) || contains_any(
+            &lower,
+            &[
+                "return false on exception",
+                "return false for exception",
+                "return false for every exception",
+                "return false on any exception",
+                "return false when",
+                "return false if",
+            ],
+        ) || contains_any(
+            &lower,
+            &[
+                "treat all exceptions as unsafe",
+                "treat every exception as unsafe",
+                "treat any exception as unsafe",
+                "treat all errors as unsafe",
+                "treat all exceptions as safe",
+                "treat every exception as safe",
+                "treat any exception as safe",
+                "treat all errors as safe",
+            ],
+        ))
+}
+
+fn localhost_port_probe_context(value: &str) -> bool {
+    contains_any(
+        value,
+        &[
+            "localhost",
+            "127.0.0.1",
+            "loopback",
+            "socket",
+            "port",
+            "connect",
+            "connection refused",
+            "instrumentation port",
+        ],
+    )
+}
+
+fn generic_why_label(label: &str) -> bool {
+    matches!(
+        label.trim(),
+        "Validated medium actionable finding"
+            | "Validated high actionable finding"
+            | "Validated low actionable finding"
+            | "Validated critical actionable finding"
+            | "Weak error handling finding"
+    )
+}
+
+fn finding_why_label_for_factor(analysis: &ReviewAnalysis, factor: &RiskFactor) -> Option<String> {
+    let mut candidates = analysis
+        .findings
+        .iter()
+        .filter(|finding| validated_actionable_finding(finding))
+        .filter(|finding| match factor.rule_id.as_str() {
+            "finding.severity.critical" => finding.severity == Severity::Critical,
+            "finding.severity.high" => finding.severity == Severity::High,
+            "finding.severity.medium" => finding.severity == Severity::Medium,
+            "finding.severity.low" => finding.severity == Severity::Low,
+            "finding.weak_error_handling" => finding.risk_code == Some(RiskCode::WeakErrorHandling),
+            _ => false,
+        });
+    candidates.next().map(finding_why_label)
+}
+
+fn finding_why_label(finding: &ReviewFinding) -> String {
+    let source = finding
+        .title
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .to_string();
+    let mut sentence = if source.is_empty() {
+        sentence_fragment(&finding.body)
+    } else {
+        source
+    };
+    if sentence.chars().count() > 140 {
+        sentence = truncate_at_word(&sentence, 140);
+    }
+    if !matches!(sentence.chars().last(), Some('.') | Some('!') | Some('?')) {
+        sentence.push('.');
+    }
+    sentence
+}
+
+fn dedupe_risk_factors_by_label(factors: &mut Vec<RiskFactor>) {
+    let mut seen = HashSet::new();
+    factors.retain(|factor| {
+        if factor.points <= 0 {
+            return true;
+        }
+        let key = normalize_key(&factor.label);
+        key.is_empty() || seen.insert(key)
+    });
 }
 
 fn validated_positive_note(finding: &ReviewFinding) -> bool {
@@ -676,8 +882,8 @@ mod tests {
     use super::{sanitize_merge_risk_assessment, sanitize_review_report, ReviewReport};
     use crate::review::{
         risk::{
-            BlastRadius, MergeDecision, MergeRiskAssessment, RiskEvidence, RiskEvidenceSource,
-            RiskFactor, RiskGateItem,
+            format_merge_risk_gate_markdown, BlastRadius, MergeDecision, MergeRiskAssessment,
+            RiskEvidence, RiskEvidenceSource, RiskFactor, RiskGateItem,
         },
         types::{
             Effort, EvidenceValidationStatus, OverallRisk, ReviewAnalysis, ReviewCategory,
@@ -942,6 +1148,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn broad_security_exception_fix_is_rewritten_with_exception_specific_nuance() {
+        let mut finding = finding_with_fix(
+            Severity::Medium,
+            ReviewCategory::Security,
+            Some(RiskCode::WeakErrorHandling),
+            "RuntimeSecurityGuard.kt",
+            "Runtime instrumentation port checks treat socket exceptions too broadly",
+            "Return true on exception.",
+        );
+        finding.body =
+            "A localhost socket probe treats any IOException from the port check as compromised."
+                .to_string();
+
+        let report = sanitize_review_report(ReviewReport {
+            analysis: analysis(vec![finding]),
+            risk_assessment: None,
+        });
+        let fix = report.analysis.findings[0]
+            .suggested_fix
+            .as_deref()
+            .unwrap();
+
+        assert!(fix.contains("connection-refused/closed port as no threat"));
+        assert!(fix.contains("timeouts, security exceptions, and unexpected I/O errors"));
+        assert!(fix.contains("telemetry/reason codes"));
+        assert!(!fix.contains("Return true on exception"));
+        assert!(!fix.contains("every exception"));
+    }
+
+    #[test]
+    fn generic_why_lines_are_replaced_with_finding_titles_in_rendered_gate() {
+        let analysis = analysis(vec![
+            finding(
+                Severity::Medium,
+                ReviewCategory::Security,
+                Some(RiskCode::WeakErrorHandling),
+                "RuntimeSecurityGuard.kt",
+                "Runtime instrumentation port checks treat unexpected socket failures as safe",
+            ),
+            finding(
+                Severity::Medium,
+                ReviewCategory::Security,
+                Some(RiskCode::WeakErrorHandling),
+                "AppSignatureVerifier.kt",
+                "Debug signature trust can be enabled outside debug builds",
+            ),
+        ]);
+        let sanitized = sanitize_merge_risk_assessment(
+            &analysis,
+            MergeRiskAssessment {
+                score: 48,
+                decision: MergeDecision::NeedsHuman,
+                blocking_issues: vec![],
+                required_before_merge: vec![],
+                risk_factors: vec![
+                    risk_factor(
+                        "finding.severity.medium",
+                        "Validated medium actionable finding",
+                    ),
+                    risk_factor("finding.weak_error_handling", "Weak error handling finding"),
+                ],
+                blast_radius: BlastRadius::default(),
+            },
+        );
+        let markdown = format_merge_risk_gate_markdown(&sanitized);
+
+        assert!(markdown.contains(
+            "- Runtime instrumentation port checks treat unexpected socket failures as safe."
+        ));
+        assert!(!markdown.contains("Validated medium actionable finding"));
+        assert!(!markdown.contains("Weak error handling finding"));
+        assert!(
+            markdown
+                .split("Why:\n")
+                .nth(1)
+                .unwrap()
+                .matches("\n- ")
+                .count()
+                <= 4
+        );
+    }
+
     fn analysis(findings: Vec<ReviewFinding>) -> ReviewAnalysis {
         ReviewAnalysis {
             summary: "summary".to_string(),
@@ -1041,6 +1330,16 @@ mod tests {
             score: 16,
             evidence: vec![evidence("src/App.tsx", rule_id)],
             points: 16,
+        }
+    }
+
+    fn risk_factor(rule_id: &str, label: &str) -> RiskFactor {
+        RiskFactor {
+            rule_id: rule_id.to_string(),
+            label: label.to_string(),
+            score: 8,
+            evidence: vec![evidence("RuntimeSecurityGuard.kt", rule_id)],
+            points: 8,
         }
     }
 

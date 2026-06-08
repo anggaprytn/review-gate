@@ -527,6 +527,7 @@ fn format_test_coverage_note(
             gaps.push(item);
         }
     }
+    gaps = normalize_test_coverage_gaps(gaps);
 
     let mut output = String::new();
     if !gaps.is_empty() {
@@ -589,12 +590,14 @@ fn format_privacy_note(
     let mut positives = Vec::new();
     let mut risks = Vec::new();
     for item in items {
-        if is_no_secret_or_pii_item(&item) {
+        if is_no_secret_or_pii_item(&item) || is_generic_privacy_no_risk_item(&item) {
             continue;
         } else if is_positive_privacy_item(&item) {
             positives.push(sanitize_privacy_item(&item));
-        } else {
+        } else if is_negative_privacy_item(&item.to_ascii_lowercase()) {
             risks.push(sanitize_privacy_item(&item));
+        } else {
+            continue;
         }
     }
     finding_risks.append(&mut risks);
@@ -833,7 +836,7 @@ fn concrete_coverage_gaps(findings: &[ReviewFinding]) -> Vec<String> {
                 ],
             )
     }) {
-        gaps.push("Add a test for security module failure handling.".to_string());
+        gaps.push("Add tests for native security modules and their failure modes.".to_string());
     }
     if validated.iter().any(|finding| {
         finding.risk_code == Some(RiskCode::DataIntegrityRisk)
@@ -857,6 +860,46 @@ fn concrete_coverage_gaps(findings: &[ReviewFinding]) -> Vec<String> {
     }
 
     gaps
+}
+
+fn normalize_test_coverage_gaps(gaps: Vec<String>) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut seen = HashSet::new();
+    let mut native_security_gap = false;
+    for gap in gaps {
+        if native_security_test_gap(&gap) {
+            native_security_gap = true;
+            continue;
+        }
+        let key = normalize_sentence_key(&gap);
+        if !key.is_empty() && seen.insert(key) {
+            output.push(gap);
+        }
+    }
+    if native_security_gap {
+        let gap = "Add tests for native security modules and their failure modes.".to_string();
+        let key = normalize_sentence_key(&gap);
+        if seen.insert(key) {
+            output.insert(0, gap);
+        }
+    }
+    output
+}
+
+fn native_security_test_gap(item: &str) -> bool {
+    let lower = item.to_ascii_lowercase();
+    contains_any_text(
+        &lower,
+        &[
+            "native security module",
+            "native security modules",
+            "runtimesecurityguard",
+            "deviceintegritymodule",
+            "screensecuritymodule",
+            "appsignatureverifier",
+            "antiinstrumentation",
+        ],
+    ) && contains_any_text(&lower, &["test", "tests", "coverage", "failure mode"])
 }
 
 fn has_validated_privacy_risk_finding(findings: &[ReviewFinding]) -> bool {
@@ -1009,8 +1052,13 @@ fn is_positive_privacy_item(item: &str) -> bool {
     if is_negative_privacy_item(&lower) {
         return false;
     }
+    positive_privacy_signal(&lower)
+}
+
+fn positive_privacy_signal(lower: &str) -> bool {
     [
         "redacted",
+        "redact",
         "wiped",
         "cleared",
         "removed",
@@ -1018,32 +1066,48 @@ fn is_positive_privacy_item(item: &str) -> bool {
         "cache-backed",
         "cache storage",
         "cleanup",
-        "sensitive",
         "secure",
         "improve privacy",
         "improves privacy",
         "privacy by moving",
         "temporary files",
+        "dedicated token storage",
+        "token storage",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
 }
 
 fn is_negative_privacy_item(item: &str) -> bool {
-    [
-        "logged",
-        "logging",
-        "leak",
-        "exposed",
-        "exposure",
-        "introduces",
-        "risk",
-        "raw payload",
-        "full payload",
-        "sensitive data",
-    ]
-    .iter()
-    .any(|needle| item.contains(needle))
+    let no_risk = is_no_secret_or_pii_item(item) || is_generic_privacy_no_risk_item(item);
+    let positive_without_missing_work = positive_privacy_signal(item)
+        && ![
+            "missing ",
+            "not ",
+            "without ",
+            "needs ",
+            "should ",
+            "does not ",
+            "fails to ",
+        ]
+        .iter()
+        .any(|needle| item.contains(needle));
+    !no_risk
+        && !positive_without_missing_work
+        && [
+            "logged",
+            "logging",
+            "leak",
+            "exposed",
+            "exposure",
+            "introduces",
+            "risk",
+            "raw payload",
+            "full payload",
+            "sensitive data",
+        ]
+        .iter()
+        .any(|needle| item.contains(needle))
 }
 
 fn is_generic_privacy_item(item: &str) -> bool {
@@ -1051,6 +1115,20 @@ fn is_generic_privacy_item(item: &str) -> bool {
     lower.contains("privacy improvement")
         || lower.contains("privacy-positive change")
         || lower.contains("good privacy practice")
+}
+
+fn is_generic_privacy_no_risk_item(item: &str) -> bool {
+    let lower = item.to_ascii_lowercase();
+    lower.contains("no other privacy issues detected")
+        || lower.contains("no privacy issues detected")
+        || lower.contains("no privacy risk")
+        || lower.contains("no new privacy risk")
+        || lower.contains("no secret exposure")
+        || lower.contains("no pii exposure")
+        || lower.contains("no pii or secret exposure")
+        || lower.contains("no secrets or pii")
+        || lower.contains("no generic privacy issues")
+        || lower.contains("nothing else privacy")
 }
 
 fn sanitize_privacy_item(item: &str) -> String {
@@ -1449,7 +1527,9 @@ mod tests {
         let section = markdown_section(&markdown, "## Test Coverage");
 
         assert!(section.contains("Coverage gaps:"));
-        assert!(section.contains("- Positive: Native security modules may not be tested."));
+        assert!(
+            section.contains("- Add tests for native security modules and their failure modes.")
+        );
         assert!(section.contains("- Upload cleanup needs regression tests."));
         assert!(section.contains("Positive:\n- authTokenStorage has unit tests."));
         assert!(section.contains("- Token rotation has tests."));
@@ -1503,6 +1583,34 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn duplicate_native_security_coverage_gaps_collapse_to_one_bullet() {
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![],
+                test_coverage_note: Some(
+                    "Native security modules need failure-mode tests. RuntimeSecurityGuard needs exception tests. DeviceIntegrityModule needs failure tests. ScreenSecurityModule needs coverage. AppSignatureVerifier needs tests."
+                        .to_string(),
+                ),
+                privacy_note: None,
+                overall_risk: OverallRisk::Low,
+            },
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        let section = markdown_section(&markdown, "## Test Coverage");
+
+        assert!(section.contains(
+            "Coverage gaps:\n- Add tests for native security modules and their failure modes."
+        ));
+        assert_eq!(section.matches("native security modules").count(), 1);
+        assert!(!section.contains("RuntimeSecurityGuard needs exception tests"));
+        assert!(!section.contains("DeviceIntegrityModule needs failure tests"));
+        assert!(!section.contains("ScreenSecurityModule needs coverage"));
+        assert!(!section.contains("AppSignatureVerifier needs tests"));
     }
 
     #[test]
@@ -1590,6 +1698,34 @@ mod tests {
     }
 
     #[test]
+    fn privacy_risks_exclude_positive_and_no_risk_statements() {
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![],
+                test_coverage_note: None,
+                privacy_note: Some(
+                    "No other privacy issues detected. Authorization headers are redacted before logging. Dedicated token storage was added. This is a good privacy practice."
+                        .to_string(),
+                ),
+                overall_risk: OverallRisk::Low,
+            },
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        let section = markdown_section(&markdown, "## Privacy");
+
+        assert!(section
+            .starts_with("No obvious new PII or secret exposure detected in reviewed chunks."));
+        assert!(!section.contains("Privacy risks:"));
+        assert!(section.contains("Privacy-positive changes:"));
+        assert!(section.contains("- Authorization headers are redacted before logging."));
+        assert!(section.contains("- Dedicated token storage was added."));
+        assert!(!section.contains("No other privacy issues detected"));
+        assert!(!section.contains("good privacy practice"));
+    }
+
+    #[test]
     fn secret_leak_finding_creates_privacy_risk_without_positive_contradiction() {
         let mut leak = finding(Severity::Medium, "Hardcoded Google Maps API key");
         leak.category = ReviewCategory::Security;
@@ -1646,7 +1782,9 @@ mod tests {
         );
         let section = markdown_section(&markdown, "## Test Coverage");
 
-        assert!(section.contains("- Add a test for security module failure handling."));
+        assert!(
+            section.contains("- Add tests for native security modules and their failure modes.")
+        );
         assert!(section.contains(
             "- Add a test or monitor for WebView cleanup timeout behavior during logout."
         ));
