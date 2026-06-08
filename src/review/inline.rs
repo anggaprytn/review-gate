@@ -3,7 +3,7 @@ use crate::{
     gitlab::types::{DiffRefs, MergeRequestDiff},
     review::{
         anchors::{AnchoredDiffContext, ReviewLineAnchor},
-        types::{Effort, ReviewAnalysis, ReviewFinding, Severity},
+        types::{Effort, EvidenceValidationStatus, ReviewAnalysis, ReviewFinding, Severity},
     },
 };
 use std::collections::HashMap;
@@ -42,6 +42,7 @@ pub enum InlineEligibilityReason {
     Eligible,
     SeverityTooLow,
     NotActionable,
+    NeedsManualConfirmation,
     MissingFilePath,
     MissingLine,
     InvalidAnchorId,
@@ -309,6 +310,9 @@ fn resolve_candidate(
     }
     if !finding.actionable {
         return ineligible(base, InlineEligibilityReason::NotActionable);
+    }
+    if finding.evidence_status == Some(EvidenceValidationStatus::NeedsManualConfirmation) {
+        return ineligible(base, InlineEligibilityReason::NeedsManualConfirmation);
     }
 
     let invalid_anchor = finding
@@ -668,6 +672,7 @@ impl InlineEligibilityReason {
             InlineEligibilityReason::Eligible => "eligible",
             InlineEligibilityReason::SeverityTooLow => "severity too low",
             InlineEligibilityReason::NotActionable => "not actionable",
+            InlineEligibilityReason::NeedsManualConfirmation => "needs manual confirmation",
             InlineEligibilityReason::MissingFilePath => "missing file path",
             InlineEligibilityReason::MissingLine => "missing line",
             InlineEligibilityReason::InvalidAnchorId => "invalid anchor id",
@@ -697,8 +702,8 @@ mod tests {
             evidence::validate_review_analysis_evidence,
             quality::normalize_review_analysis,
             types::{
-                Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, RiskCode,
-                Severity,
+                Effort, EvidenceValidationStatus, OverallRisk, ReviewAnalysis, ReviewCategory,
+                ReviewFinding, RiskCode, Severity,
             },
         },
     };
@@ -1021,6 +1026,31 @@ mod tests {
         let candidate = single_candidate(Severity::High, Effort::Quick, false);
 
         assert_eq!(candidate.reason, InlineEligibilityReason::NotActionable);
+    }
+
+    #[test]
+    fn needs_manual_confirmation_is_not_inline_candidate() {
+        let mut finding = finding(
+            Severity::Medium,
+            Effort::Quick,
+            true,
+            Some("src/a.rs"),
+            Some(1),
+        );
+        finding.evidence_status = Some(EvidenceValidationStatus::NeedsManualConfirmation);
+        let analysis = analysis(vec![finding]);
+
+        let candidates = resolve_inline_candidates(
+            &analysis,
+            &[diff("src/a.rs", "@@ -1 +1 @@\n-old\n+new")],
+            Some(&diff_refs()),
+            &inline_config(8, 5),
+        );
+
+        assert_eq!(
+            candidates[0].reason,
+            InlineEligibilityReason::NeedsManualConfirmation
+        );
     }
 
     #[test]

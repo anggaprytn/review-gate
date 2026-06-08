@@ -16,6 +16,7 @@ use crate::{
         risk::{
             assess_merge_risk, BlastRadius, MergeDecision, MergeRiskAssessment, RiskGateRunSignals,
         },
+        security_intent::{apply_security_intent_guard, SecurityIntentValidationContext},
         types::{
             EvidenceValidationStatus, OverallRisk, ReviewAnalysis, ReviewFinding, RiskCode,
             Severity,
@@ -90,6 +91,16 @@ pub fn run_review_quality_pipeline(
         input.current_file_provider.as_deref(),
     );
     accumulate_stage_stats(&mut report, &before_current, &analysis.findings);
+
+    let before_security_intent = analysis.findings.clone();
+    analysis.findings = apply_security_intent_guard(
+        analysis.findings,
+        &SecurityIntentValidationContext {
+            diffs: &input.diffs,
+            diff_context: input.diff_context.as_ref(),
+        },
+    );
+    accumulate_stage_stats(&mut report, &before_security_intent, &analysis.findings);
 
     let before_calibration = analysis.findings.clone();
     analysis.findings = calibrate_severity(analysis.findings);

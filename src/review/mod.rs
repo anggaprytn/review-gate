@@ -15,4 +15,5 @@ pub mod publisher_sanitizer;
 pub mod qa;
 pub mod quality;
 pub mod risk;
+pub mod security_intent;
 pub mod types;

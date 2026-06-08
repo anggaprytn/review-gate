@@ -959,6 +959,30 @@ mod tests {
         assert_eq!(titles(&generated), vec!["Critical", "High"]);
     }
 
+    #[test]
+    fn fix_prompt_uses_safe_rewritten_security_suggested_fix() {
+        let (storage, mr) = storage_with_single_run(vec![FindingFixture {
+            severity: "MEDIUM",
+            title: "Runtime integrity check blocks on uncertainty",
+            body: "The validated finding preserved fail-closed behavior and rewrote the unsafe fix.",
+            suggested_fix: "Confirm the intended security posture with the security/application owner. If fail-closed behavior is required, add diagnostic reason codes and telemetry rather than weakening the check.",
+            actionable: true,
+        }]);
+
+        let generated = build_fix_prompt(&storage, &mr, default_options()).unwrap();
+
+        assert!(generated
+            .prompt
+            .contains("Confirm the intended security posture"));
+        assert!(generated
+            .prompt
+            .contains("fail-closed behavior is required"));
+        assert!(!generated
+            .prompt
+            .contains("Return false when the runtime check fails"));
+        assert!(!generated.prompt.contains("Allow the app to continue"));
+    }
+
     fn default_options() -> FixPromptOptions {
         FixPromptOptions {
             run_id: None,
@@ -1025,14 +1049,15 @@ mod tests {
                 risk_code, file_path, old_line, new_line, title, body, suggested_fix,
                 actionable, created_at
             ) VALUES (?1, ?2, 'group/repo', 59, 'head', ?3, 'quick', 'correctness',
-                'missing_timeout', 'src/example.rs', NULL, 42, ?4, ?5, 'Use a timeout.',
-                ?6, '001')",
+                'missing_timeout', 'src/example.rs', NULL, 42, ?4, ?5, ?6,
+                ?7, '001')",
             params![
                 format!("{run_id}-finding-{index}"),
                 run_id,
                 finding.severity,
                 finding.title,
                 finding.body,
+                finding.suggested_fix,
                 if finding.actionable { 1 } else { 0 }
             ],
         )
@@ -1044,6 +1069,7 @@ mod tests {
             severity,
             title,
             body: "Problem body.",
+            suggested_fix: "Use a timeout.",
             actionable,
         }
     }
@@ -1062,6 +1088,7 @@ mod tests {
         severity: &'static str,
         title: &'static str,
         body: &'static str,
+        suggested_fix: &'static str,
         actionable: bool,
     }
 

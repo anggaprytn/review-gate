@@ -1,13 +1,18 @@
 use reviewgate::{
     config::{ReviewConfig, RiskGateConfig},
-    gitlab::{context::DiffStats, types::MergeRequestDiff},
+    gitlab::{
+        context::DiffStats,
+        types::{DiffRefs, MergeRequestDiff},
+    },
     review::{
         anchors::{AnchorLineKind, AnchoredDiffContext, ReviewLineAnchor},
         formatter::{format_review_markdown_for_mode_with_risk_gate, MarkdownRenderMode},
+        inline::{resolve_inline_candidates, InlineEligibilityReason},
         pipeline::{run_review_quality_pipeline, ReviewQualityPipelineInput},
         risk::MergeDecision,
         types::{
-            Effort, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding, RiskCode, Severity,
+            Effort, EvidenceValidationStatus, OverallRisk, ReviewAnalysis, ReviewCategory,
+            ReviewFinding, RiskCode, Severity,
         },
     },
 };
@@ -114,6 +119,143 @@ fn medium_only_security_hardening_cannot_publish_blocked() {
     assert!(output.risk_assessment.score <= 74);
     assert!(!markdown.contains("Blocking Issues:"));
     assert_final_markdown_invariants(&markdown);
+}
+
+#[test]
+fn security_fail_closed_weakening_fix_is_rewritten_before_markdown_and_risk_gate() {
+    let output = run_review_quality_pipeline(security_input(vec![finding!(
+        Severity::High,
+        ReviewCategory::Security,
+        Some(RiskCode::AuthBypass),
+        "src/security.ts",
+        10,
+        "Runtime integrity check blocks on uncertainty",
+        "The runtime guard fails closed and blocks when integrity is unknown.",
+        "Return false when the runtime check fails so the app can continue.",
+    )]))
+    .unwrap();
+    let markdown = render_markdown(&output);
+
+    let finding = &output.analysis.findings[0];
+    assert_eq!(finding.severity, Severity::Medium);
+    assert_eq!(
+        finding.evidence_status,
+        Some(EvidenceValidationStatus::NeedsManualConfirmation)
+    );
+    assert!(finding
+        .suggested_fix
+        .as_deref()
+        .unwrap()
+        .contains("Confirm the intended security posture"));
+    assert!(!markdown.contains("Return false when the runtime check fails"));
+    assert!(!markdown.contains("so the app can continue"));
+    assert!(!markdown.contains("Return false"));
+    assert!(!markdown.contains("Blocking Issues:"));
+    assert_ne!(output.risk_assessment.decision, MergeDecision::Blocked);
+    assert_final_markdown_invariants(&markdown);
+}
+
+#[test]
+fn fail_closed_security_observability_gap_is_medium_max_and_not_blocking() {
+    let output = run_review_quality_pipeline(security_input(vec![finding!(
+        Severity::High,
+        ReviewCategory::Security,
+        Some(RiskCode::WeakErrorHandling),
+        "src/security.ts",
+        10,
+        "Broad exception handling hides integrity failures",
+        "The integrity check catches every exception and fails closed, but false positives can block legitimate users with no diagnostic reason.",
+        "Add explicit logging for each failure path.",
+    )]))
+    .unwrap();
+    let markdown = render_markdown(&output);
+
+    let finding = &output.analysis.findings[0];
+    assert_eq!(
+        finding.title,
+        "Security failure reason is not observable enough"
+    );
+    assert_eq!(finding.category, ReviewCategory::Observability);
+    assert_eq!(finding.risk_code, Some(RiskCode::ObservabilityGap));
+    assert_eq!(finding.severity, Severity::Medium);
+    assert_ne!(output.risk_assessment.decision, MergeDecision::Blocked);
+    assert!(!markdown.contains("Blocking Issues:"));
+    assert!(markdown.contains("Keep the fail-closed behavior"));
+    assert!(!markdown.contains("return false"));
+    assert!(!markdown.contains("Allow the app to continue"));
+    assert_final_markdown_invariants(&markdown);
+}
+
+#[test]
+fn security_tradeoff_medium_only_cannot_publish_blocked_or_inline() {
+    let output = run_review_quality_pipeline(security_input(vec![finding!(
+        Severity::High,
+        ReviewCategory::Security,
+        Some(RiskCode::AuthBypass),
+        "src/security.ts",
+        10,
+        "Root policy blocks uncertain devices",
+        "The root runtime guard uses default deny and blocks untrusted devices.",
+        "Allow users to continue when root detection is uncertain.",
+    )]))
+    .unwrap();
+    let markdown = render_markdown(&output);
+
+    assert_eq!(output.analysis.findings[0].severity, Severity::Medium);
+    assert_eq!(
+        output.analysis.findings[0].evidence_status,
+        Some(EvidenceValidationStatus::NeedsManualConfirmation)
+    );
+    assert_ne!(output.risk_assessment.decision, MergeDecision::Blocked);
+    assert!(output.risk_assessment.score <= 74);
+    assert!(!markdown.contains("Blocking Issues:"));
+    assert!(!markdown.contains("Allow users to continue"));
+
+    let candidates = resolve_inline_candidates(
+        &output.analysis,
+        &[diff(
+            "src/security.ts",
+            "@@ -10 +10 @@\n+if (rootUnknown) { block(); return true; }",
+        )],
+        Some(&diff_refs()),
+        &reviewgate::config::InlineConfig {
+            enabled: true,
+            dry_run: true,
+            dedupe: true,
+            max_inline_total: 8,
+            max_high_inline: 8,
+            max_medium_inline: 5,
+        },
+    );
+    assert_eq!(
+        candidates[0].reason,
+        InlineEligibilityReason::NeedsManualConfirmation
+    );
+}
+
+#[test]
+fn destructive_security_action_keeps_policy_framing_without_no_wipe_fix() {
+    let output = run_review_quality_pipeline(security_input(vec![finding!(
+        Severity::High,
+        ReviewCategory::Security,
+        Some(RiskCode::DataIntegrityRisk),
+        "src/security.ts",
+        10,
+        "Automatic token wipe can affect legitimate users",
+        "A false positive in the tamper detector can clear tokens and wipe local data.",
+        "Do not wipe data; allow the user to continue.",
+    )]))
+    .unwrap();
+    let markdown = render_markdown(&output);
+
+    let finding = &output.analysis.findings[0];
+    assert_eq!(finding.severity, Severity::Medium);
+    let fix = finding.suggested_fix.as_deref().unwrap();
+    assert!(fix.contains("destructive security-response policy"));
+    assert!(!fix.to_ascii_lowercase().contains("do not wipe"));
+    assert!(!markdown.contains("Do not wipe data"));
+    assert!(!markdown.contains("allow the user to continue"));
+    assert_ne!(output.risk_assessment.decision, MergeDecision::Blocked);
 }
 
 #[test]
@@ -344,6 +486,26 @@ fn input(findings: Vec<ReviewFinding>) -> ReviewQualityPipelineInput {
     }
 }
 
+fn security_input(findings: Vec<ReviewFinding>) -> ReviewQualityPipelineInput {
+    let mut input = input(findings);
+    input.changed_files = vec!["src/security.ts".to_string()];
+    input.diff_context = Some(anchors_for(&[(
+        "src/security.ts",
+        10,
+        "if (integrityUnknown || rootUnknown) { block(); return true; } clearTokens(); wipeLocalData();",
+    )]));
+    input.diffs = vec![diff(
+        "src/security.ts",
+        "@@ -10 +10 @@\n+if (integrityUnknown || rootUnknown) { block(); return true; } clearTokens(); wipeLocalData();",
+    )];
+    input.diff_stats = Some(DiffStats {
+        changed_file_count: 1,
+        total_diff_bytes: 180,
+        ..DiffStats::default()
+    });
+    input
+}
+
 struct FindingSpec<'a> {
     severity: Severity,
     category: ReviewCategory,
@@ -421,6 +583,40 @@ fn anchors() -> AnchoredDiffContext {
         total_anchors: anchors.len(),
         anchors,
         truncated: false,
+    }
+}
+
+fn anchors_for(entries: &[(&str, u32, &str)]) -> AnchoredDiffContext {
+    let anchors = entries
+        .iter()
+        .map(|(path, line, content)| ReviewLineAnchor {
+            anchor_id: format!("{path}:{line}"),
+            file_path: (*path).to_string(),
+            old_path: (*path).to_string(),
+            new_path: (*path).to_string(),
+            old_line: None,
+            new_line: Some(*line),
+            kind: AnchorLineKind::Added,
+            content_preview: (*content).to_string(),
+        })
+        .collect::<Vec<_>>();
+    AnchoredDiffContext {
+        prompt_text: entries
+            .iter()
+            .map(|(_, _, content)| *content)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        total_anchors: anchors.len(),
+        anchors,
+        truncated: false,
+    }
+}
+
+fn diff_refs() -> DiffRefs {
+    DiffRefs {
+        base_sha: Some("base".to_string()),
+        start_sha: Some("start".to_string()),
+        head_sha: Some("head".to_string()),
     }
 }
 
