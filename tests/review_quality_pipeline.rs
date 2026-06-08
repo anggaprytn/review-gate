@@ -399,7 +399,7 @@ fn medium_data_integrity_finding_does_not_block_or_force_path_policy() {
     let output = run_review_quality_pipeline(input).unwrap();
     let markdown = render_markdown(&output);
 
-    assert_eq!(output.risk_assessment.decision, MergeDecision::Pass);
+    assert_eq!(output.risk_assessment.decision, MergeDecision::NeedsHuman);
     assert!(!markdown.contains("Modified offline sync layer without adding recovery test"));
     assert!(!markdown.contains("Add sync recovery test"));
     assert_final_markdown_invariants(&markdown);

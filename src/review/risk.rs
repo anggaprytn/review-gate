@@ -13,6 +13,8 @@ use crate::{
 };
 use std::collections::HashSet;
 
+const DECISION_NEEDS_HUMAN_SCORE: u8 = 25;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeDecision {
     Pass,
@@ -117,7 +119,6 @@ pub fn assess_merge_risk(
     let mut builder = RiskBuilder::default();
     let mut blocking_issues = Vec::new();
     let mut required_before_merge = Vec::new();
-    let mut needs_human = false;
     let mut has_high_actionable = false;
     let mut has_critical_actionable = false;
     let mut has_high_blocking_finding = false;
@@ -331,7 +332,6 @@ pub fn assess_merge_risk(
                     format!("{} review chunks failed.", report.failed_chunks),
                 )],
             );
-            needs_human = true;
         }
     }
 
@@ -399,10 +399,9 @@ pub fn assess_merge_risk(
                 protected_evidence,
             );
         }
-        needs_human = true;
     }
 
-    let auth_touched = any_path_or_diff_signal(
+    let security_sensitive_touched = any_path_or_diff_signal(
         diffs,
         &[
             "auth",
@@ -413,7 +412,7 @@ pub fn assess_merge_risk(
             "integrity",
         ],
     );
-    if auth_touched {
+    if security_sensitive_touched {
         builder.add(
             15,
             "changed_file.auth_security_area",
@@ -432,7 +431,6 @@ pub fn assess_merge_risk(
                 "Changed file or diff text matches an auth/security signal.",
             ),
         );
-        needs_human = true;
     }
     if any_path_or_diff_signal(diffs, &["payment", "billing", "money"]) {
         builder.add(
@@ -446,7 +444,6 @@ pub fn assess_merge_risk(
                 "Changed file or diff text matches a payment/billing/money signal.",
             ),
         );
-        needs_human = true;
     }
 
     let migration_evidence = migration_evidence(diffs, config);
@@ -457,7 +454,6 @@ pub fn assess_merge_risk(
             "Database migration or schema area touched",
             migration_evidence.clone(),
         );
-        needs_human = true;
         if !rollback_note_detected(diffs) {
             builder.add(
                 25,
@@ -476,7 +472,6 @@ pub fn assess_merge_risk(
             "API contract area touched",
             contract_evidence.clone(),
         );
-        needs_human = true;
         if !contract_snapshot_updated(diffs, config) {
             builder.add(
                 20,
@@ -501,7 +496,6 @@ pub fn assess_merge_risk(
                     ),
                 )],
             );
-            needs_human = true;
         }
         if comparison.not_detected > 0 {
             builder.add(
@@ -538,13 +532,25 @@ pub fn assess_merge_risk(
 
     let mut score = builder.score();
     let blocked = has_critical_actionable || has_high_blocking_finding;
+    let open_priority_findings = open_priority_finding_count(analysis);
+    let has_open_priority_findings = open_priority_findings > 0;
+    let large_review_partial = signals
+        .large_review
+        .is_some_and(|report| report.failed_chunks > 0)
+        || stats.collapsed_file_count > 0
+        || stats.too_large_file_count > 0;
+    let large_review_partial_with_unresolved_findings =
+        large_review_partial && has_open_priority_findings;
+    let security_sensitive_with_open_findings =
+        security_sensitive_touched && has_open_priority_findings;
     let has_medium_actionable = analysis
         .findings
         .iter()
         .any(|finding| validated_actionable_finding_with_severity(finding, Severity::Medium));
-    let needs_human = needs_human
-        || score >= config.needs_human_threshold
-        || has_high_actionable
+    let needs_human = has_open_priority_findings
+        || score >= DECISION_NEEDS_HUMAN_SCORE
+        || large_review_partial_with_unresolved_findings
+        || security_sensitive_with_open_findings
         || signals
             .comparison
             .is_some_and(|comparison| comparison.still_detected > 0);
@@ -569,7 +575,7 @@ pub fn assess_merge_risk(
     if !has_critical_actionable && !has_high_actionable {
         score = score.min(74);
         if decision == MergeDecision::Blocked {
-            decision = if needs_human || score >= config.needs_human_threshold {
+            decision = if needs_human || score >= DECISION_NEEDS_HUMAN_SCORE {
                 MergeDecision::NeedsHuman
             } else {
                 MergeDecision::Pass
@@ -605,6 +611,21 @@ pub fn assess_merge_risk(
     }
 }
 
+fn open_priority_finding_count(analysis: &ReviewAnalysis) -> usize {
+    analysis
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding.actionable
+                && matches!(
+                    finding.severity,
+                    Severity::Critical | Severity::High | Severity::Medium
+                )
+                && has_validated_evidence(finding)
+        })
+        .count()
+}
+
 pub fn format_merge_risk_gate_markdown(assessment: &MergeRiskAssessment) -> String {
     let mut output = String::new();
     output.push_str("## Merge Risk Gate\n\n");
@@ -632,14 +653,16 @@ pub fn format_merge_risk_gate_markdown(assessment: &MergeRiskAssessment) -> Stri
         output.push('\n');
     } else if assessment.decision == MergeDecision::Pass {
         output.push_str("No blocking issues detected by ReviewGate.\n\n");
+        output.push_str("Why:\n");
+        for reason in pass_why_reasons(assessment) {
+            output.push_str("- ");
+            output.push_str(reason);
+            output.push('\n');
+        }
+        output.push('\n');
     } else {
         output.push_str("Why:\n");
-        for factor in assessment
-            .risk_factors
-            .iter()
-            .filter(|factor| factor.points > 0)
-            .take(4)
-        {
+        for factor in decision_why_factors(assessment) {
             output.push_str("- ");
             output.push_str(&factor.label);
             output.push('\n');
@@ -666,6 +689,46 @@ pub fn format_merge_risk_gate_markdown(assessment: &MergeRiskAssessment) -> Stri
     }
 
     output.trim_end().to_string()
+}
+
+fn pass_why_reasons(assessment: &MergeRiskAssessment) -> Vec<&'static str> {
+    let mut reasons = vec!["No priority findings remain open."];
+    if large_review_context(assessment) {
+        reasons.push("Review completed using risk-prioritized large MR analysis.");
+    }
+    reasons.truncate(3);
+    reasons
+}
+
+fn decision_why_factors(assessment: &MergeRiskAssessment) -> Vec<&RiskFactor> {
+    assessment
+        .risk_factors
+        .iter()
+        .filter(|factor| factor.points > 0)
+        .filter(|factor| !engine_internal_why_factor(factor))
+        .take(3)
+        .collect()
+}
+
+fn engine_internal_why_factor(factor: &RiskFactor) -> bool {
+    matches!(
+        factor.rule_id.as_str(),
+        "verification.large_mr.changed_files"
+            | "verification.large_mr.diff_bytes"
+            | "changed_file.auth_security_area"
+    )
+}
+
+fn large_review_context(assessment: &MergeRiskAssessment) -> bool {
+    assessment.blast_radius.changed_files > crate::plan::DEFAULT_LARGE_MR_FILE_THRESHOLD
+        || assessment.blast_radius.diff_bytes > crate::plan::DEFAULT_LARGE_MR_DIFF_BYTES
+        || assessment.blast_radius.failed_chunks > 0
+        || assessment.blast_radius.collapsed_files > 0
+        || assessment.blast_radius.too_large_files > 0
+        || assessment
+            .risk_factors
+            .iter()
+            .any(|factor| factor.rule_id.contains("large") || factor.rule_id.contains("partial"))
 }
 
 pub fn format_merge_risk_gate_terminal(assessment: &MergeRiskAssessment) -> String {
@@ -1438,6 +1501,24 @@ mod tests {
         );
 
         assert_eq!(assessment.score, 20);
+        assert_eq!(assessment.decision, MergeDecision::Pass);
+    }
+
+    #[test]
+    fn score_20_with_no_priority_findings_passes() {
+        let assessment = assess(
+            &[],
+            &[],
+            DiffStats {
+                changed_file_count: 31,
+                total_diff_bytes: 200_001,
+                ..DiffStats::default()
+            },
+            RiskGateRunSignals::default(),
+        );
+
+        assert_eq!(assessment.score, 20);
+        assert_eq!(assessment.decision, MergeDecision::Pass);
     }
 
     #[test]

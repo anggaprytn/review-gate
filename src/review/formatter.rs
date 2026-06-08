@@ -569,19 +569,15 @@ fn format_privacy_note(
     let items = useful_note_items(note.unwrap_or_default(), 8, is_generic_privacy_item);
     if items.is_empty() {
         return if privacy_risk_detected {
-            if finding_risks.is_empty() {
-                "Potential privacy risks were detected in reviewed chunks.".to_string()
-            } else {
-                let mut output =
-                    "Potential privacy risks were detected in reviewed chunks.\n\nPrivacy risks:\n"
-                        .to_string();
-                for risk in finding_risks.into_iter().take(3) {
-                    output.push_str("- ");
-                    output.push_str(&risk);
-                    output.push('\n');
-                }
-                output.trim_end().to_string()
+            let mut output =
+                "Potential privacy risks were detected in reviewed chunks.\n\nPrivacy risks:\n"
+                    .to_string();
+            for risk in finding_risks.into_iter().take(3) {
+                output.push_str("- ");
+                output.push_str(&risk);
+                output.push('\n');
             }
+            output.trim_end().to_string()
         } else {
             "No obvious new PII or secret exposure detected in reviewed chunks.".to_string()
         };
@@ -594,16 +590,19 @@ fn format_privacy_note(
             continue;
         } else if is_positive_privacy_item(&item) {
             positives.push(sanitize_privacy_item(&item));
-        } else if is_negative_privacy_item(&item.to_ascii_lowercase()) {
+        } else if privacy_risk_detected && is_negative_privacy_item(&item.to_ascii_lowercase()) {
             risks.push(sanitize_privacy_item(&item));
         } else {
             continue;
         }
     }
-    finding_risks.append(&mut risks);
+
+    if privacy_risk_detected {
+        finding_risks.append(&mut risks);
+    }
     let risks = finding_risks;
 
-    let mut output = if privacy_risk_detected || !risks.is_empty() {
+    let mut output = if privacy_risk_detected {
         "Potential privacy risks were detected in reviewed chunks.".to_string()
     } else {
         "No obvious new PII or secret exposure detected in reviewed chunks.".to_string()
@@ -1300,7 +1299,7 @@ mod tests {
         assert!(markdown.contains("Open priority findings: 1"));
         assert!(!markdown.contains("Open actionable findings"));
         assert!(markdown.contains("| 🟠 High | 1 |"));
-        assert!(markdown.contains("## Overall Risk\n\n🟡 Medium"));
+        assert!(markdown.contains("## Overall Risk\n\n🟠 High"));
         assert!(markdown.contains("## 🔴 Critical\n\nNo critical findings."));
         assert!(markdown.contains("## 🟠 High"));
         assert!(markdown.contains("### 🟠 HIGH · ⚡ Quick fix · src/payment/client.ts:42"));
@@ -1890,6 +1889,30 @@ mod tests {
 
         assert!(section
             .starts_with("No obvious new PII or secret exposure detected in reviewed chunks."));
+    }
+
+    #[test]
+    fn privacy_note_risk_text_without_final_privacy_finding_does_not_contradict_status() {
+        let markdown = format_review_markdown_for_mode_with_emoji(
+            &ReviewAnalysis {
+                summary: "summary".to_string(),
+                findings: vec![],
+                test_coverage_note: None,
+                privacy_note: Some(
+                    "Potential privacy risks were detected. No secret or PII exposure was detected."
+                        .to_string(),
+                ),
+                overall_risk: OverallRisk::Low,
+            },
+            MarkdownRenderMode::Publish,
+            false,
+        );
+        let section = markdown_section(&markdown, "## Privacy");
+
+        assert!(section
+            .starts_with("No obvious new PII or secret exposure detected in reviewed chunks."));
+        assert!(!section.contains("Potential privacy risks were detected"));
+        assert!(!section.contains("Privacy risks:"));
     }
 
     #[test]

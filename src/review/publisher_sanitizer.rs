@@ -1,10 +1,16 @@
-use crate::review::{
-    risk::{MergeDecision, MergeRiskAssessment, RiskEvidence, RiskFactor, RiskGateItem},
-    types::{
-        EvidenceValidationStatus, ReviewAnalysis, ReviewCategory, ReviewFinding, RiskCode, Severity,
+use crate::{
+    counters::count_findings_from_analysis,
+    review::{
+        risk::{MergeDecision, MergeRiskAssessment, RiskEvidence, RiskFactor, RiskGateItem},
+        types::{
+            EvidenceValidationStatus, OverallRisk, ReviewAnalysis, ReviewCategory, ReviewFinding,
+            RiskCode, Severity,
+        },
     },
 };
 use std::collections::HashSet;
+
+const DECISION_NEEDS_HUMAN_SCORE: u8 = 25;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewReport {
@@ -15,7 +21,11 @@ pub struct ReviewReport {
 pub fn sanitize_review_report(mut report: ReviewReport) -> ReviewReport {
     report.analysis = sanitize_review_analysis(report.analysis);
     if let Some(assessment) = report.risk_assessment.take() {
-        report.risk_assessment = Some(sanitize_merge_risk_assessment(&report.analysis, assessment));
+        let assessment = sanitize_merge_risk_assessment(&report.analysis, assessment);
+        report.analysis.overall_risk = calibrated_overall_risk(&report.analysis, Some(&assessment));
+        report.risk_assessment = Some(assessment);
+    } else {
+        report.analysis.overall_risk = calibrated_overall_risk(&report.analysis, None);
     }
     report
 }
@@ -63,34 +73,105 @@ pub fn sanitize_merge_risk_assessment(
         assessment.score = assessment
             .score
             .min(medium_only_score_cap(analysis, &assessment));
-        if assessment.decision == MergeDecision::Blocked {
-            assessment.decision = if should_need_human(analysis, &assessment) {
-                MergeDecision::NeedsHuman
-            } else {
-                MergeDecision::Pass
-            };
-        }
     }
 
-    if assessment.decision == MergeDecision::Blocked && !has_critical && !has_high_blocking {
-        assessment.decision = if should_need_human(analysis, &assessment) || has_high {
-            MergeDecision::NeedsHuman
-        } else {
-            MergeDecision::Pass
-        };
-    }
-
-    if (has_critical || has_high_blocking) && assessment.decision != MergeDecision::Blocked {
-        assessment.decision = MergeDecision::Blocked;
-    }
-
-    if assessment.decision == MergeDecision::Pass && should_need_human(analysis, &assessment) {
-        assessment.decision = MergeDecision::NeedsHuman;
-    }
-
+    assessment.decision = calibrated_merge_decision(analysis, &assessment);
     add_calibrated_why_factors(analysis, &mut assessment);
 
     assessment
+}
+
+fn calibrated_merge_decision(
+    analysis: &ReviewAnalysis,
+    assessment: &MergeRiskAssessment,
+) -> MergeDecision {
+    let counters = count_findings_from_analysis(analysis);
+    let blocking_issues = assessment
+        .blocking_issues
+        .iter()
+        .any(|item| !item.evidence.is_empty());
+    let has_critical = analysis.findings.iter().any(|finding| {
+        validated_actionable_finding(finding) && finding.severity == Severity::Critical
+    });
+    let has_high_blocking = analysis
+        .findings
+        .iter()
+        .any(|finding| validated_actionable_finding(finding) && high_blocking_finding(finding));
+
+    if has_critical || has_high_blocking || blocking_issues {
+        return MergeDecision::Blocked;
+    }
+
+    if counters.open_priority > 0
+        || assessment.score >= DECISION_NEEDS_HUMAN_SCORE
+        || (large_review_partial(assessment) && open_non_note_findings(analysis) > 0)
+        || (security_sensitive_modified(assessment) && open_non_note_findings(analysis) > 0)
+    {
+        return MergeDecision::NeedsHuman;
+    }
+
+    MergeDecision::Pass
+}
+
+fn calibrated_overall_risk(
+    analysis: &ReviewAnalysis,
+    assessment: Option<&MergeRiskAssessment>,
+) -> OverallRisk {
+    let finding_risk = strongest_actionable_risk(analysis).unwrap_or(OverallRisk::Low);
+    let Some(assessment) = assessment else {
+        return finding_risk;
+    };
+
+    match assessment.decision {
+        MergeDecision::Blocked => stronger_risk(finding_risk, OverallRisk::High),
+        MergeDecision::NeedsHuman => {
+            if assessment.score >= 75 {
+                stronger_risk(finding_risk, OverallRisk::High)
+            } else {
+                stronger_risk(finding_risk, OverallRisk::Medium)
+            }
+        }
+        MergeDecision::Pass => {
+            if matches!(finding_risk, OverallRisk::Note) {
+                OverallRisk::Low
+            } else {
+                finding_risk
+            }
+        }
+    }
+}
+
+fn strongest_actionable_risk(analysis: &ReviewAnalysis) -> Option<OverallRisk> {
+    analysis
+        .findings
+        .iter()
+        .filter(|finding| finding.actionable)
+        .map(|finding| match finding.severity {
+            Severity::Critical => OverallRisk::Critical,
+            Severity::High => OverallRisk::High,
+            Severity::Medium => OverallRisk::Medium,
+            Severity::Low => OverallRisk::Low,
+            Severity::Note => OverallRisk::Note,
+        })
+        .min_by_key(|risk| risk_sort_key(*risk))
+}
+
+fn stronger_risk(left: OverallRisk, right: OverallRisk) -> OverallRisk {
+    if risk_sort_key(left) <= risk_sort_key(right) {
+        left
+    } else {
+        right
+    }
+}
+
+fn risk_sort_key(risk: OverallRisk) -> u8 {
+    match risk {
+        OverallRisk::Critical => 0,
+        OverallRisk::High => 1,
+        OverallRisk::Medium => 2,
+        OverallRisk::Low => 3,
+        OverallRisk::Note => 4,
+    }
 }
 
 fn sanitize_review_analysis(mut analysis: ReviewAnalysis) -> ReviewAnalysis {
@@ -328,6 +409,17 @@ fn medium_only_score_cap(analysis: &ReviewAnalysis, assessment: &MergeRiskAssess
             Severity::Note => 0,
         })
         .sum::<u8>();
+    if finding_score == 0 {
+        return if assessment
+            .risk_factors
+            .iter()
+            .any(|factor| factor.points > 0)
+        {
+            assessment.score.min(74)
+        } else {
+            0
+        };
+    }
     let partial_review_points = if assessment.blast_radius.failed_chunks > 0
         || assessment.blast_radius.collapsed_files > 0
         || assessment.blast_radius.too_large_files > 0
@@ -344,7 +436,16 @@ fn medium_only_score_cap(analysis: &ReviewAnalysis, assessment: &MergeRiskAssess
 }
 
 fn low_or_note_score_cap(analysis: &ReviewAnalysis, assessment: &MergeRiskAssessment) -> u8 {
-    medium_only_score_cap(analysis, assessment).min(49)
+    if analysis.findings.iter().any(validated_actionable_finding)
+        || assessment
+            .risk_factors
+            .iter()
+            .any(|factor| factor.points > 0)
+    {
+        assessment.score.min(49)
+    } else {
+        medium_only_score_cap(analysis, assessment).min(49)
+    }
 }
 
 fn has_medium(analysis: &ReviewAnalysis) -> bool {
@@ -354,31 +455,10 @@ fn has_medium(analysis: &ReviewAnalysis) -> bool {
 }
 
 fn add_calibrated_why_factors(analysis: &ReviewAnalysis, assessment: &mut MergeRiskAssessment) {
-    let medium_count = analysis
-        .findings
-        .iter()
-        .filter(|finding| {
-            validated_actionable_finding(finding) && finding.severity == Severity::Medium
-        })
-        .count();
-    if medium_count > 1
-        && !assessment
-            .risk_factors
-            .iter()
-            .any(|factor| factor.rule_id == "calibration.multiple_medium_findings")
-    {
-        assessment.risk_factors.insert(
-            0,
-            RiskFactor {
-                rule_id: "calibration.multiple_medium_findings".to_string(),
-                label: "Multiple medium-priority security/reliability findings remain open."
-                    .to_string(),
-                score: 1,
-                evidence: Vec::new(),
-                points: 1,
-            },
-        );
-    }
+    let mut public_reasons = public_why_factors(analysis, assessment);
+    public_reasons.append(&mut assessment.risk_factors);
+    assessment.risk_factors = public_reasons;
+
     for factor in &mut assessment.risk_factors {
         if generic_why_label(&factor.label) {
             if let Some(label) = finding_why_label_for_factor(analysis, factor) {
@@ -392,24 +472,98 @@ fn add_calibrated_why_factors(analysis: &ReviewAnalysis, assessment: &mut MergeR
     dedupe_risk_factors_by_label(&mut assessment.risk_factors);
 }
 
-fn should_need_human(analysis: &ReviewAnalysis, assessment: &MergeRiskAssessment) -> bool {
-    let medium_count = analysis
+fn public_why_factors(
+    analysis: &ReviewAnalysis,
+    assessment: &MergeRiskAssessment,
+) -> Vec<RiskFactor> {
+    let mut factors = Vec::new();
+    match assessment.decision {
+        MergeDecision::Pass => {}
+        MergeDecision::Blocked => {
+            factors.push(public_why_factor(
+                "published.why.blocking_findings",
+                "Validated blocking findings remain open.",
+            ));
+        }
+        MergeDecision::NeedsHuman => {
+            if has_open_severity(analysis, Severity::Medium) {
+                factors.push(public_why_factor(
+                    "published.why.medium_open",
+                    "Medium-priority findings remain open.",
+                ));
+            }
+            if has_open_severity(analysis, Severity::High) {
+                factors.push(public_why_factor(
+                    "published.why.high_open",
+                    "High-priority findings remain open.",
+                ));
+            }
+            if security_sensitive_modified(assessment) && open_non_note_findings(analysis) > 0 {
+                factors.push(public_why_factor(
+                    "published.why.security_sensitive_files",
+                    "Security-sensitive files were modified.",
+                ));
+            }
+            if large_review_partial(assessment) && open_non_note_findings(analysis) > 0 {
+                factors.push(public_why_factor(
+                    "published.why.large_partial",
+                    "Large MR review was partial or risk-prioritized.",
+                ));
+            }
+            if factors.is_empty() && assessment.score >= DECISION_NEEDS_HUMAN_SCORE {
+                factors.push(public_why_factor(
+                    "published.why.score",
+                    format!("Review risk score is {}/100.", assessment.score),
+                ));
+            }
+        }
+    }
+    factors.truncate(3);
+    factors
+}
+
+fn has_open_severity(analysis: &ReviewAnalysis, severity: Severity) -> bool {
+    analysis
+        .findings
+        .iter()
+        .any(|finding| validated_actionable_finding(finding) && finding.severity == severity)
+}
+
+fn public_why_factor(rule_id: &str, label: impl Into<String>) -> RiskFactor {
+    RiskFactor {
+        rule_id: rule_id.to_string(),
+        label: label.into(),
+        score: 1,
+        evidence: Vec::new(),
+        points: 1,
+    }
+}
+
+fn open_non_note_findings(analysis: &ReviewAnalysis) -> usize {
+    analysis
         .findings
         .iter()
         .filter(|finding| {
-            validated_actionable_finding(finding) && finding.severity == Severity::Medium
+            validated_actionable_finding(finding) && finding.severity != Severity::Note
         })
-        .count();
-    let has_medium = medium_count > 0;
-    medium_count > 1
-        || (has_medium && assessment.score >= 40)
-        || assessment.blast_radius.failed_chunks > 0
+        .count()
+}
+
+fn large_review_partial(assessment: &MergeRiskAssessment) -> bool {
+    assessment.blast_radius.failed_chunks > 0
         || assessment.blast_radius.collapsed_files > 0
         || assessment.blast_radius.too_large_files > 0
         || assessment
             .risk_factors
             .iter()
             .any(|factor| factor.rule_id.contains("large") || factor.rule_id.contains("partial"))
+}
+
+fn security_sensitive_modified(assessment: &MergeRiskAssessment) -> bool {
+    assessment
+        .risk_factors
+        .iter()
+        .any(|factor| factor.rule_id == "changed_file.auth_security_area")
 }
 
 fn validated_actionable_finding(finding: &ReviewFinding) -> bool {
@@ -881,6 +1035,7 @@ fn contains_any(value: &str, terms: &[&str]) -> bool {
 mod tests {
     use super::{sanitize_merge_risk_assessment, sanitize_review_report, ReviewReport};
     use crate::review::{
+        formatter::{format_review_markdown_for_mode_with_risk_gate, MarkdownRenderMode},
         risk::{
             format_merge_risk_gate_markdown, BlastRadius, MergeDecision, MergeRiskAssessment,
             RiskEvidence, RiskEvidenceSource, RiskFactor, RiskGateItem,
@@ -1132,6 +1287,126 @@ mod tests {
     }
 
     #[test]
+    fn final_calibration_passes_zero_priority_score_20_without_blockers() {
+        let sanitized = sanitize_merge_risk_assessment(
+            &analysis(vec![]),
+            MergeRiskAssessment {
+                score: 20,
+                decision: MergeDecision::NeedsHuman,
+                blocking_issues: vec![],
+                required_before_merge: vec![],
+                risk_factors: vec![risk_factor(
+                    "verification.large_mr.changed_files",
+                    "Changed files exceed large MR threshold",
+                )],
+                blast_radius: BlastRadius {
+                    changed_files: 31,
+                    ..BlastRadius::default()
+                },
+            },
+        );
+        let markdown = format_merge_risk_gate_markdown(&sanitized);
+
+        assert_eq!(sanitized.score, 20);
+        assert_eq!(sanitized.decision, MergeDecision::Pass);
+        assert!(markdown.contains("Decision: PASS"));
+        assert!(markdown.contains("- No priority findings remain open."));
+        assert!(markdown.contains("- Review completed using risk-prioritized large MR analysis."));
+        assert!(!markdown.contains("Changed files exceed large MR threshold"));
+    }
+
+    #[test]
+    fn final_calibration_needs_human_for_medium_findings_with_score_42() {
+        let findings = (0..6)
+            .map(|index| {
+                finding(
+                    Severity::Medium,
+                    ReviewCategory::Reliability,
+                    Some(RiskCode::WeakErrorHandling),
+                    &format!("src/file{index}.rs"),
+                    &format!("Medium finding {index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let sanitized = sanitize_merge_risk_assessment(
+            &analysis(findings),
+            MergeRiskAssessment {
+                score: 42,
+                decision: MergeDecision::Pass,
+                blocking_issues: vec![],
+                required_before_merge: vec![],
+                risk_factors: vec![],
+                blast_radius: BlastRadius::default(),
+            },
+        );
+
+        assert_eq!(sanitized.score, 42);
+        assert_eq!(sanitized.decision, MergeDecision::NeedsHuman);
+    }
+
+    #[test]
+    fn final_calibration_blocks_for_critical_finding() {
+        let sanitized = sanitize_merge_risk_assessment(
+            &analysis(vec![finding(
+                Severity::Critical,
+                ReviewCategory::Security,
+                Some(RiskCode::SqlInjection),
+                "src/paymentClient.ts",
+                "SQL injection in payment lookup",
+            )]),
+            MergeRiskAssessment {
+                score: 35,
+                decision: MergeDecision::Pass,
+                blocking_issues: vec![],
+                required_before_merge: vec![],
+                risk_factors: vec![],
+                blast_radius: BlastRadius::default(),
+            },
+        );
+
+        assert_eq!(sanitized.decision, MergeDecision::Blocked);
+        assert!(!sanitized.blocking_issues.is_empty());
+    }
+
+    #[test]
+    fn published_summary_aligns_open_count_score_decision_and_overall_risk() {
+        let report = sanitize_review_report(ReviewReport {
+            analysis: ReviewAnalysis {
+                overall_risk: OverallRisk::High,
+                ..analysis(vec![])
+            },
+            risk_assessment: Some(MergeRiskAssessment {
+                score: 20,
+                decision: MergeDecision::NeedsHuman,
+                blocking_issues: vec![],
+                required_before_merge: vec![],
+                risk_factors: vec![risk_factor(
+                    "verification.large_mr.changed_files",
+                    "Changed files exceed large MR threshold",
+                )],
+                blast_radius: BlastRadius {
+                    changed_files: 31,
+                    ..BlastRadius::default()
+                },
+            }),
+        });
+        let assessment = report.risk_assessment.as_ref().unwrap();
+        let markdown = format_review_markdown_for_mode_with_risk_gate(
+            &report.analysis,
+            MarkdownRenderMode::Publish,
+            false,
+            Some(assessment),
+        );
+
+        assert!(markdown.contains("Open priority findings: 0"));
+        assert!(markdown.contains("Risk Score: 20/100"));
+        assert!(markdown.contains("Decision: PASS"));
+        assert!(markdown.contains("## Overall Risk\n\nLow"));
+        assert!(!markdown.contains("Decision: NEEDS HUMAN"));
+        assert!(!markdown.contains("## Overall Risk\n\nHigh"));
+    }
+
+    #[test]
     fn unsafe_positive_notes_are_removed() {
         let report = sanitize_review_report(ReviewReport {
             analysis: analysis(vec![
@@ -1227,7 +1502,7 @@ mod tests {
                 .unwrap()
                 .matches("\n- ")
                 .count()
-                <= 4
+                <= 3
         );
     }
 
