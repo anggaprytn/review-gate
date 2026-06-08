@@ -328,9 +328,11 @@ fn format_summary_note(summary: &str, mode: MarkdownRenderMode) -> String {
         .collect::<Vec<_>>();
 
     let mut overview = None;
+    let mut summary_points = Vec::new();
     let mut bullets = Vec::new();
     let mut caveat = None;
     let mut seen_bullets = HashSet::new();
+    let mut seen_summary_points = HashSet::new();
 
     for line in lines {
         let stripped = line
@@ -338,6 +340,15 @@ fn format_summary_note(summary: &str, mode: MarkdownRenderMode) -> String {
             .trim();
         if stripped.is_empty() || stripped.eq_ignore_ascii_case("main risks found:") {
             continue;
+        }
+        if line.starts_with('-') || line.starts_with('*') {
+            if is_summary_point(stripped) {
+                let key = normalize_sentence_key(stripped);
+                if !key.is_empty() && seen_summary_points.insert(key) {
+                    summary_points.push(stripped.to_string());
+                }
+                continue;
+            }
         }
         let sentence = sentence_from_text(stripped);
         let lower = sentence.to_ascii_lowercase();
@@ -366,7 +377,17 @@ fn format_summary_note(summary: &str, mode: MarkdownRenderMode) -> String {
         }
     }
 
-    let mut output = overview.unwrap_or_else(|| "No summary returned.".to_string());
+    let mut output = if summary_points.is_empty() {
+        overview.unwrap_or_else(|| "No summary returned.".to_string())
+    } else {
+        let mut output = String::new();
+        for point in summary_points {
+            output.push_str("- ");
+            output.push_str(&point);
+            output.push('\n');
+        }
+        output.trim_end().to_string()
+    };
     if !bullets.is_empty() {
         output.push_str("\n\nMain risks found:\n");
         for bullet in bullets {
@@ -378,9 +399,20 @@ fn format_summary_note(summary: &str, mode: MarkdownRenderMode) -> String {
     }
     if let Some(caveat) = caveat {
         output.push_str("\n\n");
+        if output.starts_with("- ") {
+            output.push_str("- Scope: ");
+        }
         output.push_str(&caveat);
     }
     output
+}
+
+fn is_summary_point(sentence: &str) -> bool {
+    let lower = sentence.to_ascii_lowercase();
+    lower.starts_with("reviewed files:")
+        || lower.starts_with("reviewed chunks:")
+        || lower.starts_with("skipped files:")
+        || lower.starts_with("review mode:")
 }
 
 fn renderable_suggested_fix(finding: &ReviewFinding) -> Option<&str> {
@@ -1976,7 +2008,7 @@ mod tests {
     fn published_summary_is_compact() {
         let markdown = format_review_markdown_for_mode_with_emoji(
             &ReviewAnalysis {
-                summary: "ReviewGate reviewed 64 risk-prioritized files across 8 chunks.\n\nMain risks found:\n- First security risk.\n- Second reliability risk.\n- Third privacy risk.\n- Fourth correctness risk.\n- Fifth coverage risk.\n- Sixth deployment risk.\n\nThis is a partial risk-prioritized review, not a full exhaustive review.\nExtra trailing sentence that should not survive."
+                summary: "- Reviewed files: 64 risk-prioritized files\n- Reviewed chunks: 8\n- Skipped files: 25 (collapsed by GitLab)\n\nMain risks found:\n- First security risk.\n- Second reliability risk.\n- Third privacy risk.\n- Fourth correctness risk.\n- Fifth coverage risk.\n- Sixth deployment risk.\n\nThis is a partial risk-prioritized review, not a full exhaustive review.\nExtra trailing sentence that should not survive."
                     .to_string(),
                 findings: vec![
                     finding(Severity::Low, "First security risk"),
@@ -1995,14 +2027,15 @@ mod tests {
         );
         let section = markdown_section(&markdown, "## Summary");
 
-        assert!(
-            section.starts_with("ReviewGate reviewed 64 risk-prioritized files across 8 chunks.")
-        );
+        assert!(section.starts_with("- Reviewed files: 64 risk-prioritized files"));
+        assert!(section.contains("- Reviewed chunks: 8"));
+        assert!(section.contains("- Skipped files: 25 (collapsed by GitLab)"));
         assert!(section.contains("Main risks found:\n- First security risk."));
         assert!(section.contains("- Fifth coverage risk."));
         assert!(!section.contains("- Sixth deployment risk."));
-        assert!(section
-            .contains("This is a partial risk-prioritized review, not a full exhaustive review."));
+        assert!(section.contains(
+            "- Scope: This is a partial risk-prioritized review, not a full exhaustive review."
+        ));
         assert!(!section.contains("Extra trailing sentence"));
     }
 

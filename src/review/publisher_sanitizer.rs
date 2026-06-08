@@ -196,7 +196,7 @@ fn sanitize_summary(summary: &str, findings: &[ReviewFinding]) -> String {
         }
         if is_bullet(trimmed) {
             let item = bullet_text(trimmed);
-            if has_item_evidence(item, findings) {
+            if is_review_summary_metadata(item) || has_item_evidence(item, findings) {
                 output.push(trimmed.to_string());
             }
             continue;
@@ -852,6 +852,15 @@ fn has_item_evidence(item: &str, findings: &[ReviewFinding]) -> bool {
                 .count()
                 >= 3
     })
+}
+
+fn is_review_summary_metadata(item: &str) -> bool {
+    let lower = item.to_ascii_lowercase();
+    lower.starts_with("reviewed files:")
+        || lower.starts_with("reviewed chunks:")
+        || lower.starts_with("skipped files:")
+        || lower.starts_with("review mode:")
+        || lower.starts_with("scope:")
 }
 
 fn policy_template_without_finding_evidence(value: &str, findings: &[ReviewFinding]) -> bool {

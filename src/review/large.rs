@@ -1264,14 +1264,6 @@ fn push_reason(reasons: &mut Vec<String>, reason: &str) {
     }
 }
 
-fn skipped_reason_suffix(reasons: &[String]) -> String {
-    if reasons.is_empty() {
-        String::new()
-    } else {
-        format!(": {}", reasons.join(", "))
-    }
-}
-
 fn duplicate_conflict_key(finding: &ReviewFinding) -> String {
     format!(
         "{}|{:?}|{:?}|{:?}|{}",
@@ -1336,15 +1328,14 @@ fn overall_sort_key(risk: OverallRisk) -> u8 {
 
 fn compact_large_review_summary(findings: &[ReviewFinding], report: &LargeReviewReport) -> String {
     let mut summary = format!(
-        "ReviewGate reviewed {} risk-prioritized files across {} chunks.",
+        "- Reviewed files: {} risk-prioritized files\n- Reviewed chunks: {}",
         report.reviewed_files, report.reviewed_chunks
     );
     if report.skipped_files > 0 {
-        summary.push_str(&format!(
-            " Skipped {} files{}.",
-            report.skipped_files,
-            skipped_reason_suffix(&report.skipped_reasons)
-        ));
+        summary.push_str(&format!("\n- Skipped files: {}", report.skipped_files));
+        if !report.skipped_reasons.is_empty() {
+            summary.push_str(&format!(" ({})", report.skipped_reasons.join(", ")));
+        }
     }
 
     let bullets = top_finding_theme_bullets(findings, 5);
@@ -1802,7 +1793,8 @@ mod tests {
 
         assert!(merged
             .summary
-            .contains("ReviewGate reviewed 2 risk-prioritized files across 9 chunks."));
+            .contains("- Reviewed files: 2 risk-prioritized files"));
+        assert!(merged.summary.contains("- Reviewed chunks: 9"));
         assert!(merged.summary.contains("Main risks found:\n- "));
         assert!(!merged.summary.contains("Chunk review"));
         assert!(!merged.summary.contains("Chunk summaries:"));
